@@ -1,0 +1,14 @@
+# Created at run time - never commit snapshots, journals, logs, reports or gate evidence (names, GUIDs, permissions)
+logs/
+reports/
+data/
+tests/evidence/
+artifacts/
+*.db
+*.bak
+# Credentials saved for the Entra Connect script (DPAPI, per account and computer)
+config/*.cred.xml
+# Editors
+*.user
+.vs/
+.vscode/
