@@ -9,7 +9,8 @@
     PowerShell 7 (cloud actions). It is organised in regions, in the order of an execution:
 
         1. Console theme       icons, frames and colours (console colours, no ANSI sequences)
-        2. Console and log     Write-PraBanner, Write-PraStep, Write-PraItem, Write-PraLog, Write-PraSummary
+        2. Console and log     Write-PraBanner, Write-PraStep, Write-PraItem, Write-PraLog, Write-PraSummary;
+                               for the window: Write-PraEvent, Test-PraStopRequest, Request-PraOperator
         3. Configuration       Import-PraConfiguration (reads and checks the .psd1 file)
         4. Audit               Initialize-PraAudit (log file + PowerShell transcript)
         5. Results             Get-PraOutcome, Write-PraReport (CSV + HTML), Complete-PraRun
@@ -19,15 +20,19 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.0.0
+    Version : 1.1.0
     History : see CHANGELOG.md
 #>
 #Requires -Version 5.1
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '1.0.0'
+$script:ToolVersion = '1.1.0'
 $script:TranscriptOwner = $null
+# The window runs the tool in a child process and follows it through this file of events (one JSON object per
+# line); it asks for a stop with the file PRA_STOP_FILE (see Write-PraEvent, Test-PraStopRequest).
+$script:EventFile = [string]$env:PRA_EVENT_FILE
+$script:QuestionCount = 0
 # Columns of the CSV report, in this order (also the fields copied from each result row).
 $script:RowFields = @('Identity','Kind','PrimarySmtpAddress','ObjectGuid','ExchangeGuid','Action','Entra','ExchangeOnline',
     'TeamsStorage','Licence','Holds','Permissions','FinalStatus','Detail','Warnings')
@@ -192,6 +197,57 @@ function Add-PraWarning {
     })
 }
 
+function Write-PraEvent {
+    <#
+    .SYNOPSIS
+        One event of the run for the window (PRA_EVENT_FILE): one JSON object per line. Nothing when the run does
+        not belong to the window; never stops the run.
+    .DESCRIPTION
+        Kinds: start (banner), step, item (console line), ask (question to the operator), summary (final card),
+        result (the object returned by Complete-PraRun). Every event has 'time' and 'kind'.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Kind, [hashtable]$Data = @{})
+    if (-not $script:EventFile) { return }
+    $record = [ordered]@{ time = (Get-Date).ToString('o'); kind = $Kind }
+    foreach ($key in $Data.Keys) { $record[$key] = $Data[$key] }
+    $line = ($record | ConvertTo-Json -Compress -Depth 6) + "`n"
+    # The window reads the file while it is written (shared read): one more try if both meet.
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try { [IO.File]::AppendAllText($script:EventFile, $line, (New-Object Text.UTF8Encoding($false))); return }
+        catch { Start-Sleep -Milliseconds 50 }
+    }
+}
+
+function Test-PraStopRequest {
+    <# The window asked for a stop (the file PRA_STOP_FILE exists): the run starts no new object. #>
+    [CmdletBinding()]
+    param()
+    return [bool]($env:PRA_STOP_FILE -and (Test-Path -LiteralPath $env:PRA_STOP_FILE))
+}
+
+function Request-PraOperator {
+    <#
+    .SYNOPSIS
+        Asks the operator a yes/no question: in the window when the run belongs to it (event 'ask', answered in the
+        file named by the event), otherwise in the console ($Caller.ShouldContinue). A stop request answers no.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Question, [string]$Title = 'PRA Cloud Mailbox', [object]$Caller)
+    if ($script:EventFile) {
+        $script:QuestionCount++
+        $answer = '{0}.answer-{1}' -f $script:EventFile, $script:QuestionCount
+        Write-PraEvent 'ask' @{ id = $script:QuestionCount; title = $Title; text = $Question; answer = $answer }
+        while (-not (Test-Path -LiteralPath $answer)) {
+            if (Test-PraStopRequest) { return $false }
+            Start-Sleep -Milliseconds 500
+        }
+        return ([string](Get-Content -LiteralPath $answer -Raw) -match '^\s*yes')
+    }
+    if (-not $Caller) { throw "$Question - the operator cannot be asked in this run." }
+    return [bool]$Caller.ShouldContinue($Question, $Title)
+}
+
 function Write-PraLogFile {
     <# Appends one line to the log file. A log that cannot be written stops the run (audit). #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost','',Justification='Last-resort console message when the log is broken.')]
@@ -251,6 +307,9 @@ function Write-PraLog {
             Write-PraHost @('      ', (Get-PraIcon $status), $text) -Color $textColor
         }
     }
+    if ($Level -in @('Info','Sub','Success','Warning','Error')) {
+        Write-PraEvent 'item' @{ status = @{ Info='Info'; Sub='Sub'; Success='Ok'; Warning='Warn'; Error='Fail' }[$Level]; text = $text; identity = [string](Get-PraValue $Context 'CurrentIdentity' '') }
+    }
 }
 
 function Write-PraItem {
@@ -271,6 +330,7 @@ function Write-PraItem {
     Write-PraHost @('      ', $symbol, $Text) -Color $textColor
     if ($Status -eq 'Warn') { $Context.Warnings = [int](Get-PraValue $Context 'Warnings' 0) + 1; Add-PraWarning $Context $Text }
     Write-PraLogFile -Context $Context -Level (@{ Ok='OK'; Warn='WARN'; Fail='FAIL'; Info='INFO'; Skip='SKIP' }[$Status]) -Message $Text
+    Write-PraEvent 'item' @{ status = $Status; text = $Text; identity = [string](Get-PraValue $Context 'CurrentIdentity' '') }
 }
 
 function Write-PraBanner {
@@ -279,7 +339,7 @@ function Write-PraBanner {
         Title card at the start of an execution:
 
           ╭────────────────────────────────────────────────────────────────────────────╮
-          │  ♦  PRA Cloud Mailbox                            v1.0.0 · Nicolas Fabert   │
+          │  ♦  PRA Cloud Mailbox                            v1.1.0 · Nicolas Fabert   │
           │     Exchange disaster recovery · scenario 2: on-premises lost → Exchange O │
           ╰────────────────────────────────────────────────────────────────────────────╯
                ►  Action     Convert · Preview (nothing is changed)
@@ -305,6 +365,7 @@ function Write-PraBanner {
     }
     Write-PraHost @(,@(('  ' + $F.BottomLeft + ($F.Horizontal * $width) + $F.BottomRight), $T.Accent))
     Write-PraLogFile -Context $Context -Level 'STEP' -Message ("=== $Title v$($Context.Version) - run $($Context.RunId) ===")
+    $eventDetails = [ordered]@{}
     if ($Details) {
         foreach ($key in $Details.Keys) {
             $value = $Details[$key]
@@ -312,8 +373,11 @@ function Write-PraBanner {
             if ($value -is [array]) { $icon = Get-PraIcon $value[0]; $text = $value[1] }
             Write-PraHost @('     ', $icon, ('{0,-11}' -f $key), (' ' + $text))
             Write-PraLogFile -Context $Context -Level 'INFO' -Message ('{0}: {1}' -f $key, $text)
+            $eventDetails[$key] = [string]$text
         }
     }
+    Write-PraEvent 'start' @{ title = $Title; action = [string](Get-PraValue $Context 'Action' ''); mode = [string](Get-PraValue $Context 'Mode' ''); version = [string]$Context.Version
+        runId = [string]$Context.RunId; logFile = [string](Get-PraValue $Context 'LogFile' ''); details = $eventDetails }
 }
 
 function Write-PraStep {
@@ -335,6 +399,7 @@ function Write-PraStep {
     Write-Host ''
     Write-PraHost @('  ', ('{0,5}' -f $number), '  ', (Get-PraIcon $Icon), $Title) -Color $script:Theme.Accent
     Write-PraLogFile -Context $Context -Level 'STEP' -Message ("[$number] $Title")
+    Write-PraEvent 'step' @{ index = $Context.StepIndex; total = $total; title = $Title }
 }
 
 function Write-PraSummary {
@@ -375,6 +440,13 @@ function Write-PraSummary {
         }
     }
     Write-PraHost @(,@(('  ' + $F.BottomLeft + ($F.Horizontal * $width) + $F.BottomRight), $color))
+    $eventValues = [ordered]@{}
+    foreach ($key in $Values.Keys) {
+        $value = $Values[$key]
+        $text = if ($value -is [array] -and $value.Count -eq 2 -and $script:Icons.ContainsKey([string]$value[0])) { $value[1] } else { $value }
+        $eventValues[$key] = @(@($text) | ForEach-Object { [string]$_ })
+    }
+    Write-PraEvent 'summary' @{ title = $Title; status = $Status; values = $eventValues }
 }
 #endregion
 
@@ -902,7 +974,7 @@ function Complete-PraRun {
     }
     $outcome = Get-PraOutcome $Context
     $Context.ExitCode = $outcome.ExitCode; $Context.ResultStatus = $outcome.Status
-    return [pscustomobject][ordered]@{
+    $result = [pscustomobject][ordered]@{
         RunId = $Context.RunId; Version = $Context.Version; Action = $Context.Action; Mode = $Context.Mode; Phase = $Context.Phase
         Status = $outcome.Status; ExitCode = $outcome.ExitCode; SuccessCount = $outcome.Counts.Success; ErrorCount = $outcome.Counts.Error
         PendingCount = $outcome.Counts.Pending; SkippedCount = $outcome.Counts.Skipped; PlannedCount = $outcome.Counts.Planned
@@ -915,8 +987,15 @@ function Complete-PraRun {
         WarningCount = @(@(Get-PraValue $Context 'WarningList' @()) | ForEach-Object { $_ } | Where-Object { $null -ne $_ }).Count
         Warnings = [object[]]@(@(Get-PraValue $Context 'WarningList' @()) | ForEach-Object { $_ } | Where-Object { $null -ne $_ })
     }
+    Write-PraEvent 'result' @{ status = $result.Status; exitCode = $result.ExitCode; action = [string]$result.Action; mode = [string]$result.Mode
+        success = $result.SuccessCount; error = $result.ErrorCount; pending = $result.PendingCount; skipped = $result.SkippedCount; planned = $result.PlannedCount
+        total = $result.TotalCount; seconds = [int]$result.Duration.TotalSeconds; batchId = $result.BatchId; nextSteps = @($result.NextSteps)
+        logFile = [string]$result.LogFile; csvReport = [string]$result.CsvReport; htmlReport = [string]$result.HtmlReport; warnings = $result.WarningCount
+        issues = @($result.Issues | ForEach-Object { [string](Get-PraValue $_ 'Message' ([string]$_)) }) }
+    return $result
 }
 #endregion
 
 Export-ModuleMember -Function Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
-    Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun
+    Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun,
+    Write-PraEvent, Test-PraStopRequest, Request-PraOperator

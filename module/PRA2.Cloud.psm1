@@ -23,7 +23,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.0.0
+    Version : 1.1.0
 #>
 #Requires -Version 5.1
 Set-StrictMode -Version Latest
@@ -78,11 +78,28 @@ function Disconnect-Pra2Cloud {
     if ($Context.ContainsKey('GraphConnected') -and $Context['GraphConnected']) { try { $null = Disconnect-MgGraph -ErrorAction Stop } catch { $null = $_ }; $Context['GraphConnected'] = $false }
 }
 
+function Test-Pra2NetworkFailure {
+    <#
+    .SYNOPSIS
+        A failure of the connection itself, without an HTTP answer: timeout, reset, name resolution. Seen in the lab
+        after a long delta cycle. Every Graph call of the tool can be sent again (reads, PATCH of a value, licence
+        assignment, group member added when missing, DELETE allowing 404).
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][Exception]$Exception)
+    for ($e = $Exception; $e; $e = $e.InnerException) {
+        if ($e -is [Net.Sockets.SocketException] -or $e -is [IO.IOException] -or $e -is [TimeoutException] -or $e -is [Threading.Tasks.TaskCanceledException]) { return $true }
+        # HttpRequestException without a status code (.NET 5+) or without the property (.NET Framework): no answer at all.
+        if ($e.GetType().FullName -eq 'System.Net.Http.HttpRequestException' -and (-not $e.PSObject.Properties['StatusCode'] -or $null -eq $e.StatusCode)) { return $true }
+    }
+    return $false
+}
+
 function Invoke-Pra2Graph {
     <#
     .SYNOPSIS
-        Microsoft Graph request with retries on throttling (429) and transient errors (502, 503, 504).
-        Returns $null for 404 when -AllowNotFound.
+        Microsoft Graph request with retries on throttling (429), transient errors (502, 503, 504) and connection
+        failures without an answer (Test-Pra2NetworkFailure). Returns $null for 404 when -AllowNotFound.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Uri, [ValidateSet('GET','POST','PATCH','DELETE')][string]$Method = 'GET', [object]$Body, [switch]$AllowNotFound)
@@ -95,6 +112,7 @@ function Invoke-Pra2Graph {
             try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = 0 }
             if ($code -eq 404 -and $AllowNotFound) { return $null }
             if ($code -in @(429, 502, 503, 504) -and $attempt -lt 5) { Start-Sleep -Seconds (5 * $attempt); continue }
+            if ($code -eq 0 -and $attempt -lt 5 -and (Test-Pra2NetworkFailure $_.Exception)) { Start-Sleep -Seconds (10 * $attempt); continue }
             # The Graph message (error.code: error.message) says what is wrong; the exception alone only says "BadRequest".
             $detail = ''
             try { $graphError = ([string]$_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop).error; $detail = '{0}: {1}' -f $graphError.code, $graphError.message } catch { $detail = '' }
@@ -735,7 +753,8 @@ function Invoke-Pra2EntraConnect {
         EntraConnect.Mode:
           Remoting  Invoke-Command to EntraConnect.Server (ADSync cmdlets), with the current account.
           Script    EntraConnect.ScriptPath -Operation <op>: any way to reach the server (exit 0 = done).
-          Manual    The operator does it; the tool asks for a confirmation (impossible with -Force).
+          Manual    The operator does it; the tool asks for a confirmation (in the console, or in the window when the
+                    run belongs to it; impossible with -Force in the console).
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][ValidateSet('Pause','Resume','Delta')][string]$Operation, [object]$Caller)
@@ -770,9 +789,10 @@ function Invoke-Pra2EntraConnect {
         }
         'Manual' {
             $text = @{ Pause = 'Pause the Entra Connect scheduler (Set-ADSyncScheduler -SyncCycleEnabled $false)'; Resume = 'Resume the Entra Connect scheduler (Set-ADSyncScheduler -SyncCycleEnabled $true)'; Delta = 'Run a delta synchronisation (Start-ADSyncSyncCycle -PolicyType Delta) and wait for its end' }[$Operation]
-            if (-not $Caller) { throw "EntraConnect.Mode = Manual needs the operator: $text." }
+            # The window answers through its event file (PRA_EVENT_FILE); the console through the caller.
+            if (-not $Caller -and -not $env:PRA_EVENT_FILE) { throw "EntraConnect.Mode = Manual needs the operator: $text." }
             $where = if ($entra.Server) { $entra.Server } else { 'the Entra Connect server' }
-            if (-not $Caller.ShouldContinue("$text on $where. Done?", 'PRA Cloud Mailbox - Entra Connect')) { throw "Entra Connect operation $Operation not confirmed by the operator." }
+            if (-not (Request-PraOperator -Question "$text on $where. Done?" -Title 'PRA Cloud Mailbox - Entra Connect' -Caller $Caller)) { throw "Entra Connect operation $Operation not confirmed by the operator." }
             return 'confirmed by the operator'
         }
     }

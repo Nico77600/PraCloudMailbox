@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     PRA Cloud Mailbox - end-to-end tests of Convert and Recover against an in-memory tenant (tests\FakeTenant.ps1).
 .DESCRIPTION
@@ -62,7 +62,7 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
 
         function Start-E2E {
             <# Sets, in the test, the script-level variables that the functions of the entry script read. #>
-            param([ValidateSet('Convert', 'Recover')][string]$Action, [string]$Mode = 'Apply', [string]$Batch = '', [string]$Identity = '', [string]$Scope = 'All')
+            param([ValidateSet('Convert', 'Recover')][string]$Action, [string]$Mode = 'Apply', [string]$Batch = '', [string]$Identity = '', [string]$Scope = 'All', [string]$IdentityPath = '')
             $config = Import-PraConfiguration -Path $global:PraE2E.Config -Root $global:PraE2E.Root
             $run = @{ Root = $global:PraE2E.Root; Version = 'test'; RunId = [guid]::NewGuid().ToString('N'); StartTime = Get-Date; Action = $Action; Mode = $Mode; Phase = ''
                 CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; StepTotal = $(if ($Action -eq 'Convert') { 7 } else { 8 }); Warnings = 0
@@ -71,7 +71,8 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
                 LogFolder = $config.Logging.Folder; ReportFolder = $config.Report.Folder; LogFile = (Join-Path $global:PraE2E.Dir 'run.log'); TranscriptPath = ''; TranscriptStarted = $false
                 NoReport = $true; Server = ''; CloudConnectFailed = $false; ExitCode = 0; ResultStatus = ''; Config = $config; VerboseEnabled = $false
                 BatchId = ''; SnapshotLabel = ''; NextSteps = @(); Journal = $null }
-            $values = @{ context = $run; Action = $Action; Mode = $Mode; Batch = $Batch; Identity = $Identity; Scope = $Scope; Snapshot = [long]0; Force = $true; PassThru = $false; toolVersion = 'test'; caller = $null }
+            if ($IdentityPath) { $run.Identities = @(Read-PraIdentityFile -Path $IdentityPath) }
+            $values = @{ context = $run; Action = $Action; Mode = $Mode; Batch = $Batch; Identity = $Identity; IdentityPath = $IdentityPath; Scope = $Scope; Snapshot = [long]0; Force = $true; PassThru = $false; toolVersion = 'test'; caller = $null }
             foreach ($name in $values.Keys) { Set-Variable -Name $name -Value $values[$name] -Scope 1 }
         }
 
@@ -523,5 +524,114 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Success'
         @($compta.SendAs) | Should -Be @($bob.Id)
         (Get-E2EJournal $convert).Batch.status | Should -Be 'Complete'
+    }
+    It 'converts and recovers a wave given by -IdentityPath, and reports the identities it cannot find' {
+        $wave = Join-Path $global:PraE2E.Dir 'wave1.txt'
+        Set-Content -LiteralPath $wave -Encoding UTF8 -Value @('# wave 1', 'alice@contoso.com', 'COMPTA@contoso.com', 'ghost@contoso.com', 'alice@contoso.com')
+        Start-E2E -Action Convert -IdentityPath $wave
+        Invoke-PraConvert
+        @($context.Rows | ForEach-Object { $_.Identity }) | Should -Be @('alice@contoso.com', 'compta@contoso.com')
+        @($context.Rows | ForEach-Object { $_.FinalStatus }) | Should -Be @('Success', 'Success')
+        # bob is only a SendAs trustee of compta: his own identity is not touched.
+        @($global:PraFake.Calls | Where-Object { $_ -match 'Set-MailUser bob@' -or $_ -match [regex]::Escape($bob.Id) }) | Should -BeNullOrEmpty
+        $bob.CloudManaged | Should -BeFalse
+        @($context.WarningList | Where-Object { $_.Message -match '1 identity\(ies\) of the list not in snapshot .*ghost@contoso.com' }).Count | Should -Be 1
+        $convert = $context.BatchId
+        Close-E2E
+
+        Set-Content -LiteralPath $wave -Encoding UTF8 -Value 'Identity', 'alice@contoso.com'
+        Start-E2E -Action Recover -Batch $convert -IdentityPath $wave
+        Invoke-PraRecover
+        @($context.Rows | ForEach-Object { $_.Identity }) | Should -Be @('alice@contoso.com')
+        $alice.Type | Should -Be 'MailUser'
+        $compta.Type | Should -Be 'SharedMailbox'
+        (Get-E2EJournal $context.BatchId).Batch.status | Should -Be 'Partial'
+        Close-E2E
+
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PraRecover
+        @($context.Rows | ForEach-Object { $_.Identity }) | Should -Be @('compta@contoso.com')
+        (Get-E2EJournal $context.BatchId).Batch.status | Should -Be 'Complete'
+    }
+
+    It 'stops Convert before the next object when the window asks, then the batch resumes' {
+        $stop = Join-Path $global:PraE2E.Dir 'run.stop'
+        $env:PRA_STOP_FILE = $stop
+        try {
+            $global:PraFake.Faults.StopAfter = @{ Pattern = 'Graph POST groups/.+/members'; Path = $stop }
+            Start-E2E -Action Convert
+            Invoke-PraConvert
+            $convert = $context.BatchId
+            @($context.Rows | ForEach-Object { $_.FinalStatus }) | Should -Be @('Pending', 'Pending', 'Pending')
+            (Get-E2ERow 'bob@contoso.com').Detail | Should -Match 'stop requested by the operator'
+            (Get-E2ERow 'compta@contoso.com').Detail | Should -Match 'stop requested by the operator'
+            $bob.CloudManaged | Should -BeFalse
+            @($global:PraFake.Calls | Where-Object { $_ -match 'Set-MailUser bob@|assignLicense' }) | Should -BeNullOrEmpty
+            (Get-E2EJournal $convert).Batch.status | Should -Be 'Partial'
+            $context.NextSteps -join ' ' | Should -Match "Convert -Mode Apply -Batch $convert"
+            Close-E2E
+
+            Remove-Item -LiteralPath $stop
+            $global:PraFake.Faults.StopAfter = $null
+            Start-E2E -Action Convert -Batch $convert
+            Invoke-PraConvert
+            @($context.Rows | ForEach-Object { $_.FinalStatus }) | Should -Be @('Success', 'Success', 'Success')
+            @($global:PraFake.Calls | Where-Object { $_ -match 'Graph POST groups/.+/members' }).Count | Should -Be 2
+            (Get-E2EJournal $convert).Batch.status | Should -Be 'Complete'
+        } finally { Remove-Item Env:\PRA_STOP_FILE -ErrorAction SilentlyContinue }
+    }
+
+    It 'stops Recover before the next object: the users already switched back are finished, the scheduler is never left paused' {
+        Start-E2E -Action Convert
+        Invoke-PraConvert
+        $convert = $context.BatchId
+        Close-E2E
+        $stop = Join-Path $global:PraE2E.Dir 'run.stop'
+        $env:PRA_STOP_FILE = $stop
+        try {
+            $global:PraFake.Faults.StopAfter = @{ Pattern = "Graph PATCH users/$($alice.Id)/onPremisesSyncBehavior"; Path = $stop }
+            Start-E2E -Action Recover -Batch $convert
+            Invoke-PraRecover
+            (Get-E2ERow 'alice@contoso.com').FinalStatus | Should -Be 'Success'
+            $alice.Type | Should -Be 'MailUser'
+            (Get-E2ERow 'bob@contoso.com').FinalStatus | Should -Be 'Pending'
+            $bob.Type | Should -Be 'UserMailbox'
+            $bob.CloudManaged | Should -BeTrue
+            (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Pending'
+            $compta.Type | Should -Be 'SharedMailbox'
+            (Get-E2ECallIndex 'EntraConnect Pause') | Should -Be -1
+            (Get-E2EJournal $context.BatchId).Batch.status | Should -Be 'Partial'
+            Close-E2E
+
+            Remove-Item -LiteralPath $stop
+            $global:PraFake.Faults.StopAfter = $null
+            Start-E2E -Action Recover -Batch $convert
+            Invoke-PraRecover
+            @($context.Rows | ForEach-Object { $_.Identity }) | Should -Be @('bob@contoso.com', 'compta@contoso.com')
+            @($context.Rows | ForEach-Object { $_.FinalStatus }) | Should -Be @('Success', 'Success')
+            (Get-E2EJournal $context.BatchId).Batch.status | Should -Be 'Complete'
+        } finally { Remove-Item Env:\PRA_STOP_FILE -ErrorAction SilentlyContinue }
+    }
+
+    It 'writes the events the window follows: steps, lines, the plan and the result' {
+        $events = Join-Path $global:PraE2E.Dir 'run.events.jsonl'
+        & (Get-Module PRA2.Common) { $script:EventFile = $args[0] } $events
+        try {
+            Start-E2E -Action Convert -Mode Preview
+            Invoke-PraConvert
+            # The audit files of a real run (Initialize-PraAudit is not called here).
+            Set-Content -LiteralPath $context.LogFile -Value 'log'
+            $context.TranscriptPath = Join-Path $global:PraE2E.Dir 'run.transcript.txt'; Set-Content -LiteralPath $context.TranscriptPath -Value 'transcript'; $context['_PraTranscriptCreated'] = $true
+            $null = Complete-PraRun -Context $context
+        } finally { & (Get-Module PRA2.Common) { $script:EventFile = '' } }
+        $records = @(Get-Content -LiteralPath $events -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json })
+        @($records | Where-Object kind -eq 'step' | ForEach-Object { $_.title }) | Should -Contain 'Plan and confirmation'
+        @($records | Where-Object { $_.kind -eq 'item' -and $_.text -match '3 object\(s\) ready' }).Count | Should -Be 1
+        @($records | Where-Object { $_.kind -eq 'item' -and $_.status -eq 'Sub' -and $_.text -match 'Planned: compta@contoso.com' }).Count | Should -Be 1
+        $result = $records[-1]
+        $result.kind | Should -Be 'result'
+        $result.action | Should -Be 'Convert'
+        $result.planned | Should -Be 3
+        $result.exitCode | Should -Be 0 -Because (@($result.issues) -join '; ')
     }
 }

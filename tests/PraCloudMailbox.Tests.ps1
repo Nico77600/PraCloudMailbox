@@ -737,6 +737,23 @@ Describe 'Cloud calls (mocked Graph)' {
         { Set-Pra2Licence -UserId 'u1' -SkuId 's1' -Operation Remove } | Should -Throw
         $script:calls | Should -Be 1
     }
+    It 'sends a request again when the connection failed without an answer (timeout seen in the lab), never a refused one' {
+        $script:calls = 0
+        Mock Start-Sleep -ModuleName PRA2.Cloud { }
+        Mock Invoke-MgGraphRequest -ModuleName PRA2.Cloud {
+            $script:calls++
+            if ($script:calls -lt 3) { throw [Exception]::new('A connection attempt failed (graph.microsoft.com:443)', [Net.Sockets.SocketException]::new(10060)) }
+            [pscustomobject]@{ id = 'u1' }
+        }
+        (Invoke-Pra2Graph -Uri 'v1.0/users/u1').id | Should -Be 'u1'
+        $script:calls | Should -Be 3
+        & (Get-Module PRA2.Cloud) { Test-Pra2NetworkFailure ([TimeoutException]::new('x')) } | Should -BeTrue
+        & (Get-Module PRA2.Cloud) { Test-Pra2NetworkFailure ([InvalidOperationException]::new('BadRequest')) } | Should -BeFalse
+        $script:calls = 0
+        Mock Invoke-MgGraphRequest -ModuleName PRA2.Cloud { $script:calls++; throw [Exception]::new('down', [IO.IOException]::new('reset')) }
+        { Invoke-Pra2Graph -Uri 'v1.0/users/u1' } | Should -Throw '*down*'
+        $script:calls | Should -Be 5
+    }
 }
 
 Describe 'Configuration' {
@@ -750,5 +767,69 @@ Describe 'Configuration' {
         $path = Join-Path $folder 'c.psd1'
         Set-Content -LiteralPath $path -Value ("@{ Environment = 'X'; $Text }") -Encoding UTF8
         { Import-PraConfiguration -Path $path -Root $folder } | Should -Throw $Message
+    }
+}
+
+Describe 'Link with the window: events, stop, questions, waves' {
+    BeforeAll {
+        $script:linkFolder = Join-Path $TestDrive 'link'
+        $null = New-Item -ItemType Directory -Path $script:linkFolder
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:Root 'Invoke-PraCloudMailbox.ps1'), [ref]$null, [ref]$null)
+        $function = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Read-PraIdentityFile' }, $true)
+        . ([scriptblock]::Create($function.Extent.Text))
+    }
+    AfterEach {
+        & (Get-Module PRA2.Common) { $script:EventFile = ''; $script:QuestionCount = 0 }
+        Remove-Item Env:\PRA_STOP_FILE -ErrorAction SilentlyContinue
+    }
+
+    It 'writes nothing when the run does not belong to the window' {
+        Write-PraEvent 'item' @{ text = 'x' }
+        @(Get-ChildItem -LiteralPath $script:linkFolder).Count | Should -Be 0
+    }
+    It 'asks the operator through the event file and reads the answer; a stop request answers no' {
+        $events = Join-Path $script:linkFolder 'ask.events.jsonl'
+        & (Get-Module PRA2.Common) { $script:EventFile = $args[0] } $events
+        Set-Content -LiteralPath "$events.answer-1" -Value 'yes'
+        Request-PraOperator -Question 'Pause the scheduler. Done?' | Should -BeTrue
+        $env:PRA_STOP_FILE = Join-Path $script:linkFolder 'run.stop'
+        Set-Content -LiteralPath $env:PRA_STOP_FILE -Value 'stop'
+        Test-PraStopRequest | Should -BeTrue
+        Request-PraOperator -Question 'Resume the scheduler. Done?' | Should -BeFalse
+        $asked = @(Get-Content -LiteralPath $events -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object kind -eq 'ask')
+        @($asked | ForEach-Object { $_.text }) | Should -Be @('Pause the scheduler. Done?', 'Resume the scheduler. Done?')
+        $asked[1].answer | Should -Be "$events.answer-2"
+    }
+    It 'Entra Connect Manual mode asks the window when the run belongs to it' {
+        $events = Join-Path $script:linkFolder 'manual.events.jsonl'
+        & (Get-Module PRA2.Common) { $script:EventFile = $args[0] } $events
+        $env:PRA_EVENT_FILE = $events
+        try {
+            Set-Content -LiteralPath "$events.answer-1" -Value 'yes'
+            $context = New-TestContext
+            Invoke-Pra2EntraConnect -Context $context -Operation Pause | Should -Be 'confirmed by the operator'
+            Set-Content -LiteralPath "$events.answer-2" -Value 'no'
+            { Invoke-Pra2EntraConnect -Context $context -Operation Resume } | Should -Throw '*not confirmed by the operator*'
+        } finally { Remove-Item Env:\PRA_EVENT_FILE -ErrorAction SilentlyContinue }
+    }
+    It 'reads a wave from a list or a CSV file, without duplicates' {
+        $list = Join-Path $script:linkFolder 'wave.txt'
+        Set-Content -LiteralPath $list -Encoding UTF8 -Value @('# managers', 'alice@contoso.com', '', '  ALICE@contoso.com ', 'bob@contoso.com')
+        Read-PraIdentityFile -Path $list | Should -Be @('alice@contoso.com', 'bob@contoso.com')
+        $csv = Join-Path $script:linkFolder 'wave.csv'
+        Set-Content -LiteralPath $csv -Encoding UTF8 -Value @('Identity;Note', 'compta@contoso.com;shared', 'carol@contoso.com;')
+        Read-PraIdentityFile -Path $csv | Should -Be @('compta@contoso.com', 'carol@contoso.com')
+        Set-Content -LiteralPath $list -Encoding UTF8 -Value '# nothing'
+        { Read-PraIdentityFile -Path $list } | Should -Throw '*no identity*'
+        { Read-PraIdentityFile -Path (Join-Path $script:linkFolder 'missing.txt') } | Should -Throw '*file not found*'
+    }
+    It 'opens the window with -Gui alone, and refuses -IdentityPath with -Identity or for Collect' {
+        $command = Get-Command (Join-Path $script:Root 'Invoke-PraCloudMailbox.ps1')
+        $gui = $command.ParameterSets | Where-Object Name -eq 'Gui'
+        @($gui.Parameters | Where-Object IsMandatory | ForEach-Object Name) | Should -Be @('Gui')
+        @($gui.Parameters | ForEach-Object Name) | Should -Not -Contain 'Action'
+        $source = [IO.File]::ReadAllText((Join-Path $script:Root 'Invoke-PraCloudMailbox.ps1'))
+        $source | Should -Match 'Use -Identity \(one object\) or -IdentityPath \(a list\), not both'
+        $source | Should -Match '-IdentityPath is for Check, Convert and Recover'
     }
 }

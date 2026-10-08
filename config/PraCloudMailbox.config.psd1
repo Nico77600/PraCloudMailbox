@@ -2,7 +2,7 @@
 #  PRA Cloud Mailbox - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 1.0.0
+#  Version : 1.1.0
 #
 #  This file is read by Invoke-PraCloudMailbox.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.

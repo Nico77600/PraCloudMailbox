@@ -66,6 +66,12 @@ The states of a mailbox through the cycle:
 > [!CAUTION]
 > Convert and Recover change production objects in Entra ID and Exchange Online. Every behaviour they rely on was measured in a lab (developer guide, appendix B): run the preview, read the plan, and test the whole cycle with your own tenant before relying on it in a real disaster.
 
+## The window
+
+<p align="center"><a href="docs/images/pra-gui-overview.png"><img alt="The window: the next step, the configuration, the last snapshot and Check, the batches, this computer, and the activity of the last run with its batch ID" src="docs/images/pra-gui-overview.png" width="900"></a></p>
+
+`.\Invoke-PraCloudMailbox.ps1 -Gui` (Windows PowerShell 5.1 or PowerShell 7) opens the same four actions in a window: the next step at a glance, one table of objects per page (filter, waves of ticked objects), the activity of the run step by step. Each button runs the command line in its own PowerShell, with its log, journal and report; *Convert…* and *Recover…* are enabled only after a preview of the same selection, and ask for a typed confirmation.
+
 ## Reports
 
 <table>
@@ -90,7 +96,7 @@ Every run also writes a log, a PowerShell transcript and a CSV; Convert and Reco
 | Cloud actions | A cloud admin server that does not depend on the on-premises AD, **PowerShell 7.4+**, `Microsoft.Graph.Authentication` and `ExchangeOnlineManagement` 3.10+ |
 | App registration | Certificate; Graph application permissions (users, source of authority, licences, organisation, group members); `Exchange.ManageAsApp` with Exchange Administrator; eDiscovery Manager in Microsoft Purview |
 | Licences and holds | A licence group with an Exchange Online plan (or the Kiosk plan of the Teams licence, or direct licences), **one** free unit for the shared mailboxes, an eDiscovery case hold policy, a retention policy for the inactive shared mailboxes |
-| Console | Windows Terminal for emoji and colours; the classic console shows symbols |
+| Console | Windows Terminal for emoji and colours; the classic console shows symbols. The window: Windows 10/11 or Windows Server 2016+, Fluent theme with PowerShell 7.5+ |
 
 ## Quick start
 
@@ -108,6 +114,9 @@ notepad .\config\PraCloudMailbox.config.psd1        # scope, tenant, app registr
 .\Invoke-PraCloudMailbox.ps1 -Action Convert                        # disaster: preview of the plan
 .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply            # prints the batch ID
 .\Invoke-PraCloudMailbox.ps1 -Action Recover -Batch 5b21030d -Mode Apply    # infrastructure rebuilt: roll the batch back
+
+# Or the window, on either computer
+.\Invoke-PraCloudMailbox.ps1 -Gui
 ```
 
 One command per moment — every day, every week, the disaster, the rollback, the days after: see the [user guide](docs/PraCloudMailbox-UserGuide.md). The environment values of the configuration are empty in this repository. The zip of each [release](https://github.com/Nico77600/PraCloudMailbox/releases) contains only the files needed to run, with both guides in HTML; `.\tools\New-PraCloudPackage.ps1` builds the same package from the repository.
@@ -129,7 +138,7 @@ powershell.exe -NoProfile -File .\tests\Invoke-TestGate.ps1     # Windows PowerS
 pwsh -NoProfile -File .\tests\Invoke-TestGate.ps1               # PowerShell 7: everything, Convert and Recover end to end
 ```
 
-The end-to-end tests run the real Convert and Recover code against an in-memory tenant that reproduces what the lab showed (Teams storage promoted, a hold that blocks the switch back, inactive mailbox when a held identity is deleted, deleted object restored by Entra Connect unless purged...), with faults to inject: order of the steps, resume, refusals, waves, partial failures and the rollback of every state. The tool was also validated on a lab of Exchange Server SE servers with Entra Connect and a Microsoft 365 E5 tenant — licence groups (cloud and synchronised), Kiosk and direct licences, shared mailboxes, waves, Entra Connect remoting (developer guide, appendix B).
+The end-to-end tests run the real Convert and Recover code against an in-memory tenant that reproduces what the lab showed (Teams storage promoted, a hold that blocks the switch back, inactive mailbox when a held identity is deleted, deleted object restored by Entra Connect unless purged...), with faults to inject: order of the steps, resume, refusals, waves, stops and resumes, partial failures and the rollback of every state; the window is tested in both editions, with a real run in a child PowerShell. The tool was also validated on a lab of Exchange Server SE servers with Entra Connect and a Microsoft 365 E5 tenant — licence groups (cloud and synchronised), Kiosk and direct licences, shared mailboxes, waves, Entra Connect remoting (developer guide, appendix B).
 
 ## License
 

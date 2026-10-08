@@ -1,7 +1,7 @@
 ---
 title: PRA Cloud Mailbox
 subtitle: Developer guide
-version: 1.0.0
+version: 1.1.0
 author: Nicolas Fabert
 updated: 2026-10-08
 ---
@@ -38,6 +38,7 @@ Collect every day | `.\Invoke-PraCloudMailbox.ps1 -Action Collect -Mode Apply -F
 Check | `.\Invoke-PraCloudMailbox.ps1 -Action Check` in PowerShell 7 on the cloud admin server: every object must be ready (chapter 8).
 Disaster | `.\Invoke-PraCloudMailbox.ps1 -Action Convert`, then `-Mode Apply`: note the batch ID (chapter 9).
 Infrastructure rebuilt | `.\Invoke-PraCloudMailbox.ps1 -Action Recover -Batch <ID>`, then `-Mode Apply` (chapter 10).
+Or the window | `.\Invoke-PraCloudMailbox.ps1 -Gui`: the same actions, a preview before every change and a typed confirmation (chapter 13.1).
 ```
 
 > [!CAUTION]
@@ -344,6 +345,7 @@ Steps: snapshot, Microsoft 365 connection, tenant prerequisites, objects. An obj
 .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply                       # one confirmation, then the batch
 .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply -Scope UsersOnly -Force
 .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply -Batch 5b21030d       # resume a batch
+.\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply -IdentityPath .\data\wave1.txt   # a wave
 ```
 
 ![Convert -Mode Apply: users, then shared mailboxes one after another](images/pra-console-convert.png)
@@ -356,6 +358,8 @@ Steps: snapshot, Microsoft 365 connection, readiness (the rules of Check), plan 
 - **Licence group synchronised from AD** (Group mode): its source of authority goes to the cloud once, before the first user; the journal records it.
 - **Shared mailboxes**: one after another, so one unit of `Licensing.Shared.SkuPartNumber` is enough. Before each one, the tool checks that a unit is free: a shared mailbox that failed keeps its temporary licence and the next ones are not started (never left half-converted). The licence assignment is retried for 45 s (it can be refused just after the usageLocation change). The permissions of the snapshot are granted and read back: FullAccess with AutoMapping as collected, SendAs, SendOnBehalf; group trustees as their members.
 - **Resume** (`-Batch`): only the objects not *Done* are taken again; objects that already hold their licence do not count in the capacity check.
+- **A wave** (`-IdentityPath`): a text file with one identity per line (UPN, address, sAMAccountName or object GUID; `#` starts a comment) or a CSV file with an `Identity` column. Only these objects of the snapshot are read; the identities found nowhere are listed as a warning. `-Identity` and `-IdentityPath` go alone.
+- **Stop** (from the window, chapter 13.1): no new object is started; an object in progress is finished; the objects not started stay *Planned* and the batch *Partial*: resume it with `-Batch`.
 
 > [!TIP]
 > Converting in **waves** (for example the managers first) is supported: each Convert creates its own batch, and each batch is rolled back on its own. The licence group goes back to AD only with the last converted user of all the batches of the journal.
@@ -367,6 +371,7 @@ Steps: snapshot, Microsoft 365 connection, readiness (the rules of Check), plan 
 .\Invoke-PraCloudMailbox.ps1 -Action Recover -Batch 5b21030d                   # preview
 .\Invoke-PraCloudMailbox.ps1 -Action Recover -Batch 5b21030d -Mode Apply
 .\Invoke-PraCloudMailbox.ps1 -Action Recover -Batch 5b21030d -Mode Apply -Identity compta@contoso.com
+.\Invoke-PraCloudMailbox.ps1 -Action Recover -Batch 5b21030d -Mode Apply -IdentityPath .\data\wave1.txt
 ```
 
 ![Recover -Mode Apply: users back on-premises, shared mailboxes inactive and recreated by Entra Connect](images/pra-console-recover.png)
@@ -384,6 +389,7 @@ Run it once AD, Exchange and Entra Connect are rebuilt and synchronising. Steps:
 - One scheduler pause and one delta cycle serve all the shared mailboxes of the batch.
 - **Licence group**: given back to AD only when no converted user of any Convert batch of the journal is left.
 - A Recover batch is linked to its Convert batch; running Recover again resumes it. Once complete, Recover refuses to run again on the same Convert batch.
+- **A wave** (`-IdentityPath`, as for Convert): only these objects of the batch are rolled back; the others wait for the next run with the same `-Batch`. A stop from the window leaves the objects not started *Pending*, the scheduler is resumed as always.
 
 <!-- icon: shield -->
 ## 11. After the Recover
@@ -434,11 +440,40 @@ Exit codes: `0` done, `1` failed (or an object is not ready for Check), `2` done
 | `module\PRA2.Store.psm1` | SQLite (System.Data.SQLite in `lib\sqlite`): the snapshot database and the journal, schema version 1 |
 | `module\PRA2.Collect.psm1` | Collect (Windows PowerShell 5.1): Exchange connection, scope, mailboxes, permissions, groups expanded, contacts and distribution groups |
 | `module\PRA2.Cloud.psm1` | cloud (PowerShell 7): connections, Graph with retries, tenant facts, readiness rules (`Get-Pra2Readiness`, pure functions), source of authority, licences, permissions, case hold, Entra Connect operations |
+| `module\PRA2.Gui.psm1`, `module\PRA2.Gui.xaml` | the window (`-Gui`, both editions): theme, state read from the files, pages, runs in a child process (chapter 13.1) |
 | `templates\Report.template.html` | the HTML report |
 
 The run state is one hashtable, the **context**, created by the entry script and passed to every function: `Action`, `Mode`, `RunId`, `Config`, `StepIndex` / `StepTotal`, `Rows` (one result row per object), `Issues` (run errors), `WarningList`, `BatchId`, `SnapshotLabel`, `NextSteps`, `Journal` (open journal connection), `LogFile`, `TranscriptPath`, `ExitCode`.
 
 Conventions: `Set-StrictMode -Version Latest` everywhere; generic lists created with `::new()`; never `@(...)[0]` on a result that can be empty (use `Select-Object -First 1`); files in UTF-8 **with BOM** and CRLF (Windows PowerShell 5.1 reads them); one `Write-Host` per console line (the 5.1 transcript writes each `-NoNewline` piece on its own line). The console uses console colours, not ANSI sequences, so that the transcript and the log stay clean; `PRA_ICONS = Emoji | Symbols | Ascii` forces an icon style and `PRA_ANSI = 1` writes the colours as ANSI sequences (screenshots of the guides).
+
+### 13.1 The window
+
+`-Gui` opens `module\PRA2.Gui.psm1` (layout in `PRA2.Gui.xaml`) in the PowerShell that runs it. The window never changes anything itself:
+
+```steps
+Read | The state comes from the files only: the configuration, the snapshot database and the journal (read-only), the newest Check report of the report folder.
+Run | Each action is `Invoke-PraCloudMailbox.ps1` in a child process (`pwsh.exe` 7.4+, or `powershell.exe` for Collect), hidden, with `-NonInteractive`; Apply gets `-Force` because the window asked its own confirmation.
+Follow | `PRA2.Common` writes one JSON line per console event to the file `PRA_EVENT_FILE`; a timer of the window reads the new complete lines every 400 ms.
+Answer | A question of the run (Entra Connect `Manual`) is an `ask` event; the window writes `yes` or `no` to the answer file it names, next to the event file.
+Stop | The window creates the file `PRA_STOP_FILE`; the run checks it before each object.
+```
+
+| Event | Data | Written by |
+|---|---|---|
+| `start` | title, action, mode, version, runId, logFile, details of the banner | `Write-PraBanner` |
+| `step` | index, total, title | `Write-PraStep` |
+| `item` | status (`Ok`, `Warn`, `Fail`, `Info`, `Skip`, `Sub`), text, identity | `Write-PraLog`, `Write-PraItem` |
+| `ask` | id, title, text, answer (path) | `Request-PraOperator` |
+| `summary` | title, status, values of the final card | `Write-PraSummary` |
+| `result` | status, exitCode, counters, seconds, batchId, nextSteps, logFile, csvReport, htmlReport, warnings, issues | `Complete-PraRun` |
+
+- **Preview, then Apply**: a preview records the *selection key* of what it ran on (snapshot or batch, plus a hash of the GUIDs of a wave); *Convert…* and *Recover…* are enabled only while the selection of the window has the same key, and run the very same request (same wave file) with `-Mode Apply`.
+- **Waves**: the boxes ticked are written to `data\gui\wave-<action>-<time>.csv` (`Identity` = object GUID) and passed with `-IdentityPath`.
+- **Tables**: `DataTable` views, so that 21,000 objects filter as you type (about 0.3 s) and the boxes bind both ways.
+- **Files**: `data\gui\run-<time>-<action>.events.jsonl`, `.stop`, `.out.txt`, `.err.txt` (deleted after 30 days); the wave lists are kept, the logs name them.
+- **Theme**: Fluent with PowerShell 7.5 and later (light or dark as Windows); classic WPF controls with the same colours in Windows PowerShell 5.1.
+- The engine runs exactly as by hand without the window: no `PRA_EVENT_FILE`, no event; `Request-PraOperator` asks the console.
 
 <!-- icon: database -->
 ## 14. The databases
@@ -472,6 +507,7 @@ pwsh -NoProfile -File .\tests\Invoke-TestGate.ps1             # PowerShell 7: ev
 Pester 5 and PSScriptAnalyzer; offline, nothing reaches a server or a tenant. The gate runs every `*.Tests.ps1`, then the analyzer, and writes its evidence (Pester XML, analyzer CSV, summary) in `tests\evidence\gate`.
 
 - `PraCloudMailbox.Tests.ps1`: Collect against synthetic Exchange cmdlets, the store, the configuration, the readiness rules (pure functions), the licence helpers, the Entra Connect modes, the console and the reports, and hygiene rules on the code (StrictMode patterns, encodings).
+- `PraCloudMailbox.Gui.Tests.ps1` (both editions): the data of the window (command lines, events read as they are written, filters, tables, selection keys, waves, preview counts), then the window built on a test configuration, snapshot, journal and Check report: next step, filters, ticks, Apply opened only after a preview of the same selection, a refused confirmation, the events of a run, closing refused during a run, and a real Check run in a child PowerShell. Questions and confirmations are answered by hooks (`$script:Gui.Hooks`).
 - `PraCloudMailbox.EndToEnd.Tests.ps1` (PowerShell 7): the real Convert and Recover code against `FakeTenant.ps1`, an in-memory tenant that reproduces what the lab showed — Teams storage promoted, mailbox disabled when the licence goes too early, a hold that blocks the switch back, inactive mailbox when a held identity is deleted, deleted object restored by Entra Connect unless purged, case hold "failed to be deployed" — with faults to inject. The scenarios cover the order of the steps, resume, refusals, waves of batches, partial failures and the rollback of every state. Each scenario was checked by reintroducing the bug it guards against.
 
 The repository tools (not in the package, PowerShell 7.4 and Microsoft Edge):
@@ -507,6 +543,8 @@ The repository tools (not in the package, PowerShell 7.4 and Microsoft Edge):
 | A deleted shared object came back with its old objectId | A synchronisation ran before the permanent deletion (scheduler not paused): the tool pauses it; in `Manual` mode, pause it before confirming |
 | Recreated shared object not found | Entra Connect did not create it yet (or the AD object is missing): run a delta cycle, then Recover again |
 | *Collect runs in Windows PowerShell 5.1* / *runs in PowerShell 7.4* | Each action runs in its edition: Collect in `powershell.exe`, the cloud actions in `pwsh.exe` |
+| The window: *Convert…* or *Recover…* stays disabled | No preview of the selection of now: the selection changed (a box ticked, another batch, a new snapshot) or the preview planned nothing. Run *Preview* again |
+| The window: *ended without a result* | The child PowerShell stopped before the end of the run (missing module, wrong edition, script blocked): read `data\gui\run-<time>-<action>.err.txt` and `.out.txt`, then run the same command by hand |
 
 <!-- icon: beaker -->
 ## Appendix B - Lab validation
@@ -525,6 +563,7 @@ Lab: four Exchange Server SE servers in a DAG, Active Directory, Entra Connect 2
 | Tool, Direct and Kiosk | 8 Oct | Direct mode on a user who already holds the SKU with Exchange disabled: no new unit, Exchange enabled inside the existing assignment (Graph needs the dependent plans disabled too), Recover put the assignment back with exactly the same disabled plans. Kiosk mode with the Teams licence from a synchronised group: direct assignment of the same SKU with Exchange Kiosk (no new unit), cloud mailbox in 1 min 56; Recover removed only the direct assignment |
 | Tool, shared mailboxes | 7-8 Oct | Three shared mailboxes in one batch with **one** licence unit (10 min: mailbox 24-46 s, SharedMailbox 27 s each, 10/10 permissions). Recover in 14 min 33: hold stamped in 90 s each, one scheduler pause and one delta cycle for the batch, three new objects |
 | Tool, waves and remoting | 8 Oct | Two users converted in two batches through a synchronised licence group: the Recover of the first wave kept the group in the cloud, the second gave it back to AD. `EntraConnect.Mode = Remoting` from a domain server: pause 6 s, resume 3 s, delta waited to the end |
+| Tool, window | 8 Oct | The window in PowerShell 7 ran Check, a Convert wave of one user (list written by the window, `-IdentityPath`: cloud mailbox in 2 min 28) and its Recover. A connection timeout to Graph just after a 7.5-minute delta cycle stopped the first Recover cleanly; running it again resumed the batch without a new delta (3 min 38). Graph calls now retry a connection that failed without an answer |
 
 <!-- icon: shield -->
 ## Appendix C - Security and data

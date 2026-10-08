@@ -38,6 +38,10 @@
 .PARAMETER Identity
     One mailbox only (UPN, SMTP address, sAMAccountName, DN or GUID) instead of the configured scope.
 
+.PARAMETER IdentityPath
+    Check, Convert and Recover: a wave - the objects listed in this file, one per line (UPN, SMTP address,
+    sAMAccountName, DN or GUID; # starts a comment), or a CSV file with an Identity column.
+
 .PARAMETER Scope
     All (default), UsersOnly or SharedOnly (shared, room and equipment mailboxes).
 
@@ -55,6 +59,15 @@
 
 .PARAMETER PassThru
     Also returns the result of the run as an object (Status, ExitCode, counters, file paths).
+
+.PARAMETER Gui
+    Opens the window: the state of the configuration, the snapshot and the batches, and every action with its
+    preview, a typed confirmation and the progress. It runs this script for each action (Windows PowerShell 5.1
+    for Collect, PowerShell 7 for the others), so the window and the command line do exactly the same.
+
+.EXAMPLE
+    .\Invoke-PraCloudMailbox.ps1 -Gui
+    Opens the window (Windows PowerShell 5.1 on an Exchange server, or PowerShell 7 on the cloud admin server).
 
 .EXAMPLE
     .\Invoke-PraCloudMailbox.ps1 -Action Collect
@@ -76,9 +89,13 @@
     pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Recover -Mode Apply -Batch 1a2b3c4d
     Infrastructure rebuilt: rolls back the Convert batch 1a2b3c4d.
 
+.EXAMPLE
+    pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Recover -Mode Apply -Batch 1a2b3c4d -IdentityPath .\data\wave1.txt
+    Rolls back only the objects of the batch listed in wave1.txt (a wave).
+
 .NOTES
     Author     : Nicolas Fabert
-    Version    : 1.0.0
+    Version    : 1.1.0
     Requires   : Collect: Windows PowerShell 5.1 and the Exchange cmdlets (local or remote).
                  Check, Convert, Recover: PowerShell 7.4+, Microsoft.Graph.Authentication, ExchangeOnlineManagement 3.10+.
     Exit codes : 0 = done, 1 = failed (or an object is not ready), 2 = done, next step required.
@@ -86,25 +103,36 @@
 #>
 #Requires -Version 5.1
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'Force', Justification = 'Read by Invoke-PraCollect (script scope).')]
-[CmdletBinding(SupportsShouldProcess = $true)]
+[CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = 'Run')]
 param(
-    [Parameter(Mandatory)][ValidateSet('Collect','Check','Convert','Recover')][string]$Action,
-    [ValidateSet('Preview','Apply')][string]$Mode = 'Preview',
-    [string]$Identity,
-    [ValidateSet('All','UsersOnly','SharedOnly')][string]$Scope = 'All',
-    [ValidateRange(0, [long]::MaxValue)][long]$Snapshot = 0,
-    [string]$Batch,
+    [Parameter(Mandatory, ParameterSetName = 'Run')][ValidateSet('Collect','Check','Convert','Recover')][string]$Action,
+    [Parameter(ParameterSetName = 'Run')][ValidateSet('Preview','Apply')][string]$Mode = 'Preview',
+    [Parameter(ParameterSetName = 'Run')][string]$Identity,
+    [Parameter(ParameterSetName = 'Run')][string]$IdentityPath,
+    [Parameter(ParameterSetName = 'Run')][ValidateSet('All','UsersOnly','SharedOnly')][string]$Scope = 'All',
+    [Parameter(ParameterSetName = 'Run')][ValidateRange(0, [long]::MaxValue)][long]$Snapshot = 0,
+    [Parameter(ParameterSetName = 'Run')][string]$Batch,
     [string]$ConfigPath,
-    [switch]$Force,
-    [switch]$PassThru
+    [Parameter(ParameterSetName = 'Run')][switch]$Force,
+    [Parameter(ParameterSetName = 'Run')][switch]$PassThru,
+    [Parameter(Mandatory, ParameterSetName = 'Gui')][switch]$Gui
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$toolVersion = '1.0.0'
+$toolVersion = '1.1.0'
 # Not a parameter default: Windows PowerShell 5.1 leaves $PSScriptRoot empty in param() defaults when run with -File (scheduled task).
 if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot 'config\PraCloudMailbox.config.psd1' }
+
+# The window: any edition (it runs this script for each action, in the edition of the action).
+if ($Gui) {
+    Import-Module (Join-Path $PSScriptRoot 'module\PRA2.Common.psm1') -Force -ErrorAction Stop
+    Import-Module (Join-Path $PSScriptRoot 'module\PRA2.Store.psm1') -Force -ErrorAction Stop
+    Import-Module (Join-Path $PSScriptRoot 'module\PRA2.Gui.psm1') -Force -ErrorAction Stop
+    try { Show-PraGui -Root $PSScriptRoot -ConfigPath $ConfigPath -Version $toolVersion; exit 0 }
+    catch { Write-Error ('The window could not open: {0}' -f $_.Exception.Message) -ErrorAction Continue; exit 1 }
+}
 
 # Each action runs in one edition: Collect needs the Exchange cmdlets (Windows PowerShell 5.1), the cloud actions PowerShell 7.
 if ($Action -eq 'Collect' -and $PSVersionTable.PSEdition -ne 'Desktop') {
@@ -163,6 +191,76 @@ function Get-PraScopeText {
     $kinds = @(); if ($s.IncludeUsers) { $kinds += 'users' }; if ($s.IncludeShared) { $kinds += 'shared' }; if ($s.IncludeRoom) { $kinds += 'rooms' }; if ($s.IncludeEquipment) { $kinds += 'equipment' }
     if ($Scope -eq 'UsersOnly') { $kinds = @('users only') } elseif ($Scope -eq 'SharedOnly') { $kinds = @('shared mailboxes only') }
     return ('{0} {1} {2}' -f $base, $dot, ($kinds -join ' + '))
+}
+
+function Read-PraIdentityFile {
+    <# -IdentityPath: one identity per line (# starts a comment), or a CSV file with an Identity column. Duplicates removed. #>
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "-IdentityPath: file not found: $Path" }
+    $lines = @(Get-Content -LiteralPath $Path -Encoding UTF8 | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
+    if ($lines.Count -and $lines[0] -match '^"?Identity"?\s*([,;]|$)') {
+        $delimiter = if ($lines[0] -match ';') { ';' } else { ',' }
+        $lines = @(Import-Csv -LiteralPath $Path -Delimiter $delimiter -Encoding UTF8 | ForEach-Object { ([string]$_.Identity).Trim() } | Where-Object { $_ })
+    }
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $list = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in $lines) { if ($seen.Add($line)) { $list.Add($line) } }
+    if (-not $list.Count) { throw "-IdentityPath: no identity in $Path." }
+    return $list.ToArray()
+}
+
+function Get-PraIdentityList {
+    <# The objects asked for: -IdentityPath (read by the main block into the context) or -Identity; none = the whole scope. #>
+    $stored = Get-PraValue $context 'Identities' $null
+    $list = @(@($stored) | Where-Object { $_ })
+    if (-not $list.Count -and $Identity) { $list = @($Identity) }
+    return $list
+}
+
+function Get-PraIdentityArgument {
+    <# The identity part of a command line shown as the next step. #>
+    if ($IdentityPath) { return (' -IdentityPath "{0}"' -f $IdentityPath) }
+    if ($Identity) { return " -Identity $Identity" }
+    return ''
+}
+
+function Select-PraIdentity {
+    <# Objects whose keys match the identity list (case-insensitive); the identities found nowhere are reported. #>
+    param([AllowEmptyCollection()][object[]]$Items = @(), [Parameter(Mandatory)][scriptblock]$Keys, [Parameter(Mandatory)][string]$Where)
+    $wanted = @(Get-PraIdentityList)
+    if (-not $wanted.Count) { return $Items }
+    $set = [System.Collections.Generic.HashSet[string]]::new([string[]]$wanted, [StringComparer]::OrdinalIgnoreCase)
+    $found = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $selected = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in $Items) {
+        $hit = $false
+        foreach ($key in @(& $Keys $item)) { if ($key -and $set.Contains([string]$key)) { [void]$found.Add([string]$key); $hit = $true } }
+        if ($hit) { $selected.Add($item) }
+    }
+    if (-not $selected.Count) { throw $(if ($wanted.Count -eq 1) { "$($wanted[0]) is not in $Where." } else { "None of the $($wanted.Count) identities of the list is in $Where." }) }
+    $missing = @($wanted | Where-Object { -not $found.Contains($_) })
+    if ($missing.Count) { Write-PraLog -Context $context -Message ('{0} identity(ies) of the list not in {1}: {2}{3}' -f $missing.Count, $Where, ((@($missing | Select-Object -First 10)) -join ', '), $(if ($missing.Count -gt 10) { ', ...' } else { '' })) -Level Warning }
+    return $selected.ToArray()
+}
+
+function Test-PraStop {
+    <#
+    Stop asked by the window (PRA_STOP_FILE): no new object is started. The caller leaves the objects not started as
+    Pending (Set-PraRowStopped); the run then ends normally (scheduler resumed, journal, report) and can be resumed.
+    #>
+    if (-not (Test-PraStopRequest)) { return $false }
+    if (-not (Get-PraValue $context 'StopNoted' $false)) {
+        $context['StopNoted'] = $true
+        Write-PraLog -Context $context -Message 'Stop requested by the operator: no new object is started; the objects not started stay as they are (Pending). Run the same command again to go on.' -Level Warning
+    }
+    return $true
+}
+
+function Set-PraRowStopped {
+    <# An object not started because of a stop request: Pending, without a console line each (there can be thousands). #>
+    param([Parameter(Mandatory)][object]$Row)
+    $Row.FinalStatus = 'Pending'
+    $Row.Detail = 'not started: stop requested by the operator; run the same command again to go on'
 }
 
 # =================================================================================================
@@ -337,9 +435,8 @@ function Read-PraSnapshotData {
     if ($age.TotalDays -gt $config.Store.MaxSnapshotAgeDays) { Write-PraLog -Context $context -Message ('Snapshot {0:0} day(s) old (Store.MaxSnapshotAgeDays = {1}): permissions and addresses may have changed since.' -f $age.TotalDays, $config.Store.MaxSnapshotAgeDays) -Level Warning }
     if ($PSBoundParameters.ContainsKey('ObjectGuid')) { $records = @($records | Where-Object { [string]$_.object_guid -in @($ObjectGuid) }) }
     else {
-        if ($Identity -and -not $All) {
-            $records = @($records | Where-Object { $Identity -in @([string]$_.user_principal_name, [string]$_.primary_smtp_address, [string]$_.sam_account_name, [string]$_.object_guid, [string]$_.distinguished_name) })
-            if (-not $records.Count) { throw "$Identity is not in snapshot $($snap.id)." }
+        if (-not $All) {
+            $records = @(Select-PraIdentity -Items $records -Where "snapshot $($snap.id)" -Keys { param($r) @([string]$r.user_principal_name, [string]$r.primary_smtp_address, [string]$r.sam_account_name, [string]$r.object_guid, [string]$r.distinguished_name) })
         }
         if (-not $All -and $Scope -eq 'UsersOnly') { $records = @($records | Where-Object { $_.kind -eq 'User' }) }
         elseif (-not $All -and $Scope -eq 'SharedOnly') { $records = @($records | Where-Object { $_.kind -ne 'User' }) }
@@ -371,6 +468,7 @@ function Invoke-PraCheck {
     # The state of every object first: the licence units really needed depend on what each one already holds.
     $states = @{}
     foreach ($record in $records) {
+        if (Test-PraStop) { throw ('Check stopped by the operator while reading the cloud state ({0} of {1} object(s) read).' -f $states.Count, $records.Count) }
         try { $states[[string]$record.object_guid] = Get-Pra2CloudState -Context $context -Record $record } catch { $states[[string]$record.object_guid] = $_ }
     }
     $need = Get-PraLicenceNeed -Entries @($records | ForEach-Object { $s = $states[[string]$_.object_guid]; [pscustomobject]@{ Record = $_; State = $(if ($s -is [System.Management.Automation.ErrorRecord]) { $null } else { $s }); Step = '' } }) -Tenant $tenant
@@ -426,7 +524,7 @@ function Invoke-PraCheck {
     }
     $context.CurrentIdentity = ''
     Write-PraItem -Context $context -Status $(if ($ready -eq $records.Count) { 'Ok' } else { 'Info' }) -Icon Target -Text ('{0} of {1} object(s) ready for Convert' -f $ready, $records.Count)
-    $context.NextSteps = @('Disaster: pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Convert' + $(if ($Identity) { " -Identity $Identity" } elseif ($Scope -ne 'All') { " -Scope $Scope" } else { '' }) + '   # preview first, then -Mode Apply')
+    $context.NextSteps = @('Disaster: pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Convert' + $(if (Get-PraIdentityArgument) { Get-PraIdentityArgument } elseif ($Scope -ne 'All') { " -Scope $Scope" } else { '' }) + '   # preview first, then -Mode Apply')
 }
 
 # =================================================================================================
@@ -658,6 +756,7 @@ function Invoke-PraConvert {
     # Read-only first: the state of every object, then the licence units really needed, then the decision.
     $assessed = [System.Collections.Generic.List[object]]::new()
     foreach ($record in $records) {
+        if (Test-PraStop) { throw 'Stopped by the operator during the readiness check: nothing was changed.' }
         $context.CurrentIdentity = if ($record.user_principal_name) { [string]$record.user_principal_name } else { [string]$record.primary_smtp_address }
         $assessment = Get-PraObjectAssessment -Record $record -Tenant $tenant -Permissions $permissions -Members $members -Lookup $lookup
         $step = if ($resume -and $resumeItems.ContainsKey([string]$record.object_guid)) { [string](Get-PraValue $resumeItems[[string]$record.object_guid] 'step' '') } else { '' }
@@ -695,14 +794,14 @@ function Invoke-PraConvert {
         Skip-PraStep -Title 'Users: source of authority and Exchange plan' -Reason 'Preview: not run.' -Icon Write
         Skip-PraStep -Title 'Users: cloud mailboxes' -Reason 'Preview: not run.' -Icon Clock
         Skip-PraStep -Title 'Shared mailboxes' -Reason 'Preview: not run.' -Icon Mail
-        $context.NextSteps = @('pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply' + $(if ($Batch) { " -Batch $Batch" } elseif ($Identity) { " -Identity $Identity" } else { '' }))
+        $context.NextSteps = @('pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply' + $(if ($Batch) { " -Batch $Batch" } else { Get-PraIdentityArgument }))
         return
     }
     if (-not $plan.Count) { throw 'No object can be converted (see the reasons above).' }
     Confirm-PraApply ('Convert {0} object(s) to Exchange Online ({1} user(s), {2} shared)?' -f $plan.Count, $planUsers.Count, $planShared.Count)
     if (-not $resume) {
         $context.BatchId = New-Pra2Batch $context.Journal Convert @{ SnapshotId = [long]$data.Snapshot.id; Environment = $config.Environment; Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-            ToolVersion = $toolVersion; ScopeJson = (@{ Identity = $Identity; Scope = $Scope; UsersMode = $config.Licensing.Users.Mode } | ConvertTo-Json -Compress) }
+            ToolVersion = $toolVersion; ScopeJson = (@{ Identity = $Identity; IdentityPath = $IdentityPath; Identities = @(Get-PraIdentityList).Count; Scope = $Scope; UsersMode = $config.Licensing.Users.Mode } | ConvertTo-Json -Compress) }
         foreach ($entry in $plan) {
             $original = @{ entraId = $entry.EntraId; isCloudManaged = $entry.State.IsCloudManaged; exchangeGuid = [string]$entry.Record.exchange_guid
                 usageLocation = [string]$entry.State.User.usageLocation; recipientType = $entry.State.RecipientType; tag = $entry.State.TagValue; holds = @($entry.State.Holds)
@@ -723,7 +822,9 @@ function Invoke-PraConvert {
         Write-PraJournal -Step 'GroupSoaCloud' -Detail "licence group $($tenant.LicenceGroup.displayName) managed in the cloud"
         Write-PraItem -Context $context -Status Ok -Text "Licence group $($tenant.LicenceGroup.displayName) now managed in the cloud (given back to AD by Recover)"
     }
+    $stopped = $false
     foreach ($entry in $planUsers) {
+        if ($stopped -or (Test-PraStop)) { $stopped = $true; Set-PraRowStopped $entry.Row; continue }
         $context.CurrentIdentity = $entry.Row.Identity; $context.CurrentOperation = 'Convert-User'
         try { Invoke-PraConvertUserStart -Record $entry.Record -EntraId $entry.EntraId -Tenant $tenant; [void]$started.Add($entry); Write-PraItem -Context $context -Status Ok -Text ('{0}: source of authority in the cloud, Exchange plan assigned' -f $entry.Row.Identity) }
         catch {
@@ -738,7 +839,7 @@ function Invoke-PraConvert {
     $context.CurrentIdentity = ''; $context.CurrentOperation = 'Wait-Mailbox'
     $waiting = @($started)
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    while ($waiting.Count -and $clock.Elapsed.TotalSeconds -lt (Get-PraWaitSeconds 'MailboxTimeoutMinutes')) {
+    while ($waiting.Count -and $clock.Elapsed.TotalSeconds -lt (Get-PraWaitSeconds 'MailboxTimeoutMinutes') -and -not (Test-PraStop)) {
         $still = @()
         foreach ($entry in $waiting) {
             $exo = Get-Pra2ExoState -Identity $entry.EntraId
@@ -756,6 +857,7 @@ function Invoke-PraConvert {
     Write-PraStep -Context $context -Title 'Shared mailboxes' -Icon Mail
     $sharedSku = $tenant.Skus | Where-Object { [string]$_.skuPartNumber -eq [string]$config.Licensing.Shared.SkuPartNumber } | Select-Object -First 1
     foreach ($entry in $planShared) {
+        if ($stopped -or (Test-PraStop)) { $stopped = $true; Set-PraRowStopped $entry.Row; continue }
         $context.CurrentIdentity = $entry.Row.Identity; $context.CurrentOperation = 'Convert-Shared'
         $objectGuid = [string]$entry.Record.object_guid
         try {
@@ -829,7 +931,11 @@ function Invoke-PraRecover {
     $done = @{}; $previous = @{}
     if ($resume) { foreach ($item in @(Get-Pra2BatchItem $context.Journal $resume.id)) { $previous[[string]$item.object_guid] = $item; if ($item.status -eq 'Done') { $done[[string]$item.object_guid] = $true } } }
     $targets = @($convertItems | Where-Object { -not $done.ContainsKey([string]$_.object_guid) })
-    if ($Identity) { $targets = @($targets | Where-Object { $Identity -in @([string]$_.identity, [string]$_.object_guid, [string]$byGuid[[string]$_.object_guid].primary_smtp_address) }) }
+    if (@(Get-PraIdentityList).Count) {
+        $targets = @(Select-PraIdentity -Items $targets -Where "the objects of batch $($convert.id) still to roll back" -Keys {
+                param($t) $r = $byGuid[[string]$t.object_guid]
+                @([string]$t.identity, [string]$t.object_guid) + $(if ($r) { @([string]$r.primary_smtp_address, [string]$r.user_principal_name, [string]$r.sam_account_name) } else { @() }) })
+    }
     if ($Scope -eq 'UsersOnly') { $targets = @($targets | Where-Object { $_.kind -eq 'User' }) } elseif ($Scope -eq 'SharedOnly') { $targets = @($targets | Where-Object { $_.kind -ne 'User' }) }
     Write-PraItem -Context $context -Status Info -Icon Batch -Text ('Convert batch {0} of {1}: {2} object(s) to roll back{3}' -f $convert.id, $convert.created_utc, $targets.Count, $(if ($resume) { " (resuming Recover $($resume.id))" } else { '' }))
 
@@ -851,6 +957,7 @@ function Invoke-PraRecover {
     #   SharedDeleted identity already deleted by an earlier run: purge check, recreated object
     $plan = [System.Collections.Generic.List[object]]::new()
     foreach ($item in $targets) {
+        if (Test-PraStop) { throw 'Stopped by the operator while reading the state of the objects: nothing was changed.' }
         $guid = [string]$item.object_guid
         $record = $byGuid[$guid]
         $row = New-PraRow $(if ($record) { $record } else { [pscustomobject]@{ user_principal_name = $item.identity; kind = $item.kind; primary_smtp_address = ''; object_guid = $item.object_guid; exchange_guid = '' } })
@@ -888,7 +995,7 @@ function Invoke-PraRecover {
     foreach ($entry in $plan) { $entry.Row.FinalStatus = 'Planned'; Write-PraLog -Context $context -Message ('Planned: {0} ({1})' -f $entry.Row.Identity, $entry.Path) -Level Sub }
     if ($context.Mode -ne 'Apply') {
         foreach ($title in @('Users: source of authority back to AD', 'Users: back on-premises', 'Shared mailboxes', 'Licence group')) { Skip-PraStep -Title $title -Reason 'Preview: not run.' -Icon Write }
-        $context.NextSteps = @("pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Recover -Mode Apply -Batch $Batch")
+        $context.NextSteps = @("pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Recover -Mode Apply -Batch $Batch" + (Get-PraIdentityArgument))
         return
     }
     if (-not $plan.Count) { throw 'Nothing to roll back (see above).' }
@@ -896,7 +1003,7 @@ function Invoke-PraRecover {
     if ($resume) { $context.BatchId = [string]$resume.id }
     else {
         $context.BatchId = New-Pra2Batch $context.Journal Recover @{ ConvertBatch = $convert.id; SnapshotId = [long]$convert.snapshot_id; Environment = $config.Environment
-            Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name; ToolVersion = $toolVersion; ScopeJson = (@{ Identity = $Identity; Scope = $Scope } | ConvertTo-Json -Compress) }
+            Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name; ToolVersion = $toolVersion; ScopeJson = (@{ Identity = $Identity; IdentityPath = $IdentityPath; Identities = @(Get-PraIdentityList).Count; Scope = $Scope } | ConvertTo-Json -Compress) }
     }
     foreach ($entry in $plan) { Set-Pra2BatchItem $context.Journal $context.BatchId ([string]$entry.Item.object_guid) @{ kind = [string]$entry.Item.kind; identity = $entry.Row.Identity; entra_id = $entry.EntraId; status = 'Running' } }
     Write-PraItem -Context $context -Status Ok -Icon Batch -Text ("Recover batch {0} in {1}" -f $context.BatchId, $config.Store.JournalPath)
@@ -906,7 +1013,9 @@ function Invoke-PraRecover {
     Write-PraStep -Context $context -Title 'Users: source of authority back to AD' -Icon Sync
     $context.CurrentOperation = 'Users-SOA'
     $synced = [System.Collections.Generic.List[object]]::new()
+    $stopped = $false
     foreach ($entry in $planUsers) {
+        if ($stopped -or (Test-PraStop)) { $stopped = $true; Set-PraRowStopped $entry.Row; continue }
         $context.CurrentIdentity = $entry.Row.Identity
         try {
             # The case hold is lifted only while the object is still a cloud mailbox (it blocks the switch back).
@@ -934,6 +1043,8 @@ function Invoke-PraRecover {
     $context.CurrentOperation = 'Users-Plan'
     $usersMode = $config.Licensing.Users.Mode
     foreach ($entry in @($synced) + @($planBack)) {
+        # The users switched back to AD are always finished; an object already back (case hold only) is a new start.
+        if ($entry.Path -eq 'Back' -and ($stopped -or (Test-PraStop))) { $stopped = $true; Set-PraRowStopped $entry.Row; continue }
         $context.CurrentIdentity = $entry.Row.Identity
         $guid = [string]$entry.Item.object_guid
         $isUser = $entry.Item.kind -eq 'User'
@@ -985,6 +1096,7 @@ function Invoke-PraRecover {
     $paused = $false
     try {
         foreach ($entry in $planShared) {
+            if ($stopped -or (Test-PraStop)) { $stopped = $true; Set-PraRowStopped $entry.Row; continue }
             $context.CurrentIdentity = $entry.Row.Identity
             $guid = [string]$entry.Item.object_guid
             try {
@@ -1096,10 +1208,18 @@ try {
 
     Initialize-PraAudit $context
 
+    if ($Identity -and $IdentityPath) { throw 'Use -Identity (one object) or -IdentityPath (a list), not both.' }
+    if ($IdentityPath) {
+        if ($Action -eq 'Collect') { throw '-IdentityPath is for Check, Convert and Recover (Collect reads the scope of the configuration, or one object with -Identity).' }
+        $context.Identities = @(Read-PraIdentityFile -Path $IdentityPath)
+        Write-PraLog -Context $context -Message ('Identity list {0}: {1} object(s)' -f $IdentityPath, $context.Identities.Count) -Level Detail
+    }
+
     $dot = [char]0x00B7
     $modeText = if ($Action -eq 'Check') { 'Read-only' } elseif ($effectiveMode -eq 'Apply') { $(if ($Action -eq 'Collect') { 'Apply (the snapshot is written)' } else { 'Apply (changes are made)' }) } else { 'Preview (nothing is changed)' }
     $banner = [ordered]@{ 'Action' = @('Mode', $Action); 'Mode' = @($(if ($effectiveMode -eq 'Apply') { 'Write' } else { 'Plan' }), $modeText) }
-    $banner['Scope'] = @('Target', $(if ($Action -eq 'Collect') { Get-PraScopeText $config } elseif ($Batch) { "batch $Batch" + $(if ($Identity) { " $dot $Identity" } else { '' }) } else { $(if ($Identity) { "one object: $Identity" } else { "snapshot $(if ($Snapshot) { $Snapshot } else { 'last complete' })" + $(if ($Scope -ne 'All') { " $dot $Scope" } else { '' }) }) }))
+    $objects = if ($IdentityPath) { "list $(Split-Path $IdentityPath -Leaf) ($(@($context.Identities).Count) object(s))" } elseif ($Identity) { "one object: $Identity" } else { '' }
+    $banner['Scope'] = @('Target', $(if ($Action -eq 'Collect') { Get-PraScopeText $config } elseif ($Batch) { "batch $Batch" + $(if ($objects) { " $dot $objects" } else { '' }) } else { $(if ($objects) { $objects } else { "snapshot $(if ($Snapshot) { $Snapshot } else { 'last complete' })" + $(if ($Scope -ne 'All') { " $dot $Scope" } else { '' }) }) }))
     if ($Action -ne 'Collect' -and $config.Cloud.Organization) { $banner['Tenant'] = @('Cloud', $config.Cloud.Organization) }
     $banner['Database'] = @('Folder', $config.Store.Path)
     $banner['Config'] = @('Config', ('{0} {1} Environment {2}' -f (Split-Path $config._Path -Leaf), $dot, $config.Environment))

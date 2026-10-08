@@ -1,14 +1,14 @@
 ---
 title: PRA Cloud Mailbox
 subtitle: User guide
-version: 1.0.0
+version: 1.1.0
 author: Nicolas Fabert
 updated: 2026-10-08
 ---
 
 # PRA Cloud Mailbox — User guide
 
-> What must be in place before the disaster, then one command per moment: **every day** (collect), **every week** (check), **the disaster** (convert), **the infrastructure is back** (recover) and **the days after**. The procedure in detail, the prerequisites of the app registration, the configuration, the databases and the internals are in the [developer guide](PraCloudMailbox-Guide.md).
+> What must be in place before the disaster, then one command per moment: **every day** (collect), **every week** (check), **the disaster** (convert), **the infrastructure is back** (recover) and **the days after**. Every command can also be run from a window (chapter 7). The procedure in detail, the prerequisites of the app registration, the configuration, the databases and the internals are in the [developer guide](PraCloudMailbox-Guide.md).
 
 > [!IMPORTANT]
 > Files downloaded from the Internet may be blocked by Windows and fail to run. Before using this project, unblock every file in the downloaded folder:
@@ -24,6 +24,7 @@ checklist | Prerequisites | Chapter 1: two computers, two editions of PowerShell
 database | Before the disaster | Chapter 2: collect every day, check every week.
 cloud | Disaster | Chapter 3: preview, convert, note the batch ID.
 refresh | Infrastructure rebuilt | Chapters 4 and 5: roll the batch back, then what is left to do.
+compare | The window | Chapter 7: the same commands from a window, with a preview before every change.
 ```
 
 <!-- icon: checklist -->
@@ -86,7 +87,7 @@ AD, Exchange and Entra Connect are lost. On the cloud admin server, in PowerShel
 - The users get their mailbox first (their Teams storage becomes their mailbox, in one or two minutes), then the shared mailboxes, one after another, with their permissions.
 - **Note the batch ID** printed in the final card: it is the only input of the rollback. It is also in the report and in the journal.
 - A user still *Pending* at the end: run the same command with `-Batch <ID>` a little later; only what is not finished is taken again.
-- One part only: `-Scope UsersOnly` or `-Scope SharedOnly`; one object: `-Identity compta@contoso.com`. Each Convert is a batch of its own.
+- One part only: `-Scope UsersOnly` or `-Scope SharedOnly`; one object: `-Identity compta@contoso.com`; a wave: `-IdentityPath .\wave1.txt` (one identity per line, or a CSV file with an `Identity` column). Each Convert is a batch of its own.
 
 ![Convert -Mode Apply: the batch ID and the next command in the final card](images/pra-console-convert.png)
 
@@ -103,7 +104,7 @@ AD (restored from a backup), Exchange and Entra Connect work again. On the cloud
 - **Users**: they are synchronised from AD again and their mail goes back to their on-premises mailbox. Their cloud mailbox — with the mails received during the disaster — stays in Microsoft 365 under the eDiscovery case hold.
 - **Shared mailboxes**: their cloud mailbox becomes an **inactive mailbox** under the case hold (nothing is lost), and Entra Connect creates a new object linked to the on-premises shared mailbox.
 - Something not finished (*Pending*, or an error fixed in the meantime): run the same command again.
-- Several Convert batches: roll each one back with its own ID.
+- Several Convert batches: roll each one back with its own ID. A batch can also go back in waves: `-Batch 5b21030d -IdentityPath .\wave1.txt`, then the rest with the same `-Batch`.
 
 ![Recover -Mode Apply: users back on-premises, shared mailboxes inactive and recreated](images/pra-console-recover.png)
 
@@ -138,3 +139,36 @@ Every run prints a banner, numbered steps and a summary card with the result, th
 | `2` | done, next step required: an object is *Pending*, run the same command again later |
 
 Something unexpected: [developer guide, appendix A - Troubleshooting](PraCloudMailbox-Guide.md#appendix-a---troubleshooting).
+
+<!-- icon: compare -->
+## 7. The window
+
+```powershell
+pwsh -File .\Invoke-PraCloudMailbox.ps1 -Gui              # cloud admin server, PowerShell 7
+powershell.exe -File .\Invoke-PraCloudMailbox.ps1 -Gui    # Exchange server, Windows PowerShell 5.1
+```
+
+The window changes nothing by itself: each button runs the command of this guide in its own PowerShell — Windows PowerShell 5.1 for Collect, PowerShell 7 for the others — with the same log, transcript, journal and report. The **Activity** panel follows the run step by step, then shows its result, the batch ID, the next step, the report and the log.
+
+![The window: the next step, the configuration, the last snapshot and Check, the batches](images/pra-gui-overview.png)
+
+| Page | What it shows | What it runs |
+|---|---|---|
+| Overview | The next step, the configuration (certificate found, valid until), the last snapshot and Check, the batches, this computer (PowerShell 7, modules) | The button of the next step |
+| 1 Collect | The scheduled task to copy, the snapshots of the database | Preview, *Collect now* (after a yes) |
+| 2 Check | The counters and one row per object of the last Check; filter by text, status and type | Check: every object, the users or the shared mailboxes |
+| 3 Convert | Every object of the snapshot with its last Check and its last batch | Preview, then *Convert…* |
+| 4 Recover | The Convert batches, then the objects of the batch chosen | Preview, then *Recover…* |
+
+```steps
+Preview | *Convert…* and *Recover…* stay disabled until a preview has run on **exactly** the same selection: same snapshot or batch, same objects ticked. Any change asks for a new preview.
+Confirm | Type `CONVERT` or `RECOVER`: the dialog shows the objects and the command line that will run.
+Waves | Tick the objects of a wave — or filter, then *Tick the ready ones shown*. The window writes the list to `data\gui\wave-<action>-<time>.csv` and runs the command with `-IdentityPath`: the log names the file.
+Stop | *Stop after the current object*: no new object is started and the run ends normally (journal, report). *Preview the resume* (Convert) or Recover again takes up what is left.
+```
+
+- With Entra Connect in *Manual* mode, the run asks its questions in a Yes / No dialog (run the synchronisation, then answer).
+- The window cannot be closed while a run is going.
+- The files of each run are in `data\gui` (`run-*.events.jsonl`, the output of the PowerShell); they are deleted after 30 days, the wave lists are kept.
+
+![Convert: every object with its last Check and its batch; the activity of the Convert and its batch ID](images/pra-gui-convert.png)

@@ -15,8 +15,10 @@
         pra-console-recover.png   console of the Recover -Mode Apply of that batch
         pra-report-check.png      HTML report of the Check
         pra-report-convert.png    HTML report of the Convert
+        pra-gui-overview.png      the window on the state left by the Convert: next step, configuration, snapshot, batches
+        pra-gui-convert.png       the Convert page with the activity of that Convert (its events, read as the window does)
 
-    The pages are captured with Microsoft Edge (headless). Run tools\Build-Documentation.ps1 afterwards: the
+    The pages are captured with Microsoft Edge (headless), the window with RenderTargetBitmap (WPF). Run tools\Build-Documentation.ps1 afterwards: the
     guides embed the images.
 
 .PARAMETER OutputFolder
@@ -27,7 +29,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.0.0  (from Web Services Client for Exchange 1.0.0)
+    Version : 1.1.0  (from Web Services Client for Exchange 1.0.0)
     Part of : PRA Cloud Mailbox (repository tool, not in the package)
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '', Justification = 'The in-memory tenant of the tests lives in global variables.')]
@@ -180,7 +182,7 @@ Write-DocSnapshot
 function Invoke-DocRun {
     <# One run as Invoke-PraCloudMailbox.ps1 does it (main block): banner, steps, summary card, reports. #>
     param([ValidateSet('Check', 'Convert', 'Recover')][string]$RunAction, [string]$RunMode = 'Preview', [string]$RunBatch = '', [double]$Minutes)
-    $values = @{ Action = $RunAction; Mode = $(if ($RunAction -eq 'Check') { 'Preview' } else { $RunMode }); Batch = $RunBatch; Identity = ''; Scope = 'All'; Snapshot = [long]0; Force = $true; PassThru = $false; caller = $null }
+    $values = @{ Action = $RunAction; Mode = $(if ($RunAction -eq 'Check') { 'Preview' } else { $RunMode }); Batch = $RunBatch; Identity = ''; IdentityPath = ''; Scope = 'All'; Snapshot = [long]0; Force = $true; PassThru = $false; caller = $null }
     foreach ($name in $values.Keys) { Set-Variable -Name $name -Value $values[$name] -Scope Script }
     $script:effectiveMode = $values.Mode
     $script:context = @{
@@ -225,12 +227,97 @@ function Invoke-DocRun {
     [pscustomobject]@{ Records = $records; Result = $script:DocResult; Html = $script:DocResult.HtmlReport }
 }
 
+function Get-ShownText([string]$Text) {
+    # Work folder -> the folder of a real installation; this computer and this account -> neutral names.
+    $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $Text = $Text.Replace($work, $shown).Replace($account, 'CONTOSO\pra-admin')
+    # Also as escaped in the JSON data of the HTML report.
+    $Text = $Text.Replace($work.Replace('\', '\\'), $shown.Replace('\', '\\')).Replace($account.Replace('\', '\\'), 'CONTOSO\\pra-admin')
+    return $Text.Replace($env:COMPUTERNAME, 'PRA-ADMIN01')
+}
+#region Window images (WPF) ------------------------------------------------------------------------------------------
+function Invoke-DocPump {
+    $frame = [Windows.Threading.DispatcherFrame]::new()
+    [void][Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Background,
+        [Windows.Threading.DispatcherOperationCallback] { param($f) $f.Continue = $false; $null }, $frame)
+    [Windows.Threading.Dispatcher]::PushFrame($frame)
+}
+
+function Save-WindowImage([Windows.Window]$Form, [string]$Name) {
+    Invoke-DocPump; $Form.UpdateLayout(); Invoke-DocPump
+    $content = $Form.Content
+    $bitmap = [Windows.Media.Imaging.RenderTargetBitmap]::new([int][Math]::Ceiling($content.ActualWidth), [int][Math]::Ceiling($content.ActualHeight), 96, 96, [Windows.Media.PixelFormats]::Pbgra32)
+    $bitmap.Render($content)
+    $encoder = [Windows.Media.Imaging.PngBitmapEncoder]::new()
+    $encoder.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($bitmap))
+    $stream = [IO.File]::Create((Join-Path $OutputFolder "$Name.png"))
+    try { $encoder.Save($stream) } finally { $stream.Dispose() }
+    Write-Host ("  {0,-26} {1} x {2}" -f "$Name.png", $bitmap.PixelWidth, $bitmap.PixelHeight)
+}
+
+function Save-DocWindow {
+    <# The window on the state the Convert left (its objects wait for Recover), with the activity of that Convert. #>
+    param([string]$EventsPath)
+    $gui = Import-Module (Join-Path $root 'module\PRA2.Gui.psm1') -Force -PassThru
+    # No certificate store or module folder of this computer in the images.
+    & $gui {
+        function script:Get-PraGuiCertificate { [pscustomobject]@{ Text = 'LocalMachine\My, valid until 2028-06-30'; Tone = 'Primary' } }
+        function script:Get-PraGuiModuleVersion { param([string]$Name) @{ 'Microsoft.Graph.Authentication' = '2.40.0'; 'ExchangeOnlineManagement' = '3.10.1' }[$Name] }
+    }
+    $window = New-PraGuiWindow -Root $root -ConfigPath $configPath -Version $toolVersion -Theme Light
+    $form = $window.Form
+    $form.WindowStartupLocation = 'Manual'; $form.Left = -6000; $form.Top = -6000; $form.Width = 1460; $form.Height = 920
+    $form.ShowActivated = $false; $form.ShowInTaskbar = $false
+    $form.Show()
+    try {
+        # The events of the Convert, read and shown as the window does while a run goes.
+        & $gui {
+            param($events)
+            $g = $script:Gui
+            $command = 'pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply -Force'
+            Clear-PraGuiActivity
+            $g.Controls.RunAction.Text = 'Convert · Apply'
+            $g.Controls.RunMeta.Text = $command
+            Add-PraGuiLine -Status Info -Text ('Started: ' + $command)
+            $g.Run = @{ Request = @{ Action = 'Convert'; Mode = 'Apply' }; Files = @{ Events = $events }; Counts = @{ Ok = 0; Warn = 0; Fail = 0 }; SubLines = 0
+                Asked = [Collections.Generic.HashSet[int]]::new(); StopAsked = $false; LogFile = ''; Result = $null; Summary = $null }
+            foreach ($record in (Read-PraGuiEvents -Path $events).Events) { Invoke-PraGuiEvent -Record $record }
+            Show-PraGuiRunResult -Run $g.Run -ExitCode 0
+            $g.Run = $null
+            Set-PraGuiBusy -Busy $false
+        } $EventsPath
+        $hide = { param([string]$Text) (Get-ShownText $Text).Replace($root, $shown) }
+        for ($i = 0; $i -lt $window.Lines.Count; $i++) {
+            $line = $window.Lines[$i]
+            $text = & $hide $line.Text
+            if ($text -ne $line.Text) { $copy = $line.PSObject.Copy(); $copy.Text = $text; $window.Lines[$i] = $copy }
+        }
+        foreach ($name in 'OvConfig', 'OvSnapshot', 'OvBatches', 'OvComputer', 'CollectFacts', 'ConvertFacts', 'RecoverFacts') {
+            $facts = @($window.Controls[$name].ItemsSource)
+            $window.Controls[$name].ItemsSource = @(foreach ($fact in $facts) { $copy = $fact.PSObject.Copy(); $copy.Value = & $hide $fact.Value; $copy })
+        }
+        foreach ($name in 'Footer', 'RunMeta', 'ResultText', 'NextStepText', 'CheckInfo', 'CollectTask') { $window.Controls[$name].Text = & $hide $window.Controls[$name].Text }
+        & $gui { Show-PraGuiLastLine }
+        & $gui { Select-PraGuiPage -Name Overview }
+        Save-WindowImage $form 'pra-gui-overview'
+        & $gui { Select-PraGuiPage -Name Convert }
+        Save-WindowImage $form 'pra-gui-convert'
+    } finally { $form.Close() }
+    Remove-Module PRA2.Gui -Force -ErrorAction SilentlyContinue
+}
+#endregion
 Write-Host 'Runs (in-memory tenant)...'
 # Every poll of the tool advances the simulated tenant by one tick, as in the end-to-end tests.
 function global:Start-Sleep { Step-PraFake }
 try {
     $check = Invoke-DocRun -RunAction Check -Minutes 0.7
-    $convert = Invoke-DocRun -RunAction Convert -RunMode Apply -Minutes 9.6
+    # The events of the Convert, as the window reads them (PRA_EVENT_FILE).
+    $events = Join-Path $work 'convert.events.jsonl'
+    & (Get-Module PRA2.Common) { $script:EventFile = $args[0] } $events
+    try { $convert = Invoke-DocRun -RunAction Convert -RunMode Apply -Minutes 9.6 }
+    finally { & (Get-Module PRA2.Common) { $script:EventFile = '' } }
+    Write-Host 'Window (before the Recover):'
+    Save-DocWindow -EventsPath $events
     $recover = Invoke-DocRun -RunAction Recover -RunMode Apply -RunBatch $convert.Result.BatchId -Minutes 14.4
 } finally {
     Remove-Item function:global:Start-Sleep -ErrorAction SilentlyContinue
@@ -256,14 +343,6 @@ function ConvertFrom-Ansi([string]$Line) {
     return $out.ToString()
 }
 
-function Get-ShownText([string]$Text) {
-    # Work folder -> the folder of a real installation; this computer and this account -> neutral names.
-    $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $Text = $Text.Replace($work, $shown).Replace($account, 'CONTOSO\pra-admin')
-    # Also as escaped in the JSON data of the HTML report.
-    $Text = $Text.Replace($work.Replace('\', '\\'), $shown.Replace('\', '\\')).Replace($account.Replace('\', '\\'), 'CONTOSO\\pra-admin')
-    return $Text.Replace($env:COMPUTERNAME, 'PRA-ADMIN01')
-}
 
 function Save-Console([object[]]$Records, [string]$Command, [string]$Name) {
     $lines = foreach ($r in $Records) {

@@ -29,7 +29,7 @@
 
 .EXAMPLE
     .\tools\New-PraCloudPackage.ps1 -Zip
-    Creates ..\package\PraCloudMailbox-1.0.0 and ..\package\PraCloudMailbox-1.0.0.zip.
+    Creates ..\package\PraCloudMailbox-1.1.0 and ..\package\PraCloudMailbox-1.1.0.zip.
 
 .NOTES
     Author  : Nicolas Fabert
@@ -76,7 +76,7 @@ if ($Zip -and (Test-Path -LiteralPath $zipPath)) {
 $files = [Collections.Generic.List[string]]::new()
 foreach ($f in 'Invoke-PraCloudMailbox.ps1', 'README.md', 'CHANGELOG.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'templates\Report.template.html',
     'config\Targets.sample.csv', 'config\EntraConnect.sample.ps1', 'docs\PraCloudMailbox-UserGuide.html', 'docs\PraCloudMailbox-Guide.html') { $files.Add($f) }
-foreach ($m in 'PRA2.Common.psm1', 'PRA2.Store.psm1', 'PRA2.Collect.psm1', 'PRA2.Cloud.psm1') { $files.Add("module\$m") }
+foreach ($m in 'PRA2.Common.psm1', 'PRA2.Store.psm1', 'PRA2.Collect.psm1', 'PRA2.Cloud.psm1', 'PRA2.Gui.psm1', 'PRA2.Gui.xaml') { $files.Add("module\$m") }
 Get-ChildItem -LiteralPath (Join-Path $root 'lib\sqlite') -Recurse -File | ForEach-Object { $files.Add($_.FullName.Substring($rootPrefix.Length)) }
 
 foreach ($f in $files) {

@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.1.0 - 2026-10-08
+
+A window for every action, and waves of objects. The engine is unchanged when it runs without the window.
+
+### Added
+- **The window** (`Invoke-PraCloudMailbox.ps1 -Gui`, Windows PowerShell 5.1 and PowerShell 7): the next step, the
+  configuration (certificate found and valid until), the last snapshot and Check, the batches and this computer at a
+  glance; a page per action with its table of objects (filter by text, status, type, 21,000 objects); Convert and
+  Recover by waves of ticked objects. Every action runs the same script in its own PowerShell (5.1 for Collect, 7
+  for the others) with its log, transcript, journal and report, and the activity panel follows it step by step.
+  *Convert…* and *Recover…* are enabled only after a preview of exactly the same selection, and ask for a typed
+  confirmation (`CONVERT`, `RECOVER`). *Stop after the current object* ends the run cleanly (resumable). The
+  questions of Entra Connect `Manual` mode are asked in the window. Fluent theme with PowerShell 7.5 and later.
+- `-IdentityPath`: Check, Convert and Recover on a list of objects (one identity per line, or a CSV file with an
+  `Identity` column); the identities found nowhere are listed as a warning.
+- `PRA2.Common`: events of the run for the window (`PRA_EVENT_FILE`), stop request (`PRA_STOP_FILE`), questions
+  to the operator in the window or in the console (`Request-PraOperator`).
+- Tests: `PraCloudMailbox.Gui.Tests.ps1` (both editions, a real child run included); end-to-end scenarios for waves
+  with `-IdentityPath`, a stop of Convert and of Recover followed by their resume, and the events of a run.
+
+### Changed
+- Entra Connect `Manual` mode asks through `Request-PraOperator`: in the window when the run belongs to it,
+  otherwise in the console as before.
+- The package contains `module\PRA2.Gui.psm1` and `module\PRA2.Gui.xaml`.
+
+### Fixed
+- Microsoft Graph calls are sent again when the connection failed without an answer (timeout, reset): seen in the
+  lab just after a long delta cycle, it stopped a Recover (cleanly; running it again resumed the batch).
 ## 1.0.0 - 2026-10-08
 
 First public release. Every action and every licensing mode of 0.2.1 was validated in the lab with the tool; this

@@ -10,7 +10,8 @@
     Faults: LicenceAssign400 (number of refused assignments), NeverMailbox (user IDs never provisioned),
     NoHoldStamp (the case hold is never stamped), DeleteFails (DELETE /users refused), NoRecreate (Entra Connect
     does not recreate deleted objects), SendAsFails (Add-RecipientPermission refused),
-    CaseHoldDeployError (Set-CaseHoldPolicy records the change but reports 'failed to be deployed', lab 7-8 Oct).
+    CaseHoldDeployError (Set-CaseHoldPolicy records the change but reports 'failed to be deployed', lab 7-8 Oct),
+    StopAfter (@{ Pattern; Path }: the stop file of the window is created after the first call that matches).
 .NOTES
     Author  : Nicolas Fabert
 #>
@@ -37,7 +38,7 @@ function global:New-PraFakeTenant {
         Inactive = [System.Collections.Generic.List[hashtable]]::new()
         CasePolicy = @{ Name = 'PRA-HOLD'; Guid = '22222222-2222-2222-2222-222222222222'; Locations = [System.Collections.Generic.List[string]]::new() }
         Scheduler = $true
-        Faults = @{ LicenceAssign400 = 0; NeverMailbox = @(); NoHoldStamp = $false; DeleteFails = $false; NoRecreate = $false; SendAsFails = $false; CaseHoldDeployError = $false }
+        Faults = @{ LicenceAssign400 = 0; NeverMailbox = @(); NoHoldStamp = $false; DeleteFails = $false; NoRecreate = $false; SendAsFails = $false; CaseHoldDeployError = $false; StopAfter = $null }
         OrgHolds = @()
         Calls = [System.Collections.Generic.List[string]]::new()
     }
@@ -59,7 +60,13 @@ function global:Add-PraFakeUser {
     return $user
 }
 
-function global:Write-PraFakeCall { param([string]$Text) $global:PraFake.Calls.Add(('{0:000} {1}' -f $global:PraFake.Tick, $Text)) }
+function global:Write-PraFakeCall {
+    param([string]$Text)
+    $global:PraFake.Calls.Add(('{0:000} {1}' -f $global:PraFake.Tick, $Text))
+    # The window asks for a stop at a given moment: the stop file appears after the first call that matches.
+    $stop = $global:PraFake.Faults.StopAfter
+    if ($stop -and $Text -match $stop.Pattern -and -not (Test-Path -LiteralPath $stop.Path)) { Set-Content -LiteralPath $stop.Path -Value 'stop' }
+}
 
 function global:Resolve-PraFakeUser {
     param([string]$Identity)

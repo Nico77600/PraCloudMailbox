@@ -1,0 +1,601 @@
+<!--
+  PRA Cloud Mailbox - the window (loaded by module\PRA2.Gui.psm1).
+  Colours come from the Fluent theme of WPF (.NET 9 and later) or, in Windows PowerShell 5.1 and PowerShell 7.4,
+  from the same resource keys set by Set-PraGuiTheme. Named elements are found by name in the module.
+-->
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="PRA Cloud Mailbox" Width="1460" Height="920" MinWidth="1100" MinHeight="660" WindowStartupLocation="CenterScreen"
+        FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="14" UseLayoutRounding="True">
+  <Window.Resources>
+    <Style x:Key="PraCard" TargetType="Border">
+      <Setter Property="Background" Value="{DynamicResource CardBackgroundFillColorDefaultBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource CardStrokeColorDefaultBrush}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Padding" Value="18,14,18,16"/>
+      <Setter Property="Margin" Value="0,0,0,12"/>
+    </Style>
+    <Style x:Key="PraCardTitle" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="15"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Margin" Value="0,0,0,6"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}"/>
+    </Style>
+    <Style x:Key="PraText" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="TextWrapping" Value="Wrap"/>
+      <Setter Property="Margin" Value="0,0,0,8"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}"/>
+    </Style>
+    <Style x:Key="PraLabel" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+      <Setter Property="Margin" Value="0,0,8,0"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}"/>
+    </Style>
+    <Style x:Key="PraIcon" TargetType="TextBlock">
+      <Setter Property="FontFamily" Value="Segoe Fluent Icons, Segoe MDL2 Assets"/>
+    </Style>
+    <Style x:Key="PraButton" TargetType="Button">
+      <Setter Property="Padding" Value="14,6"/>
+      <Setter Property="Margin" Value="0,0,8,0"/>
+      <Setter Property="MinWidth" Value="96"/>
+    </Style>
+    <Style x:Key="PraTile" TargetType="Border">
+      <Setter Property="Background" Value="{DynamicResource CardBackgroundFillColorDefaultBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource CardStrokeColorDefaultBrush}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Padding" Value="14,8,14,10"/>
+      <Setter Property="Margin" Value="0,0,10,12"/>
+    </Style>
+    <Style x:Key="PraGrid" TargetType="DataGrid">
+      <Setter Property="AutoGenerateColumns" Value="False"/>
+      <Setter Property="CanUserAddRows" Value="False"/>
+      <Setter Property="CanUserDeleteRows" Value="False"/>
+      <Setter Property="HeadersVisibility" Value="Column"/>
+      <Setter Property="GridLinesVisibility" Value="Horizontal"/>
+      <Setter Property="HorizontalGridLinesBrush" Value="{DynamicResource DividerStrokeColorDefaultBrush}"/>
+      <Setter Property="RowHeaderWidth" Value="0"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="RowBackground" Value="Transparent"/>
+      <Setter Property="SelectionMode" Value="Single"/>
+      <Setter Property="EnableRowVirtualization" Value="True"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}"/>
+    </Style>
+    <DataTemplate x:Key="PraFactTemplate">
+      <Grid Margin="0,3,0,3">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="132"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock Text="{Binding Label}" FontSize="12.5" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+        <TextBlock Grid.Column="1" Text="{Binding Value}" FontSize="13" TextWrapping="Wrap" Foreground="{Binding Brush}"/>
+      </Grid>
+    </DataTemplate>
+    <DataTemplate x:Key="PraStatusTemplate">
+      <TextBlock Text="{Binding StatusText}" Foreground="{Binding StatusBrush}" FontWeight="SemiBold"/>
+    </DataTemplate>
+    <DataTemplate x:Key="PraTickTemplate">
+      <CheckBox IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" HorizontalAlignment="Center" VerticalAlignment="Center" MinWidth="0" Margin="4,0,0,0"/>
+    </DataTemplate>
+    <Style x:Key="PraNav" TargetType="ListBoxItem">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Grid Margin="0,0,0,4">
+              <Border x:Name="Card" Padding="12,9,10,9" CornerRadius="6" Background="Transparent">
+                <ContentPresenter/>
+              </Border>
+              <Border x:Name="Bar" Width="3" CornerRadius="2" Margin="0,10" HorizontalAlignment="Left" Background="Transparent"/>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Card" Property="Background" Value="{DynamicResource ControlFillColorSecondaryBrush}"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Card" Property="Background" Value="{DynamicResource PraAccentSoft}"/>
+                <Setter TargetName="Bar" Property="Background" Value="{DynamicResource PraBrandText}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+
+  <Grid x:Name="Root" Background="{DynamicResource ApplicationBackgroundBrush}">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <!-- Header -->
+    <Grid Margin="24,18,24,14">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+      <Border Width="46" Height="46" CornerRadius="10" Background="{DynamicResource PraBrand}" VerticalAlignment="Center">
+        <TextBlock Style="{StaticResource PraIcon}" Text="&#xE777;" FontSize="22" Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+      </Border>
+      <StackPanel Grid.Column="1" Margin="14,0,0,0" VerticalAlignment="Center">
+        <TextBlock Text="EXCHANGE DISASTER RECOVERY · SCENARIO 2 · ON-PREMISES LOST → EXCHANGE ONLINE" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource PraBrandText}"/>
+        <TextBlock Text="PRA Cloud Mailbox" FontSize="24" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
+        <TextBlock FontSize="13" Foreground="{DynamicResource TextFillColorSecondaryBrush}" TextTrimming="CharacterEllipsis"
+                   Text="Collect before the disaster, check, convert to Exchange Online, recover when the infrastructure is rebuilt - every action is the command line, with its preview, its journal and its report."/>
+      </StackPanel>
+      <StackPanel Grid.Column="2" VerticalAlignment="Center" Margin="16,0,0,0">
+        <Border x:Name="EnvPill" CornerRadius="12" Padding="12,3" HorizontalAlignment="Right" Background="{DynamicResource PraAccentSoft}">
+          <TextBlock x:Name="EnvText" FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource PraBrandText}"/>
+        </Border>
+        <TextBlock x:Name="TenantText" FontSize="12" Margin="0,5,0,0" HorizontalAlignment="Right" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+        <TextBlock x:Name="VersionText" FontSize="11" Margin="0,2,0,0" HorizontalAlignment="Right" Foreground="{DynamicResource TextFillColorTertiaryBrush}"/>
+      </StackPanel>
+    </Grid>
+
+    <!-- Body -->
+    <Grid Grid.Row="1" Margin="24,0,24,0">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="214"/>
+        <ColumnDefinition Width="16"/>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="16"/>
+        <ColumnDefinition Width="400"/>
+      </Grid.ColumnDefinitions>
+
+      <ListBox x:Name="Nav" Background="Transparent" BorderThickness="0" ItemContainerStyle="{StaticResource PraNav}" ScrollViewer.HorizontalScrollBarVisibility="Disabled"/>
+
+      <Grid Grid.Column="2" x:Name="Pages">
+
+        <!-- Overview -->
+        <ScrollViewer x:Name="PageOverview" VerticalScrollBarVisibility="Auto">
+          <StackPanel>
+            <Border x:Name="NextCard" Style="{StaticResource PraCard}" BorderThickness="1">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="Auto"/>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <Border Width="40" Height="40" CornerRadius="20" Background="{DynamicResource PraAccentSoft}" VerticalAlignment="Top">
+                  <TextBlock x:Name="NextIcon" Style="{StaticResource PraIcon}" Text="&#xE8FB;" FontSize="18" Foreground="{DynamicResource PraBrandText}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                </Border>
+                <StackPanel Grid.Column="1" Margin="14,0,12,0">
+                  <TextBlock Text="NEXT STEP" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource PraBrandText}"/>
+                  <TextBlock x:Name="NextTitle" FontSize="17" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,2,0,4" Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
+                  <TextBlock x:Name="NextText" Style="{StaticResource PraText}" Margin="0"/>
+                </StackPanel>
+                <Button x:Name="NextButton" Grid.Column="2" Style="{StaticResource PraButton}" Margin="0" VerticalAlignment="Center"/>
+              </Grid>
+            </Border>
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="12"/>
+                <ColumnDefinition Width="*"/>
+              </Grid.ColumnDefinitions>
+              <StackPanel>
+                <Border Style="{StaticResource PraCard}">
+                  <StackPanel>
+                    <TextBlock Text="Configuration" Style="{StaticResource PraCardTitle}"/>
+                    <ItemsControl x:Name="OvConfig" ItemTemplate="{StaticResource PraFactTemplate}"/>
+                  </StackPanel>
+                </Border>
+                <Border Style="{StaticResource PraCard}">
+                  <StackPanel>
+                    <TextBlock Text="Batches (journal)" Style="{StaticResource PraCardTitle}"/>
+                    <ItemsControl x:Name="OvBatches" ItemTemplate="{StaticResource PraFactTemplate}"/>
+                  </StackPanel>
+                </Border>
+              </StackPanel>
+              <StackPanel Grid.Column="2">
+                <Border Style="{StaticResource PraCard}">
+                  <StackPanel>
+                    <TextBlock Text="Last snapshot" Style="{StaticResource PraCardTitle}"/>
+                    <ItemsControl x:Name="OvSnapshot" ItemTemplate="{StaticResource PraFactTemplate}"/>
+                  </StackPanel>
+                </Border>
+                <Border Style="{StaticResource PraCard}">
+                  <StackPanel>
+                    <TextBlock Text="This computer" Style="{StaticResource PraCardTitle}"/>
+                    <ItemsControl x:Name="OvComputer" ItemTemplate="{StaticResource PraFactTemplate}"/>
+                  </StackPanel>
+                </Border>
+              </StackPanel>
+            </Grid>
+          </StackPanel>
+        </ScrollViewer>
+
+        <!-- Collect -->
+        <Grid x:Name="PageCollect" Visibility="Collapsed">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+          </Grid.RowDefinitions>
+          <Border Style="{StaticResource PraCard}">
+            <StackPanel>
+              <TextBlock Text="Collect · before the disaster" Style="{StaticResource PraCardTitle}"/>
+              <TextBlock Style="{StaticResource PraText}" Text="Reads the mailboxes in scope, their addresses and the permissions of the shared mailboxes from Exchange into a new snapshot. After the disaster nothing on-premises can be read: the last snapshot copied to the cloud admin server is what Convert knows. Runs in Windows PowerShell 5.1 on an Exchange server (or with the Exchange management tools); Exchange itself is never changed."/>
+              <ItemsControl x:Name="CollectFacts" ItemTemplate="{StaticResource PraFactTemplate}" Margin="0,0,0,8"/>
+              <TextBlock Text="Every day, a scheduled task on the Exchange server:" Style="{StaticResource PraLabel}" Margin="0,0,0,4"/>
+              <Grid Margin="0,0,0,12">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBox x:Name="CollectTask" IsReadOnly="True" FontFamily="Cascadia Mono, Consolas" FontSize="12" TextWrapping="NoWrap" VerticalContentAlignment="Center"/>
+                <Button x:Name="CollectCopyTask" Grid.Column="1" Content="Copy" Style="{StaticResource PraButton}" Margin="8,0,0,0" MinWidth="70"/>
+              </Grid>
+              <StackPanel Orientation="Horizontal">
+                <Button x:Name="CollectPreview" Content="Preview" Style="{StaticResource PraButton}"/>
+                <Button x:Name="CollectApply" Content="Collect now" Style="{StaticResource PraButton}"/>
+                <TextBlock x:Name="CollectHint" Style="{StaticResource PraLabel}" Margin="8,0,0,0" TextWrapping="Wrap" MaxWidth="480"/>
+              </StackPanel>
+            </StackPanel>
+          </Border>
+          <Border Grid.Row="1" Style="{StaticResource PraCard}">
+            <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+              </Grid.RowDefinitions>
+              <TextBlock Text="Snapshots" Style="{StaticResource PraCardTitle}"/>
+              <DataGrid x:Name="SnapshotGrid" Grid.Row="1" Style="{StaticResource PraGrid}" IsReadOnly="True">
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="Snapshot" Binding="{Binding Id}" Width="80"/>
+                  <DataGridTextColumn Header="Taken" Binding="{Binding Taken}" Width="140"/>
+                  <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="90"/>
+                  <DataGridTextColumn Header="Exchange server" Binding="{Binding Server}" Width="*"/>
+                  <DataGridTextColumn Header="Mailboxes" Binding="{Binding Mailboxes}" Width="90"/>
+                  <DataGridTextColumn Header="Permissions" Binding="{Binding Permissions}" Width="100"/>
+                  <DataGridTextColumn Header="Computer" Binding="{Binding Computer}" Width="130"/>
+                </DataGrid.Columns>
+              </DataGrid>
+            </Grid>
+          </Border>
+        </Grid>
+
+        <!-- Check -->
+        <Grid x:Name="PageCheck" Visibility="Collapsed">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+          </Grid.RowDefinitions>
+          <Border Style="{StaticResource PraCard}">
+            <StackPanel>
+              <TextBlock Text="Check · read-only" Style="{StaticResource PraCardTitle}"/>
+              <TextBlock Style="{StaticResource PraText}" Text="For every object of the last snapshot: its Entra ID object, its Exchange Online recipient, the licences and the permissions of the app. An object that is not ready would be refused by Convert. Nothing is changed: run it after every change, and every week."/>
+              <StackPanel Orientation="Horizontal">
+                <ComboBox x:Name="CheckScope" Width="200" Margin="0,0,8,0" VerticalContentAlignment="Center"/>
+                <Button x:Name="CheckRun" Content="Run Check" Style="{StaticResource PraButton}"/>
+                <TextBlock x:Name="CheckInfo" Style="{StaticResource PraLabel}" Margin="8,0,0,0" TextWrapping="Wrap" MaxWidth="420"/>
+              </StackPanel>
+            </StackPanel>
+          </Border>
+          <UniformGrid Grid.Row="1" Columns="4">
+            <Border Style="{StaticResource PraTile}">
+              <StackPanel>
+                <TextBlock Text="Objects" Style="{StaticResource PraLabel}"/>
+                <TextBlock x:Name="CheckTotal" Text="-" FontSize="24" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
+              </StackPanel>
+            </Border>
+            <Border Style="{StaticResource PraTile}">
+              <StackPanel>
+                <TextBlock Text="Ready" Style="{StaticResource PraLabel}"/>
+                <TextBlock x:Name="CheckReady" Text="-" FontSize="24" FontWeight="SemiBold" Foreground="{DynamicResource PraSuccess}"/>
+              </StackPanel>
+            </Border>
+            <Border Style="{StaticResource PraTile}">
+              <StackPanel>
+                <TextBlock Text="Ready, with a warning" Style="{StaticResource PraLabel}"/>
+                <TextBlock x:Name="CheckWarn" Text="-" FontSize="24" FontWeight="SemiBold" Foreground="{DynamicResource PraCaution}"/>
+              </StackPanel>
+            </Border>
+            <Border Style="{StaticResource PraTile}" Margin="0,0,0,12">
+              <StackPanel>
+                <TextBlock Text="Not ready" Style="{StaticResource PraLabel}"/>
+                <TextBlock x:Name="CheckNotReady" Text="-" FontSize="24" FontWeight="SemiBold" Foreground="{DynamicResource PraCritical}"/>
+              </StackPanel>
+            </Border>
+          </UniformGrid>
+          <Border Grid.Row="2" Style="{StaticResource PraCard}">
+            <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+              </Grid.RowDefinitions>
+              <WrapPanel Margin="0,0,0,4">
+                <TextBlock Text="Filter" Style="{StaticResource PraLabel}"/>
+                <TextBox x:Name="CheckFilter" Width="220" Margin="0,0,8,6" VerticalContentAlignment="Center"/>
+                <ComboBox x:Name="CheckStatusFilter" Width="170" Margin="0,0,8,6" VerticalContentAlignment="Center"/>
+                <ComboBox x:Name="CheckKindFilter" Width="150" Margin="0,0,8,6" VerticalContentAlignment="Center"/>
+                <Button x:Name="CheckOpenReport" Content="HTML report" Style="{StaticResource PraButton}" Margin="0,0,8,6"/>
+                <TextBlock x:Name="CheckCount" Style="{StaticResource PraLabel}"/>
+              </WrapPanel>
+              <DataGrid x:Name="CheckGrid" Grid.Row="1" Style="{StaticResource PraGrid}" IsReadOnly="True">
+                <DataGrid.RowStyle>
+                  <Style TargetType="DataGridRow" BasedOn="{StaticResource {x:Type DataGridRow}}">
+                    <Setter Property="ToolTip" Value="{Binding Issue}"/>
+                  </Style>
+                </DataGrid.RowStyle>
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="Object" Binding="{Binding Identity}" Width="210"/>
+                  <DataGridTextColumn Header="Type" Binding="{Binding Kind}" Width="60"/>
+                  <DataGridTemplateColumn Header="Status" CellTemplate="{StaticResource PraStatusTemplate}" Width="85"/>
+                  <DataGridTextColumn Header="Licence" Binding="{Binding Licence}" Width="115"/>
+                  <DataGridTextColumn Header="Exchange Online" Binding="{Binding ExchangeOnline}" Width="110"/>
+                  <DataGridTextColumn Header="Detail" Binding="{Binding Issue}" Width="*" MinWidth="160"/>
+                </DataGrid.Columns>
+              </DataGrid>
+            </Grid>
+          </Border>
+        </Grid>
+
+        <!-- Convert -->
+        <Grid x:Name="PageConvert" Visibility="Collapsed">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+          </Grid.RowDefinitions>
+          <Border Style="{StaticResource PraCard}">
+            <StackPanel>
+              <TextBlock Text="Convert · disaster" Style="{StaticResource PraCardTitle}"/>
+              <TextBlock Style="{StaticResource PraText}" Text="Users first - their identity is managed in the cloud and gets an Exchange plan: their Teams storage becomes their mailbox - then the shared mailboxes, one after another, with the permissions of the snapshot. Preview first: the plan, nothing changed. Then Convert, after a typed confirmation: every change is journaled under a batch ID."/>
+              <ItemsControl x:Name="ConvertFacts" ItemTemplate="{StaticResource PraFactTemplate}"/>
+            </StackPanel>
+          </Border>
+          <Border x:Name="ConvertResumePanel" Grid.Row="1" Style="{StaticResource PraCard}" Visibility="Collapsed" Background="{DynamicResource PraCautionBackground}" BorderBrush="{DynamicResource PraCautionBorder}">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <TextBlock Style="{StaticResource PraIcon}" Text="&#xE7BA;" FontSize="18" Foreground="{DynamicResource PraCaution}" VerticalAlignment="Center" Margin="0,0,12,0"/>
+              <TextBlock x:Name="ConvertResumeText" Grid.Column="1" TextWrapping="Wrap" FontSize="13" VerticalAlignment="Center" Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
+              <Button x:Name="ConvertResume" Grid.Column="2" Content="Preview the resume" Style="{StaticResource PraButton}" Margin="12,0,0,0"/>
+            </Grid>
+          </Border>
+          <Border Grid.Row="2" Style="{StaticResource PraCard}">
+            <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+              </Grid.RowDefinitions>
+              <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                <RadioButton x:Name="ConvertAll" GroupName="ConvertScope" Content="Every object of the snapshot" IsChecked="True" Margin="0,0,20,0" VerticalContentAlignment="Center"/>
+                <RadioButton x:Name="ConvertWave" GroupName="ConvertScope" Content="A wave: the objects ticked below" VerticalContentAlignment="Center"/>
+              </StackPanel>
+              <WrapPanel Grid.Row="1" Margin="0,0,0,4">
+                <TextBlock Text="Filter" Style="{StaticResource PraLabel}"/>
+                <TextBox x:Name="ConvertFilter" Width="200" Margin="0,0,8,6" VerticalContentAlignment="Center"/>
+                <ComboBox x:Name="ConvertKindFilter" Width="140" Margin="0,0,8,6" VerticalContentAlignment="Center"/>
+                <ComboBox x:Name="ConvertStateFilter" Width="160" Margin="0,0,8,6" VerticalContentAlignment="Center"/>
+                <Button x:Name="ConvertTickShown" Content="Tick the ready ones shown" Style="{StaticResource PraButton}" Margin="0,0,8,6"/>
+                <Button x:Name="ConvertUntick" Content="Untick all" Style="{StaticResource PraButton}" Margin="0,0,8,6"/>
+                <TextBlock x:Name="ConvertTicked" Style="{StaticResource PraLabel}"/>
+              </WrapPanel>
+              <DataGrid x:Name="ConvertGrid" Grid.Row="2" Style="{StaticResource PraGrid}" IsReadOnly="True">
+                <DataGrid.RowStyle>
+                  <Style TargetType="DataGridRow" BasedOn="{StaticResource {x:Type DataGridRow}}">
+                    <Setter Property="ToolTip" Value="{Binding Issue}"/>
+                  </Style>
+                </DataGrid.RowStyle>
+                <DataGrid.Columns>
+                  <DataGridTemplateColumn Header="" CellTemplate="{StaticResource PraTickTemplate}" Width="36"/>
+                  <DataGridTextColumn Header="Object" Binding="{Binding Identity}" Width="230"/>
+                  <DataGridTextColumn Header="Type" Binding="{Binding Kind}" Width="60"/>
+                  <DataGridTemplateColumn Header="Check" CellTemplate="{StaticResource PraStatusTemplate}" Width="90"/>
+                  <DataGridTextColumn Header="Converted" Binding="{Binding Batch}" Width="140"/>
+                  <DataGridTextColumn Header="Detail" Binding="{Binding Issue}" Width="*" MinWidth="160"/>
+                </DataGrid.Columns>
+              </DataGrid>
+              <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,12,0,0">
+                <Button x:Name="ConvertPreview" Content="Preview" Style="{StaticResource PraButton}"/>
+                <Button x:Name="ConvertApply" Content="Convert…" Style="{StaticResource PraButton}" IsEnabled="False"/>
+                <TextBlock x:Name="ConvertHint" Style="{StaticResource PraLabel}" TextWrapping="Wrap" MaxWidth="560"/>
+              </StackPanel>
+            </Grid>
+          </Border>
+        </Grid>
+
+        <!-- Recover -->
+        <Grid x:Name="PageRecover" Visibility="Collapsed">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+          </Grid.RowDefinitions>
+          <Border Style="{StaticResource PraCard}">
+            <StackPanel>
+              <TextBlock Text="Recover · infrastructure rebuilt" Style="{StaticResource PraCardTitle}"/>
+              <TextBlock Style="{StaticResource PraText}" Text="Once Active Directory (restored, same objectGUID), Exchange and Entra Connect work again: the users go back to AD and to their on-premises mailbox, their cloud data stays under the eDiscovery case hold; the shared mailboxes become inactive mailboxes under the hold and Entra Connect recreates their objects. Nothing is deleted from a mailbox."/>
+              <ItemsControl x:Name="RecoverFacts" ItemTemplate="{StaticResource PraFactTemplate}"/>
+            </StackPanel>
+          </Border>
+          <Border Grid.Row="1" Style="{StaticResource PraCard}">
+            <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+              </Grid.RowDefinitions>
+              <TextBlock Text="Convert batches" Style="{StaticResource PraCardTitle}"/>
+              <DataGrid x:Name="BatchGrid" Grid.Row="1" Style="{StaticResource PraGrid}" IsReadOnly="True" MaxHeight="150">
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="Batch" Binding="{Binding Id}" Width="90"/>
+                  <DataGridTextColumn Header="Converted" Binding="{Binding Created}" Width="140"/>
+                  <DataGridTextColumn Header="Users" Binding="{Binding Users}" Width="70"/>
+                  <DataGridTextColumn Header="Shared" Binding="{Binding Shared}" Width="70"/>
+                  <DataGridTextColumn Header="Convert" Binding="{Binding ConvertStatus}" Width="90"/>
+                  <DataGridTemplateColumn Header="Recover" CellTemplate="{StaticResource PraStatusTemplate}" Width="*"/>
+                </DataGrid.Columns>
+              </DataGrid>
+            </Grid>
+          </Border>
+          <Border Grid.Row="2" Style="{StaticResource PraCard}">
+            <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+              </Grid.RowDefinitions>
+              <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                <RadioButton x:Name="RecoverAll" GroupName="RecoverScope" Content="The whole batch" IsChecked="True" Margin="0,0,20,0" VerticalContentAlignment="Center"/>
+                <RadioButton x:Name="RecoverWave" GroupName="RecoverScope" Content="A wave: the objects ticked below" VerticalContentAlignment="Center"/>
+              </StackPanel>
+              <WrapPanel Grid.Row="1" Margin="0,0,0,4">
+                <TextBlock Text="Filter" Style="{StaticResource PraLabel}"/>
+                <TextBox x:Name="RecoverFilter" Width="200" Margin="0,0,8,6" VerticalContentAlignment="Center"/>
+                <Button x:Name="RecoverTickShown" Content="Tick the ones shown" Style="{StaticResource PraButton}" Margin="0,0,8,6"/>
+                <Button x:Name="RecoverUntick" Content="Untick all" Style="{StaticResource PraButton}" Margin="0,0,8,6"/>
+                <TextBlock x:Name="RecoverTicked" Style="{StaticResource PraLabel}"/>
+              </WrapPanel>
+              <DataGrid x:Name="ItemGrid" Grid.Row="2" Style="{StaticResource PraGrid}" IsReadOnly="True">
+                <DataGrid.Columns>
+                  <DataGridTemplateColumn Header="" CellTemplate="{StaticResource PraTickTemplate}" Width="36"/>
+                  <DataGridTextColumn Header="Object" Binding="{Binding Identity}" Width="260"/>
+                  <DataGridTextColumn Header="Type" Binding="{Binding Kind}" Width="70"/>
+                  <DataGridTextColumn Header="Converted" Binding="{Binding Converted}" Width="160"/>
+                  <DataGridTemplateColumn Header="Recovered" CellTemplate="{StaticResource PraStatusTemplate}" Width="*"/>
+                </DataGrid.Columns>
+              </DataGrid>
+              <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,12,0,0">
+                <Button x:Name="RecoverPreview" Content="Preview" Style="{StaticResource PraButton}"/>
+                <Button x:Name="RecoverApply" Content="Recover…" Style="{StaticResource PraButton}" IsEnabled="False"/>
+                <TextBlock x:Name="RecoverHint" Style="{StaticResource PraLabel}" TextWrapping="Wrap" MaxWidth="560"/>
+              </StackPanel>
+            </Grid>
+          </Border>
+        </Grid>
+      </Grid>
+
+      <!-- Activity -->
+      <Border Grid.Column="4" Style="{StaticResource PraCard}" Padding="16,14,16,14">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Text="Activity" Style="{StaticResource PraCardTitle}" Margin="0"/>
+            <Border x:Name="StatusPill" Grid.Column="1" CornerRadius="10" Padding="10,2">
+              <TextBlock x:Name="StatusText" FontSize="12" FontWeight="SemiBold"/>
+            </Border>
+          </Grid>
+          <StackPanel Grid.Row="1" Margin="0,8,0,0">
+            <TextBlock x:Name="RunAction" FontSize="14" FontWeight="SemiBold" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
+            <TextBlock x:Name="RunMeta" FontSize="12" Margin="0,2,0,0" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+          </StackPanel>
+          <StackPanel Grid.Row="2" Margin="0,10,0,0">
+            <TextBlock x:Name="RunStep" FontSize="12.5" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
+            <ProgressBar x:Name="RunProgress" Height="4" Margin="0,6,0,0" Minimum="0" Maximum="1" Value="0"/>
+            <TextBlock x:Name="RunCurrent" FontSize="12" Margin="0,6,0,0" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+          </StackPanel>
+          <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,8,0,8">
+            <TextBlock Style="{StaticResource PraIcon}" Text="&#xE73E;" FontSize="13" Foreground="{DynamicResource PraSuccess}" VerticalAlignment="Center"/>
+            <TextBlock x:Name="RunOk" Text="0" FontSize="12.5" Margin="5,0,16,0" Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
+            <TextBlock Style="{StaticResource PraIcon}" Text="&#xE7BA;" FontSize="13" Foreground="{DynamicResource PraCaution}" VerticalAlignment="Center"/>
+            <TextBlock x:Name="RunWarn" Text="0" FontSize="12.5" Margin="5,0,16,0" Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
+            <TextBlock Style="{StaticResource PraIcon}" Text="&#xEA39;" FontSize="13" Foreground="{DynamicResource PraCritical}" VerticalAlignment="Center"/>
+            <TextBlock x:Name="RunFail" Text="0" FontSize="12.5" Margin="5,0,0,0" Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
+          </StackPanel>
+          <Border Grid.Row="4" BorderThickness="0,1,0,0" BorderBrush="{DynamicResource DividerStrokeColorDefaultBrush}" Padding="0,8,0,0">
+            <Grid>
+              <TextBlock x:Name="ActivityEmpty" Style="{StaticResource PraText}" Text="Nothing has run yet. Every action shows here, step by step, as on the command line; its log, transcript and report are written as usual."/>
+              <ListBox x:Name="ActivityLog" BorderThickness="0" Background="Transparent" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                       VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling">
+                <ListBox.ItemContainerStyle>
+                  <Style TargetType="ListBoxItem">
+                    <Setter Property="Padding" Value="0"/>
+                    <Setter Property="Margin" Value="0"/>
+                    <Setter Property="Focusable" Value="False"/>
+                    <Setter Property="Template">
+                      <Setter.Value>
+                        <ControlTemplate TargetType="ListBoxItem">
+                          <ContentPresenter/>
+                        </ControlTemplate>
+                      </Setter.Value>
+                    </Setter>
+                  </Style>
+                </ListBox.ItemContainerStyle>
+                <ListBox.ItemTemplate>
+                  <DataTemplate>
+                    <Grid Margin="{Binding Margin}">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="22"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <TextBlock Text="{Binding Glyph}" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="12" Foreground="{Binding Brush}" Margin="0,3,0,0"/>
+                      <TextBlock Grid.Column="1" Text="{Binding Text}" TextWrapping="Wrap" FontSize="{Binding Size}" FontWeight="{Binding Weight}" Foreground="{Binding TextBrush}"/>
+                      <TextBlock Grid.Column="2" Text="{Binding Time}" FontSize="10.5" Margin="8,2,0,0" Foreground="{DynamicResource TextFillColorTertiaryBrush}"/>
+                    </Grid>
+                  </DataTemplate>
+                </ListBox.ItemTemplate>
+              </ListBox>
+            </Grid>
+          </Border>
+          <Border x:Name="ResultCard" Grid.Row="5" Visibility="Collapsed" CornerRadius="8" BorderThickness="1" Padding="12,10" Margin="0,10,0,0">
+            <StackPanel>
+              <TextBlock x:Name="ResultTitle" FontSize="14" FontWeight="SemiBold" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
+              <TextBlock x:Name="ResultText" FontSize="12.5" TextWrapping="Wrap" Margin="0,4,0,0" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+              <Grid x:Name="BatchPanel" Margin="0,8,0,0" Visibility="Collapsed">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="Auto"/>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Batch ID" Style="{StaticResource PraLabel}"/>
+                <TextBox x:Name="BatchText" Grid.Column="1" IsReadOnly="True" FontFamily="Cascadia Mono, Consolas" FontSize="14" FontWeight="SemiBold" VerticalContentAlignment="Center"/>
+                <Button x:Name="CopyBatch" Grid.Column="2" Content="Copy" Style="{StaticResource PraButton}" Margin="8,0,0,0" MinWidth="64"/>
+              </Grid>
+              <TextBlock x:Name="NextStepText" FontSize="12" TextWrapping="Wrap" Margin="0,8,0,0" FontFamily="Cascadia Mono, Consolas" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+              <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                <Button x:Name="OpenReport" Content="Report" Style="{StaticResource PraButton}" MinWidth="80"/>
+                <Button x:Name="OpenLog" Content="Log" Style="{StaticResource PraButton}" MinWidth="80"/>
+              </StackPanel>
+            </StackPanel>
+          </Border>
+          <Button x:Name="StopRun" Grid.Row="6" Content="Stop after the current object" Margin="0,10,0,0" Padding="12,6" Visibility="Collapsed"/>
+        </Grid>
+      </Border>
+    </Grid>
+
+    <!-- Footer -->
+    <Border Grid.Row="2" BorderThickness="0,1,0,0" BorderBrush="{DynamicResource DividerStrokeColorDefaultBrush}" Background="{DynamicResource LayerFillColorDefaultBrush}" Padding="24,10" Margin="0,4,0,0">
+      <Grid>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock x:Name="Footer" FontSize="12" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+        <StackPanel Grid.Column="1" Orientation="Horizontal">
+          <Button x:Name="OpenConfig" Content="Configuration" Style="{StaticResource PraButton}"/>
+          <Button x:Name="OpenData" Content="Data folder" Style="{StaticResource PraButton}"/>
+          <Button x:Name="OpenLogs" Content="Logs" Style="{StaticResource PraButton}"/>
+          <Button x:Name="RefreshState" Content="Refresh" Style="{StaticResource PraButton}"/>
+          <Button x:Name="CloseWindow" Content="Close" Style="{StaticResource PraButton}" Margin="0"/>
+        </StackPanel>
+      </Grid>
+    </Border>
+  </Grid>
+</Window>
