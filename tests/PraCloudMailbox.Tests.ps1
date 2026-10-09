@@ -24,12 +24,12 @@ BeforeAll {
         $config = @{
             Environment = 'TEST'
             Exchange = @{ ConnectionMode = 'Local'; Server = ''; DomainController = '' }
-            Scope = @{ Mode = 'OU'; SearchBase = 'OU=PRA,DC=contoso,DC=com'; GroupDN = ''; CsvPath = ''; IncludeUsers = $true; IncludeShared = $true; IncludeRoom = $false; IncludeEquipment = $false; ExcludeSamAccountNames = @() }
+            Scope = @{ Mode = 'OU'; SearchBase = 'OU=PRA,DC=contoso,DC=com'; GroupDN = ''; CsvPath = ''; IncludeUsers = $true; IncludeShared = $true; IncludeRoom = $false; IncludeEquipment = $false; ExcludeSamAccountNames = @(); ConvertRooms = $false }
             Collect = @{ SharedPermissions = $true; ExpandGroupTrustees = $true; ExcludeTrustees = @('Administrator'); MailboxStatistics = $false; Contacts = $false; ContactsSearchBase = ''; DistributionGroups = $false; DistributionGroupsSearchBase = ''; DynamicDistributionGroups = $false }
             Store = @{ Path = '.\data\test.db'; KeepSnapshots = 10; BackupFolder = '.\data\backup'; MaxSnapshotAgeDays = 7; JournalPath = '.\data\journal.db' }
             Cloud = @{ TenantId = ''; Organization = ''; AppId = ''; CertificateThumbprint = ''; DefaultUsageLocation = '' }
             Polling = @{ IntervalSeconds = 20; MailboxTimeoutMinutes = 30; SyncTimeoutMinutes = 30; HoldTimeoutMinutes = 30 }
-            Licensing = @{ Users = @{ Mode = 'Group'; GroupId = '11111111-1111-1111-1111-111111111111'; SkuPartNumber = '' }; Shared = @{ SkuPartNumber = 'E5' } }
+            Licensing = @{ Users = @{ Mode = 'Group'; GroupId = '11111111-1111-1111-1111-111111111111'; SkuPartNumber = '' }; Shared = @{ SkuPartNumber = 'E5'; Parallel = 100 } }
             Retention = @{ TagAttribute = 'CustomAttribute1'; TagValue = 'Converted'; HoldPolicy = '' }
             EntraConnect = @{ Mode = 'Manual'; Server = ''; ScriptPath = ''; MinVersion = '2.5.76.0' }
             Logging = @{ Folder = '.\logs' }
@@ -429,11 +429,19 @@ Describe 'Cloud rules: object readiness' {
         $findings = Get-Pra2Readiness -Config $script:config -Record $script:sharedRecord -State $state
         @($findings | Where-Object Code -eq 'HOLD_PRESENT')[0].Level | Should -Be 'Info'
     }
-    It 'refuses a <Kind> mailbox (Convert would turn it into a shared mailbox)' -ForEach @(@{ Kind = 'Room' }, @{ Kind = 'Equipment' }) {
+    It 'refuses a <Kind> mailbox by default (Convert would turn it into a shared mailbox)' -ForEach @(@{ Kind = 'Room' }, @{ Kind = 'Equipment' }) {
         $record = [pscustomobject]@{ kind = $Kind; object_guid = 'r'; exchange_guid = 'bbbbbbbb-0000-0000-0000-000000000002'; immutable_id = 'z'; user_principal_name = 'room@contoso.com' }
         $state = New-State -Other @{ ExchangeGuid = 'bbbbbbbb-0000-0000-0000-000000000002' }
         Get-Codes (Get-Pra2Readiness -Config $script:config -Record $record -State $state) 'Error' | Should -Contain 'KIND_NOT_SUPPORTED'
         Get-Codes (Get-Pra2Readiness -Config $script:config -Record $script:sharedRecord -State $state) 'Error' | Should -Not -Contain 'KIND_NOT_SUPPORTED'
+    }
+    It 'converts a <Kind> mailbox like a shared one when Scope.ConvertRooms is set' -ForEach @(@{ Kind = 'Room' }, @{ Kind = 'Equipment' }) {
+        $config = New-TestConfig -Override @{ Scope = @{ Mode = 'OU'; SearchBase = 'OU=PRA,DC=contoso,DC=com'; GroupDN = ''; CsvPath = ''; IncludeUsers = $true; IncludeShared = $true; IncludeRoom = $true; IncludeEquipment = $true; ExcludeSamAccountNames = @(); ConvertRooms = $true } }
+        $record = [pscustomobject]@{ kind = $Kind; object_guid = 'r'; exchange_guid = 'bbbbbbbb-0000-0000-0000-000000000002'; immutable_id = 'z'; user_principal_name = 'room@contoso.com' }
+        $state = New-State -Other @{ ExchangeGuid = 'bbbbbbbb-0000-0000-0000-000000000002' }
+        $findings = Get-Pra2Readiness -Config $config -Record $record -State $state
+        Get-Codes $findings 'Error' | Should -Not -Contain 'KIND_NOT_SUPPORTED'
+        Get-Codes $findings | Should -Contain 'ROOM_CONVERT_ENABLED'
     }
     It 'detects the Exchange mailbox plans by ID: Foundation and other Exchange-backed plans give no mailbox' {
         $skus = @([pscustomobject]@{ skuId = 's'; servicePlans = @(
@@ -596,6 +604,20 @@ Describe 'Results and report' {
         (Get-PraOutcome $context).ExitCode | Should -Be 2
         [void]$context.Rows.Add([ordered]@{ Identity = 'c'; FinalStatus = 'Error' })
         (Get-PraOutcome $context).ExitCode | Should -Be 1
+    }
+}
+
+Describe 'Rough duration estimate' {
+    It 'is empty when there is nothing to convert or roll back' {
+        (Get-PraDurationEstimate -UserWaves 0 -SharedRounds 0).Text | Should -BeNullOrEmpty
+    }
+    It 'adds 2 min per user wave and 3 min per shared pipeline round by default' {
+        $estimate = Get-PraDurationEstimate -UserWaves 10 -SharedRounds 4
+        $estimate.Seconds | Should -Be (10 * 120 + 4 * 180)
+        $estimate.Text | Should -Match 'min|h'
+    }
+    It 'accepts other typical durations' {
+        (Get-PraDurationEstimate -UserWaves 2 -SharedRounds 0 -UserWaveSeconds 30).Seconds | Should -Be 60
     }
 }
 
@@ -786,6 +808,25 @@ Describe 'Link with the window: events, stop, questions, waves' {
     It 'writes nothing when the run does not belong to the window' {
         Write-PraEvent 'item' @{ text = 'x' }
         @(Get-ChildItem -LiteralPath $script:linkFolder).Count | Should -Be 0
+    }
+    It 'Write-PraProgress emits done/total/percent, with a rough time left once something is done' {
+        $events = Join-Path $script:linkFolder 'progress.events.jsonl'
+        & (Get-Module PRA2.Common) { $script:EventFile = $args[0] } $events
+        $context = New-TestContext
+        Write-PraProgress -Context $context -Phase 'Users' -Done 0 -Total 3000 -ElapsedSeconds 0
+        Write-PraProgress -Context $context -Phase 'Users' -Done 500 -Total 3000 -ElapsedSeconds 600
+        Write-PraProgress -Context $context -Phase 'Users' -Done 3000 -Total 3000 -ElapsedSeconds 3600
+        $progress = @(Get-Content -LiteralPath $events -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object kind -eq 'progress')
+        $progress.Count | Should -Be 3
+        $progress[0].done | Should -Be 0; $progress[0].percent | Should -Be 0; $progress[0].eta | Should -BeNullOrEmpty
+        $progress[1].done | Should -Be 500; $progress[1].percent | Should -Be 17; $progress[1].eta | Should -Match 'left at this pace'
+        $progress[2].done | Should -Be 3000; $progress[2].percent | Should -Be 100; $progress[2].eta | Should -BeNullOrEmpty
+    }
+    It 'Write-PraProgress does nothing for an empty total' {
+        $events = Join-Path $script:linkFolder 'progress-empty.events.jsonl'
+        & (Get-Module PRA2.Common) { $script:EventFile = $args[0] } $events
+        Write-PraProgress -Context (New-TestContext) -Phase 'Users' -Done 0 -Total 0
+        Test-Path -LiteralPath $events | Should -BeFalse
     }
     It 'asks the operator through the event file and reads the answer; a stop request answers no' {
         $events = Join-Path $script:linkFolder 'ask.events.jsonl'

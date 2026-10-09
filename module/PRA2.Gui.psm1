@@ -28,7 +28,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.1.0
+    Version : 1.2.0
 #>
 #Requires -Version 5.1
 Set-StrictMode -Version Latest
@@ -579,7 +579,7 @@ $script:ControlNames = @(
     'ConvertApply', 'ConvertHint',
     'RecoverFacts', 'BatchGrid', 'RecoverAll', 'RecoverWave', 'RecoverFilter', 'RecoverTickShown', 'RecoverUntick', 'RecoverTicked',
     'ItemGrid', 'RecoverPreview', 'RecoverApply', 'RecoverHint',
-    'StatusPill', 'StatusText', 'RunAction', 'RunMeta', 'RunStep', 'RunProgress', 'RunCurrent', 'RunOk', 'RunWarn', 'RunFail',
+    'StatusPill', 'StatusText', 'RunAction', 'RunMeta', 'RunStep', 'RunProgress', 'RunCurrent', 'RunObjectsBar', 'RunObjects', 'RunOk', 'RunWarn', 'RunFail',
     'ActivityEmpty', 'ActivityLog', 'ResultCard', 'ResultTitle', 'ResultText', 'BatchPanel', 'BatchText', 'CopyBatch', 'NextStepText',
     'OpenReport', 'OpenLog', 'StopRun', 'Footer', 'OpenConfig', 'OpenData', 'OpenLogs', 'RefreshState', 'CloseWindow')
 # The drop-down lists: text shown -> value (scope of Check) or DataView clause (filters).
@@ -1040,7 +1040,7 @@ function Update-PraGuiConvertPage {
     }
     if ($config) {
         $facts.Add((New-PraGuiFact 'Users' ('identity to the cloud, Exchange plan by ' + (Get-PraGuiLicenceText -Config $config))))
-        $facts.Add((New-PraGuiFact 'Shared mailboxes' $(if ($config.Licensing.Shared.SkuPartNumber) { 'one at a time, temporary ' + $config.Licensing.Shared.SkuPartNumber } else { 'temporary licence not set' }) $(if ($config.Licensing.Shared.SkuPartNumber) { 'Primary' } else { 'Caution' })))
+        $facts.Add((New-PraGuiFact 'Shared mailboxes' $(if ($config.Licensing.Shared.SkuPartNumber) { 'waves of {0}, temporary {1}' -f $config.Licensing.Shared.Parallel, $config.Licensing.Shared.SkuPartNumber } else { 'temporary licence not set' }) $(if ($config.Licensing.Shared.SkuPartNumber) { 'Primary' } else { 'Caution' })))
     }
     $inCloud = $table.Select("InCloud = '1'").Count
     $facts.Add((New-PraGuiFact 'In Exchange Online' $(if ($inCloud) { '{0} object(s) converted, not recovered yet' -f $inCloud } else { 'none' })))
@@ -1363,8 +1363,22 @@ function Invoke-PraGuiEvent {
             'step' {
                 $index = [int](Get-PraValue $Record 'index' 0); $total = [int](Get-PraValue $Record 'total' 0); $title = [string](Get-PraValue $Record 'title' '')
                 $c.RunStep.Text = if ($total) { 'Step {0}/{1} · {2}' -f $index, $total, $title } else { $title }
-                if ($total) { $c.RunProgress.Value = [Math]::Max(0, [Math]::Min(1, ($index - 1) / $total)) }
+                # [Math]::Min/Max pick the (int,int) overload and truncate when a whole-number literal meets a
+                # fraction: 1.0 / 0.0 as explicit doubles keep the fraction.
+                if ($total) { $c.RunProgress.Value = [Math]::Max(0.0, [Math]::Min(1.0, ($index - 1) / [double]$total)) }
+                # A new step: the object progress of the previous one (if any) no longer applies.
+                $c.RunObjects.Text = ''; $c.RunObjects.Visibility = [Windows.Visibility]::Collapsed
+                $c.RunObjectsBar.Value = 0; $c.RunObjectsBar.Visibility = [Windows.Visibility]::Collapsed
                 Add-PraGuiLine -Status Step -Text $(if ($total) { '{0}/{1}  {2}' -f $index, $total, $title } else { $title })
+            }
+            'progress' {
+                $done = [int](Get-PraValue $Record 'done' 0); $total = [int](Get-PraValue $Record 'total' 0); $phase = [string](Get-PraValue $Record 'phase' '')
+                $percent = [int](Get-PraValue $Record 'percent' 0); $eta = [string](Get-PraValue $Record 'eta' '')
+                if ($total -gt 0) {
+                    $c.RunObjectsBar.Value = [Math]::Max(0.0, [Math]::Min(1.0, $done / [double]$total)); $c.RunObjectsBar.Visibility = [Windows.Visibility]::Visible
+                    $c.RunObjects.Text = '{0}: {1} of {2} ({3}%){4}' -f $phase, $done, $total, $percent, $(if ($eta) { ' · ' + $eta } else { '' })
+                    $c.RunObjects.Visibility = [Windows.Visibility]::Visible
+                }
             }
             'item' {
                 $status = [string](Get-PraValue $Record 'status' 'Info')
@@ -1507,7 +1521,7 @@ function Complete-PraGuiAction {
         $split = '{0} user(s), {1} shared' -f $count.Users, $count.Shared
         $confirm = if ($action -eq 'Convert') {
             if ($selection.Resume) { 'Resume of batch {0}: {1} object(s) not finished ({2}) are taken again.{3}' -f $Run.Request.Batch, $count.Planned, $split, $blocked }
-            else { '{0} object(s) are converted: {1} user(s) - identity managed in the cloud, Exchange plan, their Teams storage becomes their mailbox - then {2} shared mailbox(es), one at a time, with the permissions of the snapshot.{3}' -f $count.Planned, $count.Users, $count.Shared, $blocked }
+            else { '{0} object(s) are converted: {1} user(s) - identity managed in the cloud, Exchange plan, their Teams storage becomes their mailbox - then {2} shared mailbox(es), in waves, with the permissions of the snapshot.{3}' -f $count.Planned, $count.Users, $count.Shared, $blocked }
         } else { '{0} object(s) of batch {1} go back on-premises ({2}): users to Active Directory and their on-premises mailbox, their cloud data under the case hold; shared mailboxes become inactive mailboxes under the hold. Nothing is deleted from a mailbox.{3}' -f $count.Planned, $Run.Request.Batch, $split, $blocked }
         $confirm += ' Every change is journaled; the run can be stopped after the current object and resumed.'
         $guard = if ($selection.Resume) { (Get-PraGuiSelection -Page $action).Key } else { $selection.Key }
@@ -1563,6 +1577,8 @@ function Clear-PraGuiActivity {
     $c.ActivityEmpty.Visibility = [Windows.Visibility]::Visible
     foreach ($name in 'RunOk', 'RunWarn', 'RunFail') { $c[$name].Text = '0' }
     $c.RunStep.Text = ''; $c.RunCurrent.Text = ''; $c.RunProgress.Value = 0
+    $c.RunObjects.Text = ''; $c.RunObjects.Visibility = [Windows.Visibility]::Collapsed
+    $c.RunObjectsBar.Value = 0; $c.RunObjectsBar.Visibility = [Windows.Visibility]::Collapsed
     $c.ResultCard.Visibility = [Windows.Visibility]::Collapsed
 }
 

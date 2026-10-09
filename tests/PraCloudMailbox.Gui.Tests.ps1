@@ -4,7 +4,7 @@
     test configuration, snapshot, journal and Check report; the questions and confirmations are answered by hooks.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.1.0
+    Version : 1.2.0
 #>
 #Requires -Version 5.1
 
@@ -218,7 +218,7 @@ Describe 'Window: fresh installation' {
 Describe 'Window: built on a test state' {
     BeforeAll {
         $script:State = New-TestState -Folder (Join-Path $TestDrive 'state')
-        $script:Window = New-PraGuiWindow -Root $script:Root -ConfigPath $script:State.Config -Version '1.1.0' -Theme Light
+        $script:Window = New-PraGuiWindow -Root $script:Root -ConfigPath $script:State.Config -Version '1.2.0' -Theme Light
         $form = $script:Window.Form
         $form.WindowStartupLocation = 'Manual'; $form.Left = -6000; $form.Top = -6000; $form.ShowActivated = $false; $form.ShowInTaskbar = $false
         $form.Show()
@@ -304,6 +304,7 @@ Describe 'Window: built on a test state' {
                 Asked = (New-Object 'Collections.Generic.HashSet[int]'); StopAsked = $false; LogFile = ''; Result = $null; Summary = $null }
             foreach ($json in @(
                     '{"kind":"step","index":2,"total":7,"title":"Users"}'
+                    '{"kind":"progress","phase":"Users","done":500,"total":3000,"percent":17,"eta":"about 2 h 30 min left at this pace"}'
                     '{"kind":"item","status":"Ok","text":"alice done","identity":"alice@contoso.com"}'
                     '{"kind":"item","status":"Warn","text":"bob pending","identity":"bob@contoso.com"}'
                     ('{{"kind":"ask","id":1,"title":"Entra Connect","text":"Run a delta sync. Done?","answer":"{0}"}}' -f ("$events.answer-1" -replace '\\', '\\'))
@@ -311,6 +312,10 @@ Describe 'Window: built on a test state' {
                     '{"kind":"result","exitCode":0,"planned":0}')) { Invoke-PraGuiEvent -Record ($json | ConvertFrom-Json) }
         } $events
         $script:C.RunStep.Text | Should -Be 'Step 2/7 · Users'
+        $script:C.RunProgress.Value | Should -BeGreaterThan 0.14
+        $script:C.RunObjects.Text | Should -Be 'Users: 500 of 3000 (17%) · about 2 h 30 min left at this pace'
+        $script:C.RunObjects.Visibility | Should -Be ([Windows.Visibility]::Visible)
+        $script:C.RunObjectsBar.Value | Should -BeGreaterThan 0.16
         $script:C.RunOk.Text | Should -Be '1'
         $script:C.RunWarn.Text | Should -Be '1'
         $script:C.RunCurrent.Text | Should -Be 'Object: bob@contoso.com'
@@ -318,6 +323,18 @@ Describe 'Window: built on a test state' {
         $global:PraGuiAsked | Should -Be 'elsewhere'
         Test-Path -LiteralPath (Join-Path $TestDrive 'elsewhere.txt') | Should -BeFalse
         (& $script:Gui { $script:Gui.Run.Result }).exitCode | Should -Be 0
+    }
+    It 'hides the object progress of the previous step when a new step starts' {
+        & $script:Gui {
+            Invoke-PraGuiEvent -Record (@{ kind = 'progress'; phase = 'Shared mailboxes'; done = 1; total = 5; percent = 20; eta = '' } | ConvertTo-Json | ConvertFrom-Json)
+        }
+        $script:C.RunObjects.Visibility | Should -Be ([Windows.Visibility]::Visible)
+        & $script:Gui {
+            Invoke-PraGuiEvent -Record (@{ kind = 'step'; index = 3; total = 7; title = 'Shared mailboxes' } | ConvertTo-Json | ConvertFrom-Json)
+        }
+        $script:C.RunObjects.Text | Should -BeNullOrEmpty
+        $script:C.RunObjects.Visibility | Should -Be ([Windows.Visibility]::Collapsed)
+        $script:C.RunObjectsBar.Visibility | Should -Be ([Windows.Visibility]::Collapsed)
     }
     It 'refuses to close while a run is going' {
         $global:PraGuiNotice = ''

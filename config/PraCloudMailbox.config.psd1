@@ -2,7 +2,7 @@
 #  PRA Cloud Mailbox - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 1.1.0
+#  Version : 1.2.0
 #
 #  This file is read by Invoke-PraCloudMailbox.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
@@ -44,9 +44,10 @@
         CsvPath                = ''             # e.g. '.\config\Targets.csv'
         IncludeUsers           = $true
         IncludeShared          = $true
-        IncludeRoom            = $false        # rooms and equipment are collected, but Convert refuses them (KIND_NOT_SUPPORTED)
-        IncludeEquipment       = $false
+        IncludeRoom            = $false        # rooms and equipment are collected when true; Convert still refuses
+        IncludeEquipment       = $false        # them unless ConvertRooms is also true (booking settings are lost)
         ExcludeSamAccountNames = @()
+        ConvertRooms           = $false        # $true: Convert/Recover a room or equipment mailbox like a shared one
     }
 
     # ---------------------------------------------------------------------
@@ -102,11 +103,13 @@
     #   Users.Mode = Kiosk  : the Exchange Kiosk plan of the licence the user already has (e.g. Teams
     #                         Enterprise): no extra unit, 2 GB mailbox, no Outlook desktop.
     #   Users.Mode = Direct : SkuPartNumber assigned directly to each user.
-    #   Shared.SkuPartNumber: temporary licence of the shared mailboxes (one unit, used one after another).
+    #   Shared.SkuPartNumber: temporary licence of the shared mailboxes, given back once each one is converted.
+    #   Shared.Parallel     : shared mailboxes converted together, in waves (one temporary unit each, at most the
+    #                         free units of the SKU at the start of each wave; 1 = one after another).
     # ---------------------------------------------------------------------
     Licensing = @{
         Users  = @{ Mode = 'Group'; GroupId = ''; SkuPartNumber = '' }     # GroupId: object ID of the licence group
-        Shared = @{ SkuPartNumber = '' }     # e.g. 'SPE_E3' or 'EXCHANGESTANDARD'
+        Shared = @{ SkuPartNumber = ''; Parallel = 100 }     # e.g. 'SPE_E3' or 'EXCHANGESTANDARD'
     }
 
     # ---------------------------------------------------------------------
@@ -115,11 +118,14 @@
     #                          (adaptive scope IsInactiveMailbox + tag) keeps them once inactive.
     #   HoldPolicy           : eDiscovery case hold policy used at Recover (users: protect the
     #                          ComponentShared; shared: hold before the identity is deleted).
+    #   HoldPolicyLimit      : mailboxes per case hold policy (1000 = Microsoft Purview limit). When the
+    #                          policy is full, Recover creates <HoldPolicy>-02, -03... in the same case.
     # ---------------------------------------------------------------------
     Retention = @{
-        TagAttribute = 'CustomAttribute1'
-        TagValue     = 'Converted'
-        HoldPolicy   = ''                   # name of the case hold policy, e.g. 'PRA-Recover-Hold'
+        TagAttribute    = 'CustomAttribute1'
+        TagValue        = 'Converted'
+        HoldPolicy      = ''                # name of the case hold policy, e.g. 'PRA-Recover-Hold'
+        HoldPolicyLimit = 1000
     }
 
     # ---------------------------------------------------------------------

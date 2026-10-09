@@ -282,7 +282,7 @@ try {
     $actions = @(
         [pscustomobject]@{ Icon = 'database'; Name = 'Collect'; Chip = '<span class="rb-chip">Windows PowerShell 5.1</span>'; Text = 'On an Exchange server, every day: <strong>mailboxes, GUIDs, X500 addresses and shared mailbox permissions</strong> into a SQLite snapshot.'; Pills = (Get-ReadmePill 'Reads only' 'success') + (Get-ReadmePill 'Scheduled task' 'teal') }
         [pscustomobject]@{ Icon = 'check'; Name = 'Check'; Chip = '<span class="rb-chip hot">read-only</span>'; Text = 'On the cloud admin server: <strong>is every object ready?</strong> Entra ID object, Exchange Online recipient, licences, permissions of the app.'; Pills = (Get-ReadmePill 'Error = refused' 'warning') + (Get-ReadmePill 'Every week' 'teal') }
-        [pscustomobject]@{ Icon = 'cloud'; Name = 'Convert'; Chip = '<span class="rb-chip">-Mode Apply</span>'; Text = 'Users first &mdash; <strong>the Teams storage becomes the mailbox</strong> &mdash; then the shared mailboxes one after another, with their permissions.'; Pills = (Get-ReadmePill 'Batch ID' 'violet') + (Get-ReadmePill 'Resumable' 'success') }
+        [pscustomobject]@{ Icon = 'cloud'; Name = 'Convert'; Chip = '<span class="rb-chip">-Mode Apply</span>'; Text = 'Users first &mdash; <strong>the Teams storage becomes the mailbox</strong> &mdash; then the shared mailboxes in waves, with their permissions.'; Pills = (Get-ReadmePill 'Batch ID' 'violet') + (Get-ReadmePill 'Resumable' 'success') }
         [pscustomobject]@{ Icon = 'refresh'; Name = 'Recover'; Chip = '<span class="rb-chip">-Batch</span>'; Text = 'Users back on-premises, their cloud data <strong>under a case hold</strong>; shared mailboxes <strong>inactive</strong>, recreated by Entra Connect.'; Pills = (Get-ReadmePill 'Licences as before' 'success') + (Get-ReadmePill 'Waves' 'teal') }
     )
     $actionHtml = ($actions | ForEach-Object { "<div class=""card-item""><div class=""card-icon"">$(Get-ReadmeIcon $_.Icon)</div><div><div class=""card-title"">$($_.Name) $($_.Chip)</div><div class=""card-text"">$($_.Text)</div><div>$($_.Pills)</div></div></div>" }) -join ''
@@ -298,7 +298,7 @@ try {
         'Users &middot; Recover <span>&middot; once AD, Exchange and Entra Connect are rebuilt</span>' = @(
             'refresh | AD authority | one delta cycle', 'arrow | | ', 'key | Plan removed | licences exactly as before', 'arrow | | '
             'server | On-premises | MailUser, on-premises GUID', 'arrow | | ', 'shield | Case hold | disaster mails kept')
-        'Shared mailboxes &middot; Convert <span>&middot; one after another</span>' = @(
+        'Shared mailboxes &middot; Convert <span>&middot; in waves</span>' = @(
             'key | Temporary licence | one unit for all', 'arrow | | ', 'people | SharedMailbox | then the licence goes back', 'arrow | | '
             'tag | Tag | CustomAttribute1 = Converted', 'arrow | | ', 'check | Permissions | FullAccess, SendAs, SendOnBehalf')
         'Shared mailboxes &middot; Recover <span>&middot; one scheduler pause, one delta cycle</span>' = @(

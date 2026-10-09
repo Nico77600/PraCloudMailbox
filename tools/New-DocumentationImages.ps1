@@ -211,7 +211,7 @@ function Invoke-DocRun {
             $banner['Config'] = @('Config', ('{0} {1} Environment {2}' -f (Split-Path $context.Config._Path -Leaf), $dot, $context.Config.Environment))
             $banner['Log'] = @('Log', $context.LogFile)
             Write-PraBanner -Context $context -Title 'PRA Cloud Mailbox' -Subtitle "Exchange DR $dot scenario 2 $dot on-premises lost $([char]0x2192) Exchange Online" -Details $banner
-            $context.StepTotal = @{ Check = 4; Convert = 7; Recover = 8 }[$RunAction]
+            $context.StepTotal = @{ Check = 4; Convert = 7; Recover = 7 }[$RunAction]
             switch ($RunAction) { 'Check' { Invoke-PraCheck } 'Convert' { Invoke-PraConvert } 'Recover' { Invoke-PraRecover } }
         } catch {
             $context.Issues.Add([pscustomobject]@{ Message = $_.Exception.Message; Source = 'Execution' }); $context.ExitCode = 1
