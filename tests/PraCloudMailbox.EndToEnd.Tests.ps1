@@ -65,7 +65,7 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
             param([ValidateSet('Convert', 'Recover')][string]$Action, [string]$Mode = 'Apply', [string]$Batch = '', [string]$Identity = '', [string]$Scope = 'All', [string]$IdentityPath = '')
             $config = Import-PraConfiguration -Path $global:PraE2E.Config -Root $global:PraE2E.Root
             $run = @{ Root = $global:PraE2E.Root; Version = 'test'; RunId = [guid]::NewGuid().ToString('N'); StartTime = Get-Date; Action = $Action; Mode = $Mode; Phase = ''
-                CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; StepTotal = $(if ($Action -eq 'Convert') { 7 } else { 8 }); Warnings = 0
+                CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; StepTotal = 7; Warnings = 0
                 Issues = [System.Collections.Generic.List[object]]::new(); Rows = [System.Collections.Generic.List[object]]::new()
                 BackupFiles = [System.Collections.Generic.List[string]]::new(); StateFiles = [System.Collections.Generic.List[string]]::new(); Excluded = [System.Collections.Generic.List[string]]::new()
                 LogFolder = $config.Logging.Folder; ReportFolder = $config.Report.Folder; LogFile = (Join-Path $global:PraE2E.Dir 'run.log'); TranscriptPath = ''; TranscriptStarted = $false
@@ -494,6 +494,192 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         @(($bob.Direct | Where-Object { $_.skuId -eq 'sku-e5' }).disabledPlans | Sort-Object) | Should -Be @('plan-exo', 'plan-teams')
     }
 
+    It 'converts the shared mailboxes in waves of Licensing.Shared.Parallel, phase by phase for the whole wave' {
+        $accueil = Add-PraFakeUser -Upn 'accueil@contoso.com' -Kind Shared -UsageLocation ''
+        $rh = Add-PraFakeUser -Upn 'rh@contoso.com' -Kind Shared -UsageLocation ''
+        $global:PraE2E.InScope.Add('accueil@contoso.com'); $global:PraE2E.InScope.Add('rh@contoso.com')
+        Write-E2ESnapshot
+        $text = [IO.File]::ReadAllText($global:PraE2E.Config)
+        [IO.File]::WriteAllText($global:PraE2E.Config, $text.Replace("Shared = @{ SkuPartNumber = 'E5' }", "Shared = @{ SkuPartNumber = 'E5'; Parallel = 2 }"), [Text.UTF8Encoding]::new($true))
+        Start-E2E -Action Convert -Scope SharedOnly
+        Invoke-PraConvert
+        @($context.Rows | ForEach-Object { $_.FinalStatus }) | Should -Be @('Success', 'Success', 'Success')
+        foreach ($mailbox in @($compta, $accueil, $rh)) { $mailbox.Type | Should -Be 'SharedMailbox'; @($mailbox.Direct).Count | Should -Be 0 }
+        # Wave 1 = compta and accueil, phase by phase: both GUIDs cleared before either becomes shared; rh starts after them.
+        (Get-E2ECallIndex 'Set-MailUser accueil@') | Should -BeLessThan (Get-E2ECallIndex 'Set-Mailbox compta@contoso.com Type=Shared')
+        (Get-E2ECallIndex 'Set-MailUser rh@') | Should -BeGreaterThan (Get-E2ECallIndex 'Set-Mailbox accueil@contoso.com CustomAttribute1')
+        (Get-E2ERow 'compta@contoso.com').Detail | Should -Match '4/4 permission\(s\) granted'
+        @($compta.SendAs) | Should -Be @($bob.Id)
+    }
+    It 'emits a progress event per wave of a multi-wave Convert, and a rough estimate in the plan' {
+        $accueil = Add-PraFakeUser -Upn 'accueil@contoso.com' -Kind Shared -UsageLocation ''
+        $rh = Add-PraFakeUser -Upn 'rh@contoso.com' -Kind Shared -UsageLocation ''
+        $global:PraE2E.InScope.Add('accueil@contoso.com'); $global:PraE2E.InScope.Add('rh@contoso.com')
+        Write-E2ESnapshot
+        $text = [IO.File]::ReadAllText($global:PraE2E.Config)
+        [IO.File]::WriteAllText($global:PraE2E.Config, $text.Replace("Shared = @{ SkuPartNumber = 'E5' }", "Shared = @{ SkuPartNumber = 'E5'; Parallel = 2 }"), [Text.UTF8Encoding]::new($true))
+        $events = Join-Path $global:PraE2E.Dir 'progress-convert.events.jsonl'
+        & (Get-Module PRA2.Common) { $script:EventFile = $args[0] } $events
+        try {
+            Start-E2E -Action Convert -Scope SharedOnly
+            Invoke-PraConvert
+        } finally { & (Get-Module PRA2.Common) { $script:EventFile = '' } }
+        @($context.Rows | ForEach-Object { $_.FinalStatus }) | Should -Be @('Success', 'Success', 'Success')
+        $records = @(Get-Content -LiteralPath $events -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json })
+        $progress = @($records | Where-Object { $_.kind -eq 'progress' -and $_.phase -eq 'Shared mailboxes' })
+        @($progress | ForEach-Object { $_.done }) | Should -Be @(0, 2)
+        @($progress | ForEach-Object { $_.total }) | Should -Be @(3, 3)
+        @($records | Where-Object { $_.kind -eq 'item' -and $_.text -match 'Rough estimate: about' }).Count | Should -Be 1
+    }
+    It 'converts and recovers a room mailbox like a shared one when Scope.ConvertRooms is set' {
+        $room = Add-PraFakeUser -Upn 'salle-paris@contoso.com' -Kind Room -UsageLocation ''
+        $global:PraE2E.InScope.Add('salle-paris@contoso.com')
+        Write-E2ESnapshot
+        $text = [IO.File]::ReadAllText($global:PraE2E.Config)
+        [IO.File]::WriteAllText($global:PraE2E.Config, $text.Replace("Scope = @{ Mode = 'Auto' }", "Scope = @{ Mode = 'Auto'; IncludeRoom = `$true; ConvertRooms = `$true }"), [Text.UTF8Encoding]::new($true))
+        Start-E2E -Action Convert -Identity 'salle-paris@contoso.com'
+        Invoke-PraConvert
+        (Get-E2ERow 'salle-paris@contoso.com').FinalStatus | Should -Be 'Success'
+        $room.Type | Should -Be 'SharedMailbox'
+        $convert = $context.BatchId
+        $roomCloud = $room.ExchangeGuid; $oldId = $room.Id
+        Close-E2E
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PraRecover
+        (Get-E2ERow 'salle-paris@contoso.com').FinalStatus | Should -Be 'Success'
+        $new = Resolve-PraFakeUser 'salle-paris@contoso.com'
+        $new.Id | Should -Not -Be $oldId
+        $new.Type | Should -Be 'MailUser'
+        @($global:PraFake.Inactive | Where-Object { $_.ExchangeGuid -eq $roomCloud }).Count | Should -Be 1
+    }
+    It 'still refuses a room mailbox when Scope.ConvertRooms is not set' {
+        $room = Add-PraFakeUser -Upn 'salle-paris@contoso.com' -Kind Room -UsageLocation ''
+        $global:PraE2E.InScope.Add('salle-paris@contoso.com')
+        Write-E2ESnapshot
+        $text = [IO.File]::ReadAllText($global:PraE2E.Config)
+        [IO.File]::WriteAllText($global:PraE2E.Config, $text.Replace("Scope = @{ Mode = 'Auto' }", "Scope = @{ Mode = 'Auto'; IncludeRoom = `$true }"), [Text.UTF8Encoding]::new($true))
+        Start-E2E -Action Convert -Identity 'salle-paris@contoso.com'
+        { Invoke-PraConvert } | Should -Throw '*No object can be converted*'
+        (Get-E2ERow 'salle-paris@contoso.com').FinalStatus | Should -Be 'Error'
+        (Get-E2ERow 'salle-paris@contoso.com').Detail | Should -Match 'not converted'
+        $room.Type | Should -Be 'MailUser'
+    }
+    It 'makes the waves no larger than the free units of the temporary licence' {
+        $accueil = Add-PraFakeUser -Upn 'accueil@contoso.com' -Kind Shared -UsageLocation ''
+        $global:PraE2E.InScope.Add('accueil@contoso.com')
+        Write-E2ESnapshot
+        # Parallel = 100 by default, one free unit: one shared mailbox at a time, the unit given back between them.
+        $global:PraFake.Skus['sku-e5'].Enabled = 1
+        Start-E2E -Action Convert -Scope SharedOnly
+        Invoke-PraConvert
+        @($context.Rows | ForEach-Object { $_.FinalStatus }) | Should -Be @('Success', 'Success')
+        (Get-E2ECallIndex 'Set-MailUser accueil@') | Should -BeGreaterThan (Get-E2ECallIndex 'Set-Mailbox compta@contoso.com CustomAttribute1')
+        $accueil.Type | Should -Be 'SharedMailbox'
+    }
+
+    It 'rolls back in waves: one delta cycle for the users of a wave, one scheduler pause for the shared mailboxes of a wave' {
+        $accueil = Add-PraFakeUser -Upn 'accueil@contoso.com' -Kind Shared -UsageLocation ''
+        $global:PraE2E.InScope.Add('accueil@contoso.com')
+        Write-E2ESnapshot
+        Start-E2E -Action Convert
+        Invoke-PraConvert
+        $convert = $context.BatchId
+        $oldIds = @($compta.Id, $accueil.Id)
+        Close-E2E
+        $global:PraFake.Calls.Clear(); $global:PraFake.CaseHoldCalls = 0
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PraRecover
+        @($context.Rows | ForEach-Object { $_.FinalStatus }) | Should -Be @('Success', 'Success', 'Success', 'Success')
+        $calls = $global:PraFake.Calls
+        # Users: both back to AD before the one delta cycle of their wave; one case hold call for both.
+        $pause = Get-E2ECallIndex 'EntraConnect Pause'
+        $resume = Get-E2ECallIndex 'EntraConnect Resume'
+        @($calls[0..$pause] | Where-Object { $_ -match 'EntraConnect Delta' }).Count | Should -Be 1
+        (Get-E2ECallIndex "Graph PATCH users/$($bob.Id)/onPremisesSyncBehavior") | Should -BeLessThan (Get-E2ECallIndex 'EntraConnect Delta')
+        # Shared: the scheduler paused once, both identities deleted and purged meanwhile, then one delta cycle.
+        @($calls | Where-Object { $_ -match 'EntraConnect (Pause|Resume)' }).Count | Should -Be 2
+        foreach ($id in $oldIds) {
+            (Get-E2ECallIndex "Graph DELETE users/$id") | Should -BeGreaterThan $pause
+            (Get-E2ECallIndex "Graph DELETE directory/deletedItems/$id") | Should -BeLessThan $resume
+        }
+        @($calls | Where-Object { $_ -match 'EntraConnect Delta' }).Count | Should -Be 2
+        $global:PraFake.CaseHoldCalls | Should -Be 2
+        $global:PraFake.Scheduler | Should -BeTrue
+        @($global:PraFake.Inactive).Count | Should -Be 2
+        (Get-E2EJournal $context.BatchId).Batch.status | Should -Be 'Complete'
+    }
+    It 'emits a progress event per wave of a multi-wave Recover (users and shared), and a rough estimate in the plan' {
+        $accueil = Add-PraFakeUser -Upn 'accueil@contoso.com' -Kind Shared -UsageLocation ''
+        $global:PraE2E.InScope.Add('accueil@contoso.com')
+        Write-E2ESnapshot
+        $text = [IO.File]::ReadAllText($global:PraE2E.Config)
+        [IO.File]::WriteAllText($global:PraE2E.Config, $text.Replace("Shared = @{ SkuPartNumber = 'E5' }", "Shared = @{ SkuPartNumber = 'E5'; Parallel = 1 }"), [Text.UTF8Encoding]::new($true))
+        Start-E2E -Action Convert
+        Invoke-PraConvert
+        $convert = $context.BatchId
+        Close-E2E
+        $events = Join-Path $global:PraE2E.Dir 'progress-recover.events.jsonl'
+        & (Get-Module PRA2.Common) { $script:EventFile = $args[0] } $events
+        try {
+            Start-E2E -Action Recover -Batch $convert
+            $context.UserWaveSize = 1
+            Invoke-PraRecover
+        } finally { & (Get-Module PRA2.Common) { $script:EventFile = '' } }
+        @($context.Rows | ForEach-Object { $_.FinalStatus }) | Should -Be @('Success', 'Success', 'Success', 'Success')
+        $records = @(Get-Content -LiteralPath $events -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json })
+        $userProgress = @($records | Where-Object { $_.kind -eq 'progress' -and $_.phase -eq 'Users' })
+        @($userProgress | ForEach-Object { $_.done }) | Should -Be @(0, 1)
+        @($userProgress | ForEach-Object { $_.total }) | Should -Be @(2, 2)
+        $sharedProgress = @($records | Where-Object { $_.kind -eq 'progress' -and $_.phase -eq 'Shared mailboxes' })
+        @($sharedProgress | ForEach-Object { $_.done }) | Should -Be @(0, 1)
+        @($sharedProgress | ForEach-Object { $_.total }) | Should -Be @(2, 2)
+        @($records | Where-Object { $_.kind -eq 'item' -and $_.text -match 'Rough estimate: about' }).Count | Should -Be 1
+    }
+
+    It 'opens a new case hold policy in the same case when the ones of the tool are full (Retention.HoldPolicyLimit)' {
+        $text = [IO.File]::ReadAllText($global:PraE2E.Config)
+        [IO.File]::WriteAllText($global:PraE2E.Config, $text.Replace("Retention = @{ HoldPolicy = 'PRA-HOLD' }", "Retention = @{ HoldPolicy = 'PRA-HOLD'; HoldPolicyLimit = 1 }"), [Text.UTF8Encoding]::new($true))
+        # A policy of the tool being deleted (still listed for hours, lab 9 Oct): left out, its name not used again.
+        $global:PraFake.CasePolicies.Add(@{ Name = 'PRA-HOLD-02'; Guid = [guid]::NewGuid().ToString(); CaseId = 'case-pra'; Mode = 'PendingDeletion'; Locations = [System.Collections.Generic.List[string]]::new() })
+        Start-E2E -Action Convert
+        Invoke-PraConvert
+        $convert = $context.BatchId
+        $sharedCloud = $compta.ExchangeGuid
+        Close-E2E
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PraRecover
+        @($context.Rows | ForEach-Object { $_.FinalStatus }) | Should -Be @('Success', 'Success', 'Success')
+        $policies = @($global:PraFake.CasePolicies | Where-Object { -not $_.ContainsKey('Mode') })
+        @($policies | ForEach-Object { $_.Name }) | Should -Be @('PRA-HOLD', 'PRA-HOLD-03', 'PRA-HOLD-04')
+        @($policies | ForEach-Object { $_.Locations.Count }) | Should -Be @(1, 1, 1)
+        @($policies | ForEach-Object { $_.CaseId } | Select-Object -Unique) | Should -Be @('case-pra')
+        @($global:PraFake.CaseRules) | Should -Be @('PRA-HOLD-03/PRA-HOLD-03-Rule', 'PRA-HOLD-04/PRA-HOLD-04-Rule')
+        $alice.Holds | Should -Contain (Get-PraFakeHoldTag)
+        $bob.Holds | Should -Contain (Get-PraFakeHoldTag 'PRA-HOLD-03')
+        (Get-E2ERow 'bob@contoso.com').Holds | Should -Be (Get-PraFakeHoldTag 'PRA-HOLD-03')
+        @($global:PraFake.Inactive | Where-Object { $_.ExchangeGuid -eq $sharedCloud })[0].Holds | Should -Contain (Get-PraFakeHoldTag 'PRA-HOLD-04')
+        # A later run finds the policies of the tool again (Get-CaseHoldPolicy -Case lists them without locations).
+        $set = Get-Pra2HoldPolicySet -Policy 'PRA-HOLD' -Limit 1
+        @($set.Policies | ForEach-Object { '{0}={1}' -f $_.Name, $_.Count }) | Should -Be @('PRA-HOLD=1', 'PRA-HOLD-03=1', 'PRA-HOLD-04=1')
+        $set.Tags.Contains((Get-PraFakeHoldTag 'PRA-HOLD-04')) | Should -BeTrue
+    }
+
+    It 'never deletes the identity of a shared mailbox whose case hold was refused' {
+        Start-E2E -Action Convert -Scope SharedOnly
+        Invoke-PraConvert
+        $convert = $context.BatchId
+        Close-E2E
+        $global:PraFake.Faults.CaseHoldFails = $true
+        $global:PraFake.Calls.Clear()
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PraRecover
+        (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Error'
+        (Get-E2ERow 'compta@contoso.com').Detail | Should -Match 'case hold policy PRA-HOLD'
+        $compta.Type | Should -Be 'SharedMailbox'
+        @($global:PraFake.Calls | Where-Object { $_ -match 'Graph DELETE|EntraConnect' }) | Should -BeNullOrEmpty
+        (Get-E2EJournal $context.BatchId).Batch.status | Should -Be 'Partial'
+    }
+
     It 'does not start a shared mailbox when the only temporary licence is kept by one that failed (review 6)' {
         $rh = Add-PraFakeUser -Upn 'rh@contoso.com' -Kind Shared -UsageLocation ''
         $global:PraE2E.InScope.Add('rh@contoso.com')
@@ -560,6 +746,8 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         try {
             $global:PraFake.Faults.StopAfter = @{ Pattern = 'Graph POST groups/.+/members'; Path = $stop }
             Start-E2E -Action Convert
+            # One user per wave: the stop is taken before the next wave (500 users in a real run).
+            $context.UserWaveSize = 1
             Invoke-PraConvert
             $convert = $context.BatchId
             @($context.Rows | ForEach-Object { $_.FinalStatus }) | Should -Be @('Pending', 'Pending', 'Pending')
@@ -591,6 +779,7 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         try {
             $global:PraFake.Faults.StopAfter = @{ Pattern = "Graph PATCH users/$($alice.Id)/onPremisesSyncBehavior"; Path = $stop }
             Start-E2E -Action Recover -Batch $convert
+            $context.UserWaveSize = 1
             Invoke-PraRecover
             (Get-E2ERow 'alice@contoso.com').FinalStatus | Should -Be 'Success'
             $alice.Type | Should -Be 'MailUser'
@@ -634,4 +823,45 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         $result.planned | Should -Be 3
         $result.exitCode | Should -Be 0 -Because (@($result.issues) -join '; ')
     }
-}
+
+    It 'reads the states in bulk exactly as page by page or object by object, in a few calls per 50 objects' {
+        $script:bob.Type = 'UserMailbox'; $script:bob.Holds.Add('mbx0000000000000000000000000000abc:1'); $script:bob.Component = [guid]::NewGuid().ToString()
+        Start-E2E -Action Convert -Mode Preview
+        $records = @($global:PraFake.Ad | ForEach-Object { [pscustomobject]@{ object_guid = $_.ObjectGuid; immutable_id = $_.ImmutableId; user_principal_name = $_.Upn; primary_smtp_address = $_.Upn; kind = $_.Kind } })
+        $records += [pscustomobject]@{ object_guid = 'g-missing'; immutable_id = 'imm-nobody'; user_principal_name = 'nobody@contoso.com'; primary_smtp_address = 'nobody@contoso.com'; kind = 'User' }
+        $byRow = Get-Pra2CloudStateSet -Context $context -Records $records -PageThreshold 100
+        $global:PraFake.PageSize = 2; $global:PraFake.FilterCalls = 0
+        $byPage = Get-Pra2CloudStateSet -Context $context -Records $records -PageThreshold 0
+        foreach ($record in $records) { ($byPage[$record.object_guid] | ConvertTo-Json -Depth 8 -Compress) | Should -Be ($byRow[$record.object_guid] | ConvertTo-Json -Depth 8 -Compress) }
+        $global:PraFake.FilterCalls | Should -Be 4
+        $alice = $byPage[($global:PraFake.Ad | Where-Object Upn -eq 'alice@contoso.com').ObjectGuid]
+        $alice.RecipientType | Should -Be 'MailUser'
+        @($alice.Locations | Where-Object Type -eq 'ComponentShared')[0].Guid | Should -Be $script:aliceTeams
+        $alice.IsCloudManaged | Should -BeFalse
+        $bob = $byPage[($global:PraFake.Ad | Where-Object Upn -eq 'bob@contoso.com').ObjectGuid]
+        $bob.RecipientType | Should -Be 'UserMailbox'
+        @($bob.Holds) | Should -Be @('mbx0000000000000000000000000000abc:1')
+        @($bob.Locations | ForEach-Object Type) | Should -Be @('Primary', 'ComponentShared')
+        $byPage['g-missing'].User | Should -BeNullOrEmpty
+        # 120 objects: three filters of 50 at most per Exchange Online read.
+        $ids = @(1..120 | ForEach-Object { (Add-PraFakeUser -Upn "u$_@contoso.com").Id })
+        $global:PraFake.FilterCalls = 0
+        $exo = Get-Pra2ExoStateSet -Id $ids
+        $exo.Count | Should -Be 120
+        $global:PraFake.FilterCalls | Should -Be 9
+    }
+    It 'sends again the requests of a Graph batch that were throttled, and reads one object at a time when the filters fail' {
+        Start-E2E -Action Convert -Mode Preview
+        $records = @($global:PraFake.Ad | ForEach-Object { [pscustomobject]@{ object_guid = $_.ObjectGuid; immutable_id = $_.ImmutableId; user_principal_name = $_.Upn; primary_smtp_address = $_.Upn; kind = $_.Kind } })
+        $reference = Get-Pra2CloudStateSet -Context $context -Records $records
+        $script:alice.CloudManaged = $true
+        $global:PraFake.Faults.BatchThrottle = 3
+        $throttled = Get-Pra2CloudStateSet -Context $context -Records $records
+        $global:PraFake.Faults.BatchThrottle | Should -Be 0
+        $throttled[($global:PraFake.Ad | Where-Object Upn -eq 'alice@contoso.com').ObjectGuid].IsCloudManaged | Should -BeTrue
+        $throttled[($global:PraFake.Ad | Where-Object Upn -eq 'bob@contoso.com').ObjectGuid].IsCloudManaged | Should -BeFalse
+        $script:alice.CloudManaged = $false
+        $global:PraFake.Faults.ExoFilterFails = $true
+        $oneByOne = Get-Pra2CloudStateSet -Context $context -Records $records
+        foreach ($record in $records) { ($oneByOne[$record.object_guid] | ConvertTo-Json -Depth 8 -Compress) | Should -Be ($reference[$record.object_guid] | ConvertTo-Json -Depth 8 -Compress) }
+    }}

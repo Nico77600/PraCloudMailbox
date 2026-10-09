@@ -1,7 +1,7 @@
 ---
 title: PRA Cloud Mailbox
 subtitle: Developer guide
-version: 1.1.0
+version: 1.2.0
 author: Nicolas Fabert
 updated: 2026-10-08
 ---
@@ -109,7 +109,7 @@ A hold on the cloud mailbox (eDiscovery, Litigation or retention) **blocks Recov
 | Convert 1 | `Set-MailUser -ExchangeGuid` empty, source of authority to the cloud | |
 | Convert 2 | usageLocation set from the cloud | |
 | Convert 3 | Temporary licence (Exchange plan only) | Mailbox in 25 to 70 s |
-| Convert 4 | `Set-Mailbox -Type Shared`, **wait until it is a SharedMailbox**, tag (`CustomAttribute1 = Converted`), permissions of the snapshot, then the licence put back as before | Removing the licence before the conversion is effective disables the mailbox at once. One unit is enough: the shared mailboxes are converted one after another |
+| Convert 4 | `Set-Mailbox -Type Shared`, **wait until it is a SharedMailbox**, tag (`CustomAttribute1 = Converted`), the licence put back as before, then the permissions of the snapshot | Removing the licence before the conversion is effective disables the mailbox at once. One unit per shared mailbox converted at the same time (`Licensing.Shared.Parallel`), given back after each wave |
 | Recover 1 | eDiscovery case hold, checked in `InPlaceHolds` | About 90 s |
 | Recover 2 | Entra Connect scheduler paused, Entra ID identity deleted | **The mailbox becomes inactive** in 16 to 48 s, with its content, the hold and the tag |
 | Recover 3 | Identity deleted permanently (Entra ID recycle bin) | Otherwise the next synchronisation **restores** the deleted object (same immutableId) |
@@ -137,7 +137,7 @@ The mails received in the cloud during the disaster are **never deleted**: those
 - It never deletes a user mailbox, and never runs `Set-User -PermanentlyClearPreviousMailboxInfo` (it empties the mails of the cloud mailbox 3 to 6 hours later).
 - It never deletes a shared mailbox identity before the case hold is stamped on the mailbox (`InPlaceHolds`): otherwise the mailbox would be soft-deleted, not inactive, and purged after 30 days.
 - It never lifts a hold from an object that is already back on-premises.
-- It never converts a room or equipment mailbox (`KIND_NOT_SUPPORTED`: their booking settings are not collected and they were not validated in the lab).
+- It never converts a room or equipment mailbox unless `Scope.ConvertRooms` is set (`KIND_NOT_SUPPORTED` otherwise): even then, their booking settings (capacity, auto-accept, booking policies) are not collected or recreated — it becomes a plain shared mailbox in the cloud, and the on-premises room or equipment mailbox (with its booking settings) is what comes back unchanged at Recover.
 
 # Part II · Set up
 
@@ -161,7 +161,7 @@ The mails received in the cloud during the disaster are **never deleted**: those
 | PowerShell | **PowerShell 7.4** or later (`pwsh.exe`) |
 | Modules | `Microsoft.Graph.Authentication` and `ExchangeOnlineManagement` 3.10 or later |
 | App registration | Certificate sign-in; the certificate with its private key in `Cert:\CurrentUser\My` or `Cert:\LocalMachine\My` (chapter 4.3) |
-| Licences | Group mode: a licence group whose licence includes an Exchange Online plan, and enough free units for the users. Kiosk mode: the Exchange Kiosk plan inside the licence the users already have (e.g. Teams Enterprise). Direct mode: free units of `Licensing.Users.SkuPartNumber`. Shared mailboxes: **one** free unit of `Licensing.Shared.SkuPartNumber` (any SKU with an Exchange Online plan) |
+| Licences | Group mode: a licence group whose licence includes an Exchange Online plan, and enough free units for the users. Kiosk mode: the Exchange Kiosk plan inside the licence the users already have (e.g. Teams Enterprise). Direct mode: free units of `Licensing.Users.SkuPartNumber`. Shared mailboxes: free units of `Licensing.Shared.SkuPartNumber` (any SKU with an Exchange Online plan): one per shared mailbox of a wave, up to `Licensing.Shared.Parallel` (100 by default); one unit is enough, then they go one after another |
 | Holds | An eDiscovery case with a case hold policy (`Retention.HoldPolicy`, chapter 4.4), and a retention policy for the inactive shared mailboxes |
 | Entra Connect | Recover only: Entra Connect **2.5.76.0** or later on the rebuilt server (it keeps the cloud source of authority of the objects), reachable as described in chapter 6.1 |
 
@@ -207,7 +207,7 @@ New-RetentionComplianceRule -Name 'PRA-Converted-Retention-Rule' -Policy 'PRA-Co
 ```
 
 - The case hold protects at once (about 90 s per object); the adaptive scope needs **up to 5 days** to pick up a new inactive mailbox. The case hold covers the meantime.
-- An eDiscovery case hold holds **at most 1,000 mailboxes**: beyond that, roll back in waves with one configuration file per wave and its own `Retention.HoldPolicy`.
+- An eDiscovery case hold holds **at most 1,000 mailboxes** (Microsoft Purview limit, `Retention.HoldPolicyLimit`). Recover handles this itself: once `Retention.HoldPolicy` is full, it creates `<HoldPolicy>-02`, `<HoldPolicy>-03`... in the **same case** (with a rule that holds everything) and keeps using them — nothing to configure by hand, one configuration file is enough for the whole volume. A sibling policy being deleted is left out, its number is not used again.
 - The adaptive scope never catches a mailbox that is already deleted without a hold: this is why Recover puts the case hold **before** deleting a shared identity.
 - Retention policies applied to **every** mailbox of the organisation would also hold the users' cloud mailboxes and block their Recover: Check warns about them (`ORG_HOLD`).
 
@@ -245,13 +245,13 @@ Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.0 -Scope AllUsers -
 |---|---|
 | `Environment` | Label used in the backup file names |
 | `Exchange` | `ConnectionMode` (`Local`, `Remote`), `Server` (Remote), `DomainController` (the same DC for every read of a run) |
-| `Scope` | `Mode` (`Auto`, `OU`, `Group`, `Csv`), `SearchBase`, `GroupDN`, `CsvPath` (column `Identity`: UPN, SMTP, sAMAccountName, DN or GUID), `IncludeUsers`, `IncludeShared`, `IncludeRoom`, `IncludeEquipment`, `ExcludeSamAccountNames` |
+| `Scope` | `Mode` (`Auto`, `OU`, `Group`, `Csv`), `SearchBase`, `GroupDN`, `CsvPath` (column `Identity`: UPN, SMTP, sAMAccountName, DN or GUID), `IncludeUsers`, `IncludeShared`, `IncludeRoom`, `IncludeEquipment`, `ExcludeSamAccountNames`, `ConvertRooms` (converts a room or equipment mailbox like a shared one; default `$false`) |
 | `Collect` | `SharedPermissions`, `ExpandGroupTrustees` (groups used as trustees: members stored and granted one by one), `ExcludeTrustees` (wildcards), `MailboxStatistics`, `Contacts`, `ContactsSearchBase`, `DistributionGroups`, `DistributionGroupsSearchBase`, `DynamicDistributionGroups` |
 | `Store` | `Path` (snapshots), `KeepSnapshots`, `BackupFolder` (a consistent copy after each Collect), `MaxSnapshotAgeDays` (Check warns beyond), `JournalPath` (journal of Convert and Recover, cloud side) |
 | `Cloud` | `TenantId`, `Organization`, `AppId`, `CertificateThumbprint`, `DefaultUsageLocation` (two letters, for the objects without usageLocation) |
 | `Polling` | `IntervalSeconds`, `MailboxTimeoutMinutes`, `SyncTimeoutMinutes`, `HoldTimeoutMinutes` |
-| `Licensing` | `Users.Mode` (`Group`, `Kiosk`, `Direct`), `Users.GroupId` (object ID of the licence group), `Users.SkuPartNumber` (Direct), `Shared.SkuPartNumber` (temporary licence) |
-| `Retention` | `TagAttribute`, `TagValue` (written on the shared mailboxes), `HoldPolicy` (case hold policy of Recover) |
+| `Licensing` | `Users.Mode` (`Group`, `Kiosk`, `Direct`), `Users.GroupId` (object ID of the licence group), `Users.SkuPartNumber` (Direct), `Shared.SkuPartNumber` (temporary licence), `Shared.Parallel` (shared mailboxes converted together, 1 to 1000, default 100) |
+| `Retention` | `TagAttribute`, `TagValue` (written on the shared mailboxes), `HoldPolicy` (case hold policy of Recover), `HoldPolicyLimit` (mailboxes per policy before a sibling is created, 1 to 1000, default 1000) |
 | `EntraConnect` | `Mode` (`Remoting`, `Script`, `Manual`), `Server`, `ScriptPath`, `MinVersion` (chapter 6.1) |
 | `Logging`, `Report` | Folders; `Report.Enabled` |
 
@@ -326,7 +326,8 @@ Steps: snapshot, Microsoft 365 connection, tenant prerequisites, objects. An obj
 | `EXO_MAILUSER` | Ok | MailUser with the on-premises ExchangeGuid |
 | `GUID_CLEARED` / `GUID_MISMATCH` | Warn | ExchangeGuid empty (a Convert started) or different from the snapshot |
 | `ALREADY_CLOUD_MAILBOX` | Error | Already a cloud mailbox |
-| `KIND_NOT_SUPPORTED` | Error | Room or equipment mailbox |
+| `KIND_NOT_SUPPORTED` | Error | Room or equipment mailbox, `Scope.ConvertRooms` is `$false` (the default) |
+| `ROOM_CONVERT_ENABLED` | Info | Room or equipment mailbox, `Scope.ConvertRooms` is `$true`: converted like a shared mailbox |
 | `TEAMS_STORAGE` / `NO_TEAMS_STORAGE` | Info | The ComponentShared storage will be promoted, or a new empty mailbox created |
 | `COMPONENT_SHARED` | Info | Shared mailbox with a ComponentShared storage: the temporary licence promotes it, with its content |
 | `EXCHANGE_PLAN_PRESENT` | Error | An Exchange Online mailbox plan is already enabled (by plan ID; Foundation does not count): clearing the ExchangeGuid would not create the mailbox while the plan stays. Remove the plan before the disaster or exclude the object |
@@ -348,18 +349,19 @@ Steps: snapshot, Microsoft 365 connection, tenant prerequisites, objects. An obj
 .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply -IdentityPath .\data\wave1.txt   # a wave
 ```
 
-![Convert -Mode Apply: users, then shared mailboxes one after another](images/pra-console-convert.png)
+![Convert -Mode Apply: users, then shared mailboxes in waves](images/pra-console-convert.png)
 
 Steps: snapshot, Microsoft 365 connection, readiness (the rules of Check), plan and confirmation, users (source of authority and Exchange plan), users (cloud mailboxes), shared mailboxes.
 
 - **Refused objects**: an object with a Check error is not converted; the others are. Licence capacity is checked first: not enough free units = nothing is changed.
 - **Batch**: Apply creates a batch in the journal (chapter 14) with the original state of every object — source of authority, ExchangeGuid, usageLocation, recipient type, tag, holds, direct licences with their disabled plans. Its ID is printed at the end with the next command, and is the only input of Recover.
-- **Users**: all the identity steps first (GUID cleared, source of authority, usageLocation, plan), then the tool polls every `Polling.IntervalSeconds` until each one is a UserMailbox (`MailboxTimeoutMinutes`). A user still waiting at the timeout is *Pending*: run the same command with `-Batch` later.
+- **Users**: in waves of 500, phase by phase for the whole wave: ExchangeGuid cleared (one Exchange Online call each), source of authority to the cloud (Graph batches of 20), **one** wait for the wave until Exchange Online no longer sees them as synchronised (23 to 45 s in the lab by day, up to 9 min on a slow evening), usageLocation (Graph batches), then the plan: membership of the licence group checked and added by Graph batches, or the Kiosk / direct plan user by user. Then the tool polls every `Polling.IntervalSeconds` all the users together (filters of 50) until each one is a UserMailbox (`MailboxTimeoutMinutes`). A user still waiting at the timeout is *Pending*: run the same command with `-Batch` later.
 - **Licence group synchronised from AD** (Group mode): its source of authority goes to the cloud once, before the first user; the journal records it.
-- **Shared mailboxes**: one after another, so one unit of `Licensing.Shared.SkuPartNumber` is enough. Before each one, the tool checks that a unit is free: a shared mailbox that failed keeps its temporary licence and the next ones are not started (never left half-converted). The licence assignment is retried for 45 s (it can be refused just after the usageLocation change). The permissions of the snapshot are granted and read back: FullAccess with AutoMapping as collected, SendAs, SendOnBehalf; group trustees as their members.
+- **Shared mailboxes**: in waves of `Licensing.Shared.Parallel` (100 by default), one temporary unit of `Licensing.Shared.SkuPartNumber` each and **never more than the free units** at the start of the wave: a shared mailbox that failed keeps its temporary licence, and no object is started without a unit (never left half-converted). Each wave goes phase by phase: identity start as for the users, temporary licence (retried for 45 s: it can be refused just after the usageLocation change), one wait for all the mailboxes, `Type Shared` asked again until it is effective, tag, licence put back as before, **one** pause of 60 s for the wave, type checked, then the permissions of the snapshot, granted and read back: FullAccess with AutoMapping as collected, SendAs, SendOnBehalf; group trustees as their members. Lab, 8 Oct: three shared mailboxes in one wave, 10/10 permissions.
 - **Resume** (`-Batch`): only the objects not *Done* are taken again; objects that already hold their licence do not count in the capacity check.
 - **A wave** (`-IdentityPath`): a text file with one identity per line (UPN, address, sAMAccountName or object GUID; `#` starts a comment) or a CSV file with an `Identity` column. Only these objects of the snapshot are read; the identities found nowhere are listed as a warning. `-Identity` and `-IdentityPath` go alone.
-- **Stop** (from the window, chapter 13.1): no new object is started; an object in progress is finished; the objects not started stay *Planned* and the batch *Partial*: resume it with `-Batch`.
+- **Stop** (from the window, chapter 13.1): the wave in progress is finished (500 users or `Parallel` shared mailboxes), no new wave is started; the objects not started stay *Planned* and the batch *Partial*: resume it with `-Batch`.
+- **Many objects**: the cloud state of every object is read in bulk before anything is changed (Entra ID users page by page, source of authority by Graph batches, Exchange Online by filters of 50 objects): about 20 minutes for 21,000 objects instead of 15 hours one by one.
 
 > [!TIP]
 > Converting in **waves** (for example the managers first) is supported: each Convert creates its own batch, and each batch is rolled back on its own. The licence group goes back to AD only with the last converted user of all the batches of the journal.
@@ -376,20 +378,21 @@ Steps: snapshot, Microsoft 365 connection, readiness (the rules of Check), plan 
 
 ![Recover -Mode Apply: users back on-premises, shared mailboxes inactive and recreated by Entra Connect](images/pra-console-recover.png)
 
-Run it once AD, Exchange and Entra Connect are rebuilt and synchronising. Steps: snapshot, Microsoft 365 and Security & Compliance connections, prerequisites (case hold policy, Entra Connect), plan and confirmation, users (source of authority back to AD), users (back on-premises), shared mailboxes, licence group. Each object goes the way its **current state** allows:
+Run it once AD, Exchange and Entra Connect are rebuilt and synchronising. Steps: snapshot, Microsoft 365 and Security & Compliance connections, prerequisites (case hold policies, Entra Connect), plan and confirmation, users (back on-premises), shared mailboxes, licence group. Users (and shared mailboxes whose Convert stopped half-way) are rolled back in waves of `UserWaveSize` (500), shared mailboxes in waves of `Licensing.Shared.Parallel`; every phase of a wave runs for the whole wave at once, with a single wait instead of one per object. Each object goes the way its **current state** allows:
 
 | State found | What Recover does |
 |---|---|
-| User with a cloud mailbox | Case hold lifted if present (any other hold stops the user: remove it first), source of authority back to AD, one delta cycle (skipped when already synchronised), Exchange plan removed (licences as before Convert), wait for a MailUser with the on-premises ExchangeGuid, case hold added and checked. The cloud mailbox stays as ComponentShared with its content, under the hold |
+| User with a cloud mailbox | Case hold lifted if present (any other hold stops the user: remove it first), source of authority back to AD (Graph batches), **one** delta cycle for the wave (skipped when already synchronised), Exchange plan removed (licences as before Convert), **one** wait for the wave until each one is a MailUser with the on-premises ExchangeGuid, case hold added to the wave and **one** wait for the stamps. The cloud mailbox stays as ComponentShared with its content, under the hold |
 | Already back on-premises (synchronised MailUser, on-premises GUID) | Case hold added if missing and checked; **never lifted** |
-| SharedMailbox | Case hold checked in `InPlaceHolds` (otherwise nothing is deleted), scheduler paused, identity deleted, inactive mailbox checked, identity deleted permanently, scheduler resumed (always, even after an error), one delta cycle, new object checked as a MailUser with the on-premises GUID |
+| SharedMailbox | Case hold added to the wave and checked (otherwise nothing is deleted), scheduler paused **once for the wave**, identities deleted (Graph batches), inactive mailboxes checked, identities deleted permanently, scheduler resumed (always, even after an error), **one** delta cycle for the wave, new objects checked as MailUser with the on-premises GUID |
 | Shared identity deleted by an earlier run | Recycle bin checked (purged if needed), delta cycle, recreated object checked |
 | Shared mailbox whose Convert stopped half-way (MailUser or UserMailbox) | Rolled back like a user (temporary licence put back as before); never deleted |
 
-- One scheduler pause and one delta cycle serve all the shared mailboxes of the batch.
+- One scheduler pause and one delta cycle serve all the shared mailboxes of a wave.
 - **Licence group**: given back to AD only when no converted user of any Convert batch of the journal is left.
 - A Recover batch is linked to its Convert batch; running Recover again resumes it. Once complete, Recover refuses to run again on the same Convert batch.
-- **A wave** (`-IdentityPath`, as for Convert): only these objects of the batch are rolled back; the others wait for the next run with the same `-Batch`. A stop from the window leaves the objects not started *Pending*, the scheduler is resumed as always.
+- **A wave** (`-IdentityPath`, as for Convert): only these objects of the batch are rolled back; the others wait for the next run with the same `-Batch`. **Stop** (from the window, chapter 13.1): the wave in progress is finished, no new wave is started; the objects not started stay *Pending*, the scheduler is resumed as always.
+- Lab, 9 Oct: shared wave of 3 (one scheduler pause, one delta cycle, 8 min 57 s) and user wave of 2 (one delta cycle, 6 min 45 s) recovered in a real tenant; case hold overflow (`Retention.HoldPolicyLimit` lowered to force it) correctly opened a sibling policy for the extra mailboxes.
 
 <!-- icon: shield -->
 ## 11. After the Recover
@@ -463,6 +466,7 @@ Stop | The window creates the file `PRA_STOP_FILE`; the run checks it before eac
 |---|---|---|
 | `start` | title, action, mode, version, runId, logFile, details of the banner | `Write-PraBanner` |
 | `step` | index, total, title | `Write-PraStep` |
+| `progress` | phase, done, total, percent, eta (rough time left, or empty) | `Write-PraProgress` |
 | `item` | status (`Ok`, `Warn`, `Fail`, `Info`, `Skip`, `Sub`), text, identity | `Write-PraLog`, `Write-PraItem` |
 | `ask` | id, title, text, answer (path) | `Request-PraOperator` |
 | `summary` | title, status, values of the final card | `Write-PraSummary` |
@@ -470,6 +474,7 @@ Stop | The window creates the file `PRA_STOP_FILE`; the run checks it before eac
 
 - **Preview, then Apply**: a preview records the *selection key* of what it ran on (snapshot or batch, plus a hash of the GUIDs of a wave); *Convert…* and *Recover…* are enabled only while the selection of the window has the same key, and run the very same request (same wave file) with `-Mode Apply`.
 - **Waves**: the boxes ticked are written to `data\gui\wave-<action>-<time>.csv` (`Identity` = object GUID) and passed with `-IdentityPath`.
+- **Object progress**: a wave of users or shared mailboxes writes a `progress` event (`Write-PraProgress`) before it starts; the window shows a second progress bar and a line under the step one (*Shared mailboxes: 1,200 of 5,000 (24%); about 3 h 10 min left at this pace*), cleared at the next step.
 - **Tables**: `DataTable` views, so that 21,000 objects filter as you type (about 0.3 s) and the boxes bind both ways.
 - **Files**: `data\gui\run-<time>-<action>.events.jsonl`, `.stop`, `.out.txt`, `.err.txt` (deleted after 30 days); the wave lists are kept, the logs name them.
 - **Theme**: Fluent with PowerShell 7.5 and later (light or dark as Windows); classic WPF controls with the same colours in Windows PowerShell 5.1.
@@ -564,6 +569,7 @@ Lab: four Exchange Server SE servers in a DAG, Active Directory, Entra Connect 2
 | Tool, shared mailboxes | 7-8 Oct | Three shared mailboxes in one batch with **one** licence unit (10 min: mailbox 24-46 s, SharedMailbox 27 s each, 10/10 permissions). Recover in 14 min 33: hold stamped in 90 s each, one scheduler pause and one delta cycle for the batch, three new objects |
 | Tool, waves and remoting | 8 Oct | Two users converted in two batches through a synchronised licence group: the Recover of the first wave kept the group in the cloud, the second gave it back to AD. `EntraConnect.Mode = Remoting` from a domain server: pause 6 s, resume 3 s, delta waited to the end |
 | Tool, window | 8 Oct | The window in PowerShell 7 ran Check, a Convert wave of one user (list written by the window, `-IdentityPath`: cloud mailbox in 2 min 28) and its Recover. A connection timeout to Graph just after a 7.5-minute delta cycle stopped the first Recover cleanly; running it again resumed the batch without a new delta (3 min 38). Graph calls now retry a connection that failed without an answer |
+| Tool, volume (1.2) | 8 Oct | Lab tenant of 21,700 users and 16,000 mailboxes. Bulk reads: every user page by page in 20 s, Exchange Online by filters of 50 objects in 0.3 to 0.7 s, states identical to the reads one object at a time (8 objects: 25.5 s, now 3.6 s). Three shared mailboxes converted in **one wave** (three temporary E5 units, 10/10 permissions granted after the licence was given back) and recovered; two users converted in one wave (Graph batches, licence group, one wait of 127 s for both) |
 
 <!-- icon: shield -->
 ## Appendix C - Security and data

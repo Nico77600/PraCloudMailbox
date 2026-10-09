@@ -11,7 +11,10 @@
     NoHoldStamp (the case hold is never stamped), DeleteFails (DELETE /users refused), NoRecreate (Entra Connect
     does not recreate deleted objects), SendAsFails (Add-RecipientPermission refused),
     CaseHoldDeployError (Set-CaseHoldPolicy records the change but reports 'failed to be deployed', lab 7-8 Oct),
-    StopAfter (@{ Pattern; Path }: the stop file of the window is created after the first call that matches).
+    CaseHoldFails (Set-CaseHoldPolicy refuses every change),
+    StopAfter (@{ Pattern; Path }: the stop file of the window is created after the first call that matches),
+    BatchThrottle (number of requests of a Graph batch answered 429 before the next ones succeed), ExoFilterFails (the
+    filtered Exchange Online reads fail: the tool reads one object at a time). PageSize: users per page of /users.
 .NOTES
     Author  : Nicolas Fabert
 #>
@@ -36,15 +39,26 @@ function global:New-PraFakeTenant {
         Recycle = [ordered]@{}
         Ad = [System.Collections.Generic.List[hashtable]]::new()
         Inactive = [System.Collections.Generic.List[hashtable]]::new()
-        CasePolicy = @{ Name = 'PRA-HOLD'; Guid = '22222222-2222-2222-2222-222222222222'; Locations = [System.Collections.Generic.List[string]]::new() }
+        # Case hold policies of the eDiscovery case; CasePolicy is the first one (the configured policy).
+        CasePolicies = [System.Collections.Generic.List[hashtable]]::new()
+        CasePolicy = $null
+        CaseRules = [System.Collections.Generic.List[string]]::new()
         Scheduler = $true
-        Faults = @{ LicenceAssign400 = 0; NeverMailbox = @(); NoHoldStamp = $false; DeleteFails = $false; NoRecreate = $false; SendAsFails = $false; CaseHoldDeployError = $false; StopAfter = $null }
+        Faults = @{ LicenceAssign400 = 0; NeverMailbox = @(); NoHoldStamp = $false; DeleteFails = $false; NoRecreate = $false; SendAsFails = $false; CaseHoldDeployError = $false; CaseHoldFails = $false; StopAfter = $null; BatchThrottle = 0; ExoFilterFails = $false }
+        PageSize = 999; FilterCalls = 0; CaseHoldCalls = 0
         OrgHolds = @()
         Calls = [System.Collections.Generic.List[string]]::new()
     }
+    $global:PraFake.CasePolicy = @{ Name = 'PRA-HOLD'; Guid = '22222222-2222-2222-2222-222222222222'; CaseId = 'case-pra'; Locations = [System.Collections.Generic.List[string]]::new() }
+    $global:PraFake.CasePolicies.Add($global:PraFake.CasePolicy)
 }
 
-function global:Get-PraFakeHoldTag { 'UniH' + $global:PraFake.CasePolicy.Guid }
+function global:Get-PraFakeHoldTag {
+    <# InPlaceHolds tag of a case hold policy (the configured one by default). #>
+    param([string]$Name)
+    $policy = if ($Name) { $global:PraFake.CasePolicies | Where-Object { $_.Name -eq $Name } | Select-Object -First 1 } else { $global:PraFake.CasePolicy }
+    'UniH' + $policy.Guid
+}
 
 function global:Add-PraFakeUser {
     param([Parameter(Mandatory)][string]$Upn, [ValidateSet('User','Shared','Room','Equipment')][string]$Kind = 'User', [string]$Id = ([guid]::NewGuid().ToString()),
@@ -92,7 +106,6 @@ function global:Step-PraFake {
     <# One tick: what Microsoft 365 does in the background between two polls. #>
     $fake = $global:PraFake
     $fake.Tick++
-    $tag = Get-PraFakeHoldTag
     foreach ($user in @($fake.Users.Values)) {
         if ($user.CloudManaged -and $user.DirSynced) { $user.DirSynced = $false }
         $plan = Test-PraFakeExchangePlan $user
@@ -116,9 +129,12 @@ function global:Step-PraFake {
             $user.Type = 'SharedMailbox'; $user.PendingShared = $false
             Write-PraFakeCall "Shared $($user.Upn)"
         }
-        $wanted = $fake.CasePolicy.Locations.Contains($user.Id) -and -not $fake.Faults.NoHoldStamp
-        if ($wanted -and -not $user.Holds.Contains($tag)) { $user.Holds.Add($tag); Write-PraFakeCall "HoldStamped $($user.Upn)" }
-        elseif (-not $fake.CasePolicy.Locations.Contains($user.Id) -and $user.Holds.Contains($tag)) { [void]$user.Holds.Remove($tag); Write-PraFakeCall "HoldReleased $($user.Upn)" }
+        foreach ($policy in $fake.CasePolicies) {
+            $tag = 'UniH' + $policy.Guid
+            $held = $policy.Locations.Contains($user.Id)
+            if ($held -and -not $fake.Faults.NoHoldStamp -and -not $user.Holds.Contains($tag)) { $user.Holds.Add($tag); Write-PraFakeCall "HoldStamped $($user.Upn) $($policy.Name)" }
+            elseif (-not $held -and $user.Holds.Contains($tag)) { [void]$user.Holds.Remove($tag); Write-PraFakeCall "HoldReleased $($user.Upn) $($policy.Name)" }
+        }
     }
     foreach ($user in @($fake.Recycle.Values)) {
         $known = @($fake.Inactive | Where-Object { $_.ExchangeGuid -eq $user.ExchangeGuid }).Count
@@ -216,7 +232,7 @@ function global:Invoke-MgGraphRequest {
     $path, $query = $relative -split '\?', 2
     $parts = @($path.Split('/') | ForEach-Object { [uri]::UnescapeDataString($_) })
     $data = if ($Body) { $Body | ConvertFrom-Json -AsHashtable } else { @{} }
-    if ($Method -ne 'GET') { Write-PraFakeCall "Graph $Method $path" }
+    if ($Method -ne 'GET' -and $path -ne '$batch') { Write-PraFakeCall "Graph $Method $path" }
     switch -Regex ($path) {
         '^subscribedSkus$' {
             $skus = foreach ($id in $fake.Skus.Keys) {
@@ -251,8 +267,32 @@ function global:Invoke-MgGraphRequest {
         }
         '^users$' {
             $filter = [uri]::UnescapeDataString([string]$query)
-            $immutable = [regex]::Match($filter, "onPremisesImmutableId eq '([^']*)'").Groups[1].Value
-            return [pscustomobject]@{ value = @($fake.Users.Values | Where-Object { $_.ImmutableId -eq $immutable } | ForEach-Object { ConvertTo-PraFakeGraphUser $_ }) }
+            if ($filter -match 'onPremisesImmutableId eq') {
+                $immutable = [regex]::Match($filter, "onPremisesImmutableId eq '([^']*)'").Groups[1].Value
+                return [pscustomobject]@{ value = @($fake.Users.Values | Where-Object { $_.ImmutableId -eq $immutable } | ForEach-Object { ConvertTo-PraFakeGraphUser $_ }) }
+            }
+            # Every user, page by page.
+            $token = [regex]::Match($filter, '\$skiptoken=(\d+)')
+            $skip = if ($token.Success) { [int]$token.Groups[1].Value } else { 0 }
+            $all = @($fake.Users.Values)
+            $page = @($all | Select-Object -Skip $skip -First $fake.PageSize | ForEach-Object { ConvertTo-PraFakeGraphUser $_ })
+            $answer = [ordered]@{ value = $page }
+            if ($skip + $fake.PageSize -lt $all.Count) { $answer['@odata.nextLink'] = 'https://graph.microsoft.com/v1.0/users?$select=id&$skiptoken={0}' -f ($skip + $fake.PageSize) }
+            return [pscustomobject]$answer
+        }
+        '^\$batch$' {
+            $responses = foreach ($request in @($data.requests)) {
+                if ($fake.Faults.BatchThrottle -gt 0) { $fake.Faults.BatchThrottle--; [pscustomobject]@{ id = $request.id; status = 429; body = $null }; continue }
+                $call = @{ Method = $request.method; Uri = ('v1.0' + $request.url) }
+                if ($request.ContainsKey('body') -and $null -ne $request.body) { $call.Body = ($request.body | ConvertTo-Json -Depth 8 -Compress) }
+                try { [pscustomobject]@{ id = $request.id; status = 200; body = (Invoke-MgGraphRequest @call) } }
+                catch {
+                    $code = 500; try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = 500 }
+                    $errorBody = $null; try { $errorBody = [string]$_.ErrorDetails.Message | ConvertFrom-Json } catch { $errorBody = $null }
+                    [pscustomobject]@{ id = $request.id; status = $code; body = $errorBody }
+                }
+            }
+            return [pscustomobject]@{ responses = @($responses) }
         }
         '^users/[^/]+$' {
             $user = Resolve-PraFakeUser $parts[1]
@@ -306,27 +346,72 @@ function global:Get-PraFakeUserOrError {
     return $user
 }
 
+function global:Get-PraFakeFiltered {
+    <# The users named by an OPATH filter of object IDs (ExternalDirectoryObjectId -eq '...' -or ...), as the bulk reads send it. #>
+    param([string]$Filter)
+    $global:PraFake.FilterCalls++
+    foreach ($match in [regex]::Matches($Filter, "ExternalDirectoryObjectId -eq '([^']+)'")) {
+        $id = $match.Groups[1].Value
+        if ($global:PraFake.Users.Contains($id)) { $global:PraFake.Users[$id] }
+    }
+}
+
+function global:ConvertTo-PraFakeRecipient {
+    param([hashtable]$User)
+    [pscustomobject]@{ RecipientTypeDetails = $User.Type; ExchangeGuid = $User.ExchangeGuid; ExternalDirectoryObjectId = $User.Id; Guid = $User.Id
+        Name = ($User.Upn -split '@')[0]; Identity = $User.Upn; PrimarySmtpAddress = $User.Upn; CustomAttribute1 = $User.Tag }
+}
+
+function global:Get-PraFakeLocationText {
+    <# MailboxLocations as Exchange Online writes them: '1;<guid>;<type>;<database>;<id>'. #>
+    param([hashtable]$User)
+    if ($User.Type -match 'Mailbox$') { '1;{0};Primary;NAMPRD01.PROD.OUTLOOK.COM;{1}' -f $User.ExchangeGuid, $User.Id }
+    if ($User.Component) { '1;{0};ComponentShared;NAMPRD01.PROD.OUTLOOK.COM;{1}' -f $User.Component, $User.Id }
+}
+
 function global:Get-Recipient {
     [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity)
     $user = Get-PraFakeUserOrError $Identity
     if (-not $user) { return }
-    [pscustomobject]@{ RecipientTypeDetails = $user.Type; ExchangeGuid = $user.ExchangeGuid; ExternalDirectoryObjectId = $user.Id; Guid = $user.Id
-        Name = ($user.Upn -split '@')[0]; Identity = $user.Upn; PrimarySmtpAddress = $user.Upn; CustomAttribute1 = $user.Tag }
+    ConvertTo-PraFakeRecipient $user
+}
+
+function global:Get-EXORecipient {
+    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [string]$Filter, [object]$ResultSize, [string[]]$Properties, [string[]]$RecipientTypeDetails)
+    if ($global:PraFake.Faults.ExoFilterFails) { throw 'A server side error has occurred because of which the operation could not be completed.' }
+    foreach ($user in @(Get-PraFakeFiltered $Filter)) { ConvertTo-PraFakeRecipient $user }
 }
 
 function global:Get-User {
-    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity)
-    $user = Get-PraFakeUserOrError $Identity
-    if (-not $user) { return }
-    [pscustomobject]@{ IsDirSynced = $user.DirSynced; RecipientTypeDetails = $(if ($user.Type -match 'Mailbox$') { $user.Type } else { 'User' }) }
+    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [string]$Filter, [object]$ResultSize)
+    $users = if ($Filter) { @(Get-PraFakeFiltered $Filter) } else { @(Get-PraFakeUserOrError $Identity) }
+    foreach ($user in @($users | Where-Object { $_ })) {
+        [pscustomobject]@{ IsDirSynced = $user.DirSynced; ExternalDirectoryObjectId = $user.Id; UserPrincipalName = $user.Upn
+            RecipientTypeDetails = $(if ($user.Type -match 'Mailbox$') { $user.Type } else { 'User' }) }
+    }
 }
 
 function global:Get-MailUser {
-    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity)
-    $user = Get-PraFakeUserOrError $Identity
-    if (-not $user) { return }
-    if ($user.Type -ne 'MailUser') { Write-Error "$Identity isn't a mail user."; return }
-    [pscustomobject]@{ ExchangeGuid = $user.ExchangeGuid; InPlaceHolds = @($user.Holds); CustomAttribute1 = $user.Tag }
+    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [string]$Filter, [object]$ResultSize)
+    if ($Filter) { $users = @(Get-PraFakeFiltered $Filter | Where-Object { $_.Type -eq 'MailUser' }) }
+    else {
+        $user = Get-PraFakeUserOrError $Identity
+        if (-not $user) { return }
+        if ($user.Type -ne 'MailUser') { Write-Error "$Identity isn't a mail user."; return }
+        $users = @($user)
+    }
+    foreach ($user in $users) {
+        [pscustomobject]@{ ExchangeGuid = $user.ExchangeGuid; InPlaceHolds = @($user.Holds); CustomAttribute1 = $user.Tag; ExternalDirectoryObjectId = $user.Id
+            MailboxLocations = @(Get-PraFakeLocationText $user) }
+    }
+}
+
+function global:Get-EXOMailbox {
+    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [string]$Filter, [object]$ResultSize, [string[]]$Properties)
+    foreach ($user in @(Get-PraFakeFiltered $Filter | Where-Object { $_.Type -match 'Mailbox$' })) {
+        [pscustomobject]@{ ExchangeGuid = $user.ExchangeGuid; InPlaceHolds = @($user.Holds); LitigationHoldEnabled = $false; ExternalDirectoryObjectId = $user.Id
+            MailboxLocations = @(Get-PraFakeLocationText $user); PrimarySmtpAddress = $user.Upn }
+    }
 }
 
 function global:Get-Mailbox {
@@ -410,32 +495,59 @@ function global:Get-OrganizationConfig {
 }
 
 function global:Get-CaseHoldPolicy {
-    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity)
-    $policy = $global:PraFake.CasePolicy
-    if ($Identity -ne $policy.Name) { Write-Error "Policy $Identity not found."; return }
-    [pscustomobject]@{ Name = $policy.Name; Guid = [guid]$policy.Guid; ExchangeLocation = @($policy.Locations | ForEach-Object { $u = Resolve-PraFakeUser $_; [pscustomobject]@{ Name = $(if ($u) { $u.Upn } else { $_ }); ImmutableIdentity = $_ } }) }
+    <# -Identity: one policy with its locations (by object ID, as the lab shows). -Case: the policies of a case, WITHOUT their locations (lab 8 Oct). #>
+    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [string]$Case)
+    if ($Case) {
+        return @($global:PraFake.CasePolicies | Where-Object { $_.CaseId -eq $Case } | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Guid = [guid]$_.Guid; CaseId = $_.CaseId; Mode = (Get-PraValue $_ 'Mode' 'Enforce'); ExchangeLocation = @() } })
+    }
+    $policy = $global:PraFake.CasePolicies | Where-Object { $_.Name -eq $Identity } | Select-Object -First 1
+    if (-not $policy) { Write-Error "Policy $Identity not found."; return }
+    [pscustomobject]@{ Name = $policy.Name; Guid = [guid]$policy.Guid; CaseId = $policy.CaseId; Mode = (Get-PraValue $policy 'Mode' 'Enforce')
+        ExchangeLocation = @($policy.Locations | ForEach-Object { $u = Resolve-PraFakeUser $_; [pscustomobject]@{ Name = $(if ($u) { $u.Upn } else { $_ }); ImmutableIdentity = $_ } }) }
 }
 
 function global:Set-CaseHoldPolicy {
-    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [string]$AddExchangeLocation, [string]$RemoveExchangeLocation)
-    $policy = $global:PraFake.CasePolicy
-    if ($AddExchangeLocation) {
-        $user = Get-PraFakeUserOrError $AddExchangeLocation
-        if (-not $user) { return }
-        if ($policy.Locations.Contains($user.Id)) { Write-Error "The location $AddExchangeLocation is already in the policy."; return }
-        $policy.Locations.Add($user.Id); Write-PraFakeCall "CaseHold Add $($user.Upn)"
-        if ($global:PraFake.Faults.CaseHoldDeployError) { Write-Error "|Microsoft.Exchange.Management.UnifiedPolicy.PolicyDeploymentException|Policy '$($policy.Guid)' failed to be deployed."; return }
+    <# Many locations in one call. One location already there (or not there) fails the call after the others are changed. #>
+    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [string[]]$AddExchangeLocation, [string[]]$RemoveExchangeLocation)
+    $policy = $global:PraFake.CasePolicies | Where-Object { $_.Name -eq $Identity } | Select-Object -First 1
+    if (-not $policy) { Write-Error "Policy $Identity not found."; return }
+    $global:PraFake.CaseHoldCalls++
+    if ($global:PraFake.Faults.CaseHoldFails) { Write-Error "Policy $Identity cannot be changed now (fake fault)."; return }
+    $problem = ''
+    foreach ($one in @($AddExchangeLocation | Where-Object { $_ })) {
+        $user = Resolve-PraFakeUser $one
+        if (-not $user) { $problem = "The location $one couldn't be found."; continue }
+        if ($policy.Locations.Contains($user.Id)) { $problem = "The location $one is already in the policy."; continue }
+        $policy.Locations.Add($user.Id); Write-PraFakeCall "CaseHold Add $($user.Upn) $($policy.Name)"
     }
-    if ($RemoveExchangeLocation) {
-        $user = Resolve-PraFakeUser $RemoveExchangeLocation
-        if (-not $user -or -not $policy.Locations.Remove($user.Id)) { Write-Error "The location $RemoveExchangeLocation was not found in the policy."; return }
-        Write-PraFakeCall "CaseHold Remove $($user.Upn)"
-        if ($global:PraFake.Faults.CaseHoldDeployError) { Write-Error "|Microsoft.Exchange.Management.UnifiedPolicy.PolicyDeploymentException|Policy '$($policy.Guid)' failed to be deployed."; return }
+    foreach ($one in @($RemoveExchangeLocation | Where-Object { $_ })) {
+        $user = Resolve-PraFakeUser $one
+        if (-not $user -or -not $policy.Locations.Remove($user.Id)) { $problem = "The location $one was not found in the policy."; continue }
+        Write-PraFakeCall "CaseHold Remove $($user.Upn) $($policy.Name)"
     }
+    if ($problem) { Write-Error $problem; return }
+    if ($global:PraFake.Faults.CaseHoldDeployError) { Write-Error "|Microsoft.Exchange.Management.UnifiedPolicy.PolicyDeploymentException|Policy '$($policy.Guid)' failed to be deployed."; return }
+}
+
+function global:New-CaseHoldPolicy {
+    [CmdletBinding()] param([string]$Name, [string]$Case, [bool]$Enabled = $true)
+    if ($global:PraFake.CasePolicies | Where-Object { $_.Name -eq $Name }) { Write-Error "A policy named $Name already exists."; return }
+    $policy = @{ Name = $Name; Guid = [guid]::NewGuid().ToString(); CaseId = $Case; Locations = [System.Collections.Generic.List[string]]::new() }
+    $global:PraFake.CasePolicies.Add($policy)
+    Write-PraFakeCall "CaseHoldPolicy New $Name"
+    [pscustomobject]@{ Name = $Name; Guid = [guid]$policy.Guid; CaseId = $Case; Enabled = $Enabled }
+}
+
+function global:New-CaseHoldRule {
+    [CmdletBinding()] param([string]$Name, [string]$Policy)
+    $global:PraFake.CaseRules.Add("$Policy/$Name")
+    Write-PraFakeCall "CaseHoldRule New $Name"
+    [pscustomobject]@{ Name = $Name; Policy = $Policy }
 }
 #endregion
 
 $global:PraFakeCommands = @('Invoke-MgGraphRequest', 'Get-Recipient', 'Get-User', 'Get-MailUser', 'Get-Mailbox', 'Get-MailboxLocation', 'Set-MailUser', 'Set-Mailbox', 'Get-OrganizationConfig', 'Get-PraFakeMailboxPlan',
-    'Get-MailboxPermission', 'Add-MailboxPermission', 'Get-RecipientPermission', 'Add-RecipientPermission', 'Get-CaseHoldPolicy', 'Set-CaseHoldPolicy',
+    'Get-MailboxPermission', 'Add-MailboxPermission', 'Get-RecipientPermission', 'Add-RecipientPermission', 'Get-CaseHoldPolicy', 'Set-CaseHoldPolicy', 'New-CaseHoldPolicy', 'New-CaseHoldRule',
     'New-PraFakeTenant', 'Get-PraFakeHoldTag', 'Add-PraFakeUser', 'Write-PraFakeCall', 'Resolve-PraFakeUser', 'Test-PraFakeExchangePlan', 'Step-PraFake',
-    'Invoke-PraFakeEntraConnect', 'Invoke-PraFakeWait', 'Stop-PraFakeGraph', 'ConvertTo-PraFakeGraphUser', 'Get-PraFakeUserOrError')
+    'Invoke-PraFakeEntraConnect', 'Invoke-PraFakeWait', 'Stop-PraFakeGraph', 'ConvertTo-PraFakeGraphUser', 'Get-PraFakeUserOrError',
+    'Get-PraFakeFiltered', 'ConvertTo-PraFakeRecipient', 'Get-PraFakeLocationText', 'Get-EXORecipient', 'Get-EXOMailbox')

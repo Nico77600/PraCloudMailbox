@@ -20,14 +20,14 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.1.0
+    Version : 1.2.0
     History : see CHANGELOG.md
 #>
 #Requires -Version 5.1
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '1.1.0'
+$script:ToolVersion = '1.2.0'
 $script:TranscriptOwner = $null
 # The window runs the tool in a child process and follows it through this file of events (one JSON object per
 # line); it asks for a stop with the file PRA_STOP_FILE (see Write-PraEvent, Test-PraStopRequest).
@@ -203,8 +203,9 @@ function Write-PraEvent {
         One event of the run for the window (PRA_EVENT_FILE): one JSON object per line. Nothing when the run does
         not belong to the window; never stops the run.
     .DESCRIPTION
-        Kinds: start (banner), step, item (console line), ask (question to the operator), summary (final card),
-        result (the object returned by Complete-PraRun). Every event has 'time' and 'kind'.
+        Kinds: start (banner), step, progress (done/total of the current phase, with a rough 'time left'), item
+        (console line), ask (question to the operator), summary (final card), result (the object returned by
+        Complete-PraRun). Every event has 'time' and 'kind'.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Kind, [hashtable]$Data = @{})
@@ -331,6 +332,48 @@ function Write-PraItem {
     if ($Status -eq 'Warn') { $Context.Warnings = [int](Get-PraValue $Context 'Warnings' 0) + 1; Add-PraWarning $Context $Text }
     Write-PraLogFile -Context $Context -Level (@{ Ok='OK'; Warn='WARN'; Fail='FAIL'; Info='INFO'; Skip='SKIP' }[$Status]) -Message $Text
     Write-PraEvent 'item' @{ status = $Status; text = $Text; identity = [string](Get-PraValue $Context 'CurrentIdentity' '') }
+}
+
+function Write-PraProgress {
+    <#
+    .SYNOPSIS
+        Progress of a long loop of objects: one console/log line (Write-PraItem) plus a 'progress' event (window:
+        a second progress bar and a line under the step one, done/total of the current phase only).
+    .PARAMETER Phase
+        Short label shown with the counts, e.g. 'Users', 'Shared mailboxes'.
+    .PARAMETER Done
+        Objects already finished (before the one about to start): the caller decides what counts as done.
+    .PARAMETER ElapsedSeconds
+        Time spent on this phase so far (a stopwatch started by the caller at its first object): used for a rough
+        'time left at this pace' once at least one object is done. Omitted or 0 = no estimate.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$Phase, [Parameter(Mandatory)][int]$Done,
+        [Parameter(Mandatory)][int]$Total, [double]$ElapsedSeconds = 0)
+    if ($Total -le 0) { return }
+    $Done = [Math]::Max(0, [Math]::Min($Done, $Total))
+    $percent = [int][Math]::Round(100.0 * $Done / $Total)
+    $eta = ''
+    if ($Done -gt 0 -and $Done -lt $Total -and $ElapsedSeconds -gt 0) { $eta = 'about {0} left at this pace' -f (Format-PraDuration ($ElapsedSeconds * ($Total - $Done) / $Done)) }
+    Write-PraItem -Context $Context -Status Info -Icon Batch -Text ('{0}: {1} of {2} ({3}%){4}' -f $Phase, $Done, $Total, $percent, $(if ($eta) { '; ' + $eta } else { '' }))
+    Write-PraEvent 'progress' @{ phase = $Phase; done = $Done; total = $Total; percent = $percent; eta = $eta }
+}
+
+function Get-PraDurationEstimate {
+    <#
+    .SYNOPSIS
+        Rough order of magnitude for a Convert or Recover, from the number of waves and typical times measured in
+        the lab: about 2 minutes of waiting per user wave (synchronisation, 23 s to 9 min seen), about 3 minutes per
+        shared-mailbox pipeline round (mailbox provisioning and permissions, 24 s to 14 min seen). A real tenant can
+        be much slower some evenings: this plans a maintenance window, it is not a guarantee.
+    .PARAMETER UserWaves
+        Number of waves of up to UserWaveSize users (0 when there is none).
+    .PARAMETER SharedRounds
+        Number of pipeline rounds of up to Licensing.Shared.Parallel shared mailboxes (0 when there is none).
+    #>
+    param([Parameter(Mandatory)][int]$UserWaves, [Parameter(Mandatory)][int]$SharedRounds, [double]$UserWaveSeconds = 120, [double]$SharedRoundSeconds = 180)
+    $seconds = ($UserWaves * $UserWaveSeconds) + ($SharedRounds * $SharedRoundSeconds)
+    return [pscustomobject]@{ Seconds = $seconds; Text = $(if ($seconds -gt 0) { Format-PraDuration $seconds } else { '' }) }
 }
 
 function Write-PraBanner {
@@ -501,7 +544,7 @@ function Get-PraDefaultConfiguration {
     return @{
         Environment = 'PROD'
         Exchange = @{ ConnectionMode='Local'; Server=''; DomainController='' }
-        Scope = @{ Mode='OU'; SearchBase=''; GroupDN=''; CsvPath=''; IncludeUsers=$true; IncludeShared=$true; IncludeRoom=$false; IncludeEquipment=$false; ExcludeSamAccountNames=@() }
+        Scope = @{ Mode='OU'; SearchBase=''; GroupDN=''; CsvPath=''; IncludeUsers=$true; IncludeShared=$true; IncludeRoom=$false; IncludeEquipment=$false; ExcludeSamAccountNames=@(); ConvertRooms=$false }
         Collect = @{
             SharedPermissions=$true; ExpandGroupTrustees=$true; ExcludeTrustees=@(); MailboxStatistics=$false
             Contacts=$false; ContactsSearchBase=''; DistributionGroups=$false; DistributionGroupsSearchBase=''; DynamicDistributionGroups=$false
@@ -511,9 +554,9 @@ function Get-PraDefaultConfiguration {
         Polling = @{ IntervalSeconds=20; MailboxTimeoutMinutes=30; SyncTimeoutMinutes=30; HoldTimeoutMinutes=30 }
         Licensing = @{
             Users = @{ Mode='Group'; GroupId=''; SkuPartNumber='' }
-            Shared = @{ SkuPartNumber='' }
+            Shared = @{ SkuPartNumber=''; Parallel=100 }
         }
-        Retention = @{ TagAttribute='CustomAttribute1'; TagValue='Converted'; HoldPolicy='' }
+        Retention = @{ TagAttribute='CustomAttribute1'; TagValue='Converted'; HoldPolicy=''; HoldPolicyLimit=1000 }
         EntraConnect = @{ Mode='Remoting'; Server=''; ScriptPath=''; MinVersion='2.5.76.0' }
         Logging = @{ Folder='.\logs' }
         Report = @{ Enabled=$true; Folder='.\reports' }
@@ -564,9 +607,13 @@ function Import-PraConfiguration {
     if ($users.Mode -notin @('Group','Kiosk','Direct')) { throw 'Configuration: Licensing.Users.Mode must be Group, Kiosk or Direct.' }
     if ($users.Mode -eq 'Group' -and $users.GroupId -and $users.GroupId -notmatch '^[0-9a-fA-F-]{36}$') { throw 'Configuration: Licensing.Users.GroupId must be the object ID (GUID) of the licence group.' }
     if ($users.Mode -eq 'Direct' -and -not $users.SkuPartNumber) { throw 'Configuration: Licensing.Users.Mode = Direct requires Licensing.Users.SkuPartNumber.' }
+    $parallel = $config.Licensing.Shared.Parallel
+    if ($parallel -isnot [int] -or $parallel -lt 1 -or $parallel -gt 1000) { throw 'Configuration: Licensing.Shared.Parallel must be a whole number between 1 and 1000 (temporary licences used at the same time by the shared mailboxes).' }
     $retention = $config.Retention
     if ($retention.TagAttribute -notmatch '^CustomAttribute([1-9]|1[0-5])$') { throw 'Configuration: Retention.TagAttribute must be CustomAttribute1 to CustomAttribute15.' }
     if (-not $retention.TagValue) { throw 'Configuration: Retention.TagValue is empty.' }
+    $limit = $retention.HoldPolicyLimit
+    if ($limit -isnot [int] -or $limit -lt 1 -or $limit -gt 1000) { throw 'Configuration: Retention.HoldPolicyLimit must be a whole number between 1 and 1000 (mailboxes per case hold policy; 1000 is the Microsoft Purview limit).' }
     try { $null = [version]$config.EntraConnect.MinVersion } catch { throw 'Configuration: EntraConnect.MinVersion must be a version number (2.5.76.0).' }
     if ($config.EntraConnect.Server -and $config.EntraConnect.Server -notmatch '^[A-Za-z0-9.-]+$') { throw 'Configuration: EntraConnect.Server must be a host name.' }
     if ($config.EntraConnect.Mode -notin @('Remoting','Script','Manual')) { throw 'Configuration: EntraConnect.Mode must be Remoting, Script or Manual.' }
@@ -996,6 +1043,6 @@ function Complete-PraRun {
 }
 #endregion
 
-Export-ModuleMember -Function Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
-    Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun,
+Export-ModuleMember -Function Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraProgress, Get-PraDurationEstimate,
+    Write-PraBanner, Write-PraStep, Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun,
     Write-PraEvent, Test-PraStopRequest, Request-PraOperator

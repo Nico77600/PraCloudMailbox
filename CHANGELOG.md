@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.2.0 - 2026-10-09
+
+Volume: 15,000 users, 5,000 shared mailboxes.
+
+### Changed
+- The cloud state of every object is read in bulk before anything is changed (Check, Convert, Recover): Entra ID users
+  page by page, source of authority by Graph batches, Exchange Online by filters of 50 objects. About 20 minutes for
+  21,000 objects instead of 15 hours one by one; polls of many objects (mailboxes, synchronisation) also by sets.
+- Convert goes phase by phase: users in waves of 500 (Graph batches, one wait per wave until Exchange Online no
+  longer sees them as synchronised), shared mailboxes in waves of `Licensing.Shared.Parallel` (100 by default), one
+  temporary unit each and never more than the free units; the permissions are granted once the temporary licence
+  is given back. A stop from the window is taken between two waves.
+- Recover goes phase by phase too, one wave at a time: users (and shared mailboxes whose Convert stopped half-way)
+  in waves of 500, shared mailboxes in waves of `Licensing.Shared.Parallel`. Every phase of a wave runs for the
+  whole wave at once (case hold, source of authority, Exchange plan removal, MailUser wait) with a single wait
+  instead of one per object; a shared wave pauses the Entra Connect scheduler once for all its identity deletions
+  and runs a single delta cycle, instead of once per mailbox. A stop from the window is honoured between waves (a
+  wave already running is always finished).
+- The case hold used by Recover can now hold more than 1,000 mailboxes: when the configured policy
+  (`Retention.HoldPolicy`) is full, Recover creates `<HoldPolicy>-02`, `-03`... in the same eDiscovery case (with a
+  rule that holds everything) and keeps using them transparently. A sibling policy being deleted is left out.
+- Convert and Recover report their progress wave by wave: a console line and a 'progress' event (window: a second
+  progress bar and a line under the step one, N of total objects of the current phase, with a rough time left once
+  at least one wave is done) instead of only the final per-object result lines.
+- The *Plan and confirmation* step of Convert and Recover shows a rough duration estimate from the number of waves
+  (about 2 minutes per user wave, about 3 minutes per shared-mailbox pipeline round, lab order of magnitude - a real
+  tenant can be much slower some evenings).
+- Room and equipment mailboxes can be converted like shared mailboxes (`Scope.ConvertRooms`, default off): they
+  still need `Scope.IncludeRoom` / `IncludeEquipment` at Collect. Their booking settings (capacity, auto-accept,
+  booking policies) are not collected or recreated; the on-premises object is authoritative and comes back
+  unchanged at Recover.
+
+### Added
+- `Licensing.Shared.Parallel` (1 to 1000, default 100).
+- `Retention.HoldPolicyLimit` (1 to 1000, default 1000): mailboxes per case hold policy before Recover opens the
+  next one in the series.
+- `Scope.ConvertRooms` (default `$false`).
+
+### Fixed
+- The step progress bar of the window stayed at 0% through most of a run: `[Math]::Min`/`Max` silently truncated
+  the fraction to an integer when compared to the whole-number literals `0` and `1`.
+
+### Lab-validated 9 Oct
+- Shared wave of 3 and user wave of 2 recovered in a real tenant with the new wave pipeline: a single scheduler
+  pause and a single delta cycle for the whole shared wave, a single delta cycle for the whole user wave.
+- Case hold overflow confirmed live: with `Retention.HoldPolicyLimit` lowered to force it, the configured policy
+  filled up and a sibling policy was created automatically in the same case and correctly held the rest.
 ## 1.1.0 - 2026-10-08
 
 A window for every action, and waves of objects. The engine is unchanged when it runs without the window.

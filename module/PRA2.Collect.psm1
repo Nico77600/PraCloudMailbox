@@ -17,7 +17,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.1.0
+    Version : 1.2.0
 #>
 #Requires -Version 5.1
 Set-StrictMode -Version Latest

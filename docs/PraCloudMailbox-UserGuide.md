@@ -1,7 +1,7 @@
 ---
 title: PRA Cloud Mailbox
 subtitle: User guide
-version: 1.1.0
+version: 1.2.0
 author: Nicolas Fabert
 updated: 2026-10-08
 ---
@@ -35,7 +35,7 @@ compare | The window | Chapter 7: the same commands from a window, with a previe
 | Exchange side (Collect) | An Exchange server (or the management tools), **Windows PowerShell 5.1**, an account that reads recipients and permissions (*View-Only Organization Management* and *Active Directory Permissions*, or *Organization Management*) |
 | Cloud admin server | A Windows computer that does **not depend on the on-premises AD**, **PowerShell 7.4** or later, the modules `Microsoft.Graph.Authentication` and `ExchangeOnlineManagement` 3.10+ |
 | App registration | Certificate sign-in, Microsoft Graph application permissions, `Exchange.ManageAsApp` with the Exchange Administrator role, eDiscovery Manager in Microsoft Purview: [developer guide, chapter 4.3](PraCloudMailbox-Guide.md#43-app-registration) |
-| Licences | A licence group with an Exchange Online plan and free units for the users (or the Kiosk plan of their Teams licence, or direct licences), and **one** free unit for the shared mailboxes |
+| Licences | A licence group with an Exchange Online plan and free units for the users (or the Kiosk plan of their Teams licence, or direct licences), and free units for the shared mailboxes: one per shared mailbox converted at the same time (`Licensing.Shared.Parallel`; one unit is enough, they then go one after another) |
 | Holds | An eDiscovery case hold policy and a retention policy for the inactive shared mailboxes: [developer guide, chapter 4.4](PraCloudMailbox-Guide.md#44-case-hold-and-retention) |
 | After the disaster | Active Directory restored from a backup (same objectGUID), Exchange, and **Entra Connect 2.5.76.0** or later |
 
@@ -84,7 +84,7 @@ AD, Exchange and Entra Connect are lost. On the cloud admin server, in PowerShel
 .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply             # one confirmation, then the batch
 ```
 
-- The users get their mailbox first (their Teams storage becomes their mailbox, in one or two minutes), then the shared mailboxes, one after another, with their permissions.
+- The users get their mailbox first (their Teams storage becomes their mailbox, in one or two minutes), then the shared mailboxes, in waves (up to `Licensing.Shared.Parallel` at the same time, 100 by default, one temporary licence each), with their permissions.
 - **Note the batch ID** printed in the final card: it is the only input of the rollback. It is also in the report and in the journal.
 - A user still *Pending* at the end: run the same command with `-Batch <ID>` a little later; only what is not finished is taken again.
 - One part only: `-Scope UsersOnly` or `-Scope SharedOnly`; one object: `-Identity compta@contoso.com`; a wave: `-IdentityPath .\wave1.txt` (one identity per line, or a CSV file with an `Identity` column). Each Convert is a batch of its own.
