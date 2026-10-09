@@ -1,0 +1,12 @@
+{
+  "runtimeRoot": ".",
+  "testMode": "gate",
+  "testEntry": "tests/Invoke-TestGate.ps1",
+  "tests": [
+    "tests/PraCloudMailbox.Tests.ps1",
+    "tests/PraCloudMailbox.EndToEnd.Tests.ps1",
+    "tests/PraCloudMailbox.Gui.Tests.ps1"
+  ],
+  "packageBuilder": "tools/New-PraCloudPackage.ps1",
+  "packageEntry": "Invoke-PraCloudMailbox.ps1"
+}

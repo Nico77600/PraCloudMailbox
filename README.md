@@ -146,4 +146,9 @@ The end-to-end tests run the real Convert and Recover code against an in-memory 
 
 ## Disclaimer
 
-Personal project, provided as is. It is not an official Microsoft product and is not supported by Microsoft. The tool changes production objects in Entra ID and Exchange Online: run the preview, review the plan, keep the journal and test the whole cycle in a lab before using it in a real disaster.
+This Script is a Personal project.
+It's provided "AS-IS". It's not an official Microsoft product so no support can be expected from Microsoft.
+
+As any scripts you must read carefully the documentation and test it first in a Test environment before any run in Production.
+
+The tool changes production objects in Entra ID and Exchange Online: run the preview, review the plan, keep the journal and test the whole cycle in a lab before using it in a real disaster.
