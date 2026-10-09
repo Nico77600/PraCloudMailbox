@@ -509,6 +509,8 @@
             <TextBlock x:Name="RunStep" FontSize="12.5" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
             <ProgressBar x:Name="RunProgress" Height="4" Margin="0,6,0,0" Minimum="0" Maximum="1" Value="0"/>
             <TextBlock x:Name="RunCurrent" FontSize="12" Margin="0,6,0,0" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+            <ProgressBar x:Name="RunObjectsBar" Height="4" Margin="0,6,0,0" Minimum="0" Maximum="1" Value="0" Visibility="Collapsed"/>
+            <TextBlock x:Name="RunObjects" FontSize="12" Margin="0,4,0,0" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Visibility="Collapsed"/>
           </StackPanel>
           <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,8,0,8">
             <TextBlock Style="{StaticResource PraIcon}" Text="&#xE73E;" FontSize="13" Foreground="{DynamicResource PraSuccess}" VerticalAlignment="Center"/>

@@ -10,7 +10,8 @@
     Exchange Online recipient of each object of the Collect snapshot, the rules that tell whether Convert can
     run (Get-Pra2Readiness, pure functions of the snapshot row and of the cloud state, tested without any
     cloud access), source of authority, licences, shared mailbox permissions, the eDiscovery case hold
-    (Security & Compliance) and the Entra Connect operations of Recover.
+    (Security & Compliance) and the Entra Connect operations of Recover. The states of many objects are read in bulk
+    (Get-Pra2CloudStateSet, Get-Pra2ExoStateSet): a few calls per 50 objects instead of five calls per object.
 
     Facts from the lab (2-7 October 2026) behind the rules:
       - Convert of a user = ExchangeGuid cleared, SOA transferred (isCloudManaged), then an Exchange plan:
@@ -23,7 +24,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.1.0
+    Version : 1.2.0
 #>
 #Requires -Version 5.1
 Set-StrictMode -Version Latest
@@ -241,7 +242,7 @@ function Test-Pra2TenantReadiness {
     }
     if ($SharedCount -gt 0) {
         $name = [string]$licensing.Shared.SkuPartNumber
-        if (-not $name) { & $add 'Error' 'SHARED_LICENCE' 'Licensing.Shared.SkuPartNumber is empty: Convert needs a temporary licence with an Exchange plan for each shared mailbox (one at a time).' }
+        if (-not $name) { & $add 'Error' 'SHARED_LICENCE' 'Licensing.Shared.SkuPartNumber is empty: Convert needs a temporary licence with an Exchange plan for each shared mailbox (given back once it is converted).' }
         else {
             $sku = $skuByName[$name]
             if (-not $sku) { & $add 'Error' 'SHARED_LICENCE' "Licensing.Shared.SkuPartNumber $name is not a licence of the tenant." }
@@ -249,7 +250,9 @@ function Test-Pra2TenantReadiness {
             else {
                 $free = Get-Pra2FreeUnit $sku
                 $level = if ($free -ge 1) { 'Ok' } else { 'Error' }
-                & $add $level 'SHARED_LICENCE' ('{0}: {1} free unit(s); one is enough, the shared mailboxes are converted one after another ({2} in scope).' -f $name, $free, $SharedCount)
+                $parallel = [Math]::Max(1, [int](Get-PraValue $licensing.Shared 'Parallel' 100))
+                $wave = [Math]::Max(1, [Math]::Min($parallel, $free))
+                & $add $level 'SHARED_LICENCE' ('{0}: {1} free unit(s); the shared mailboxes are converted in waves of {2} (Licensing.Shared.Parallel = {3}, one temporary unit each, given back after each wave; {4} in scope).' -f $name, $free, $wave, $parallel, $SharedCount)
             }
         }
     }
@@ -271,44 +274,260 @@ function Test-Pra2TenantReadiness {
 function Get-Pra2CloudState {
     <#
     .SYNOPSIS
-        Entra ID object and Exchange Online recipient of one snapshot row (read-only).
+        Entra ID object and Exchange Online recipient of one snapshot row (read-only). Get-Pra2CloudStateSet for one row.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][object]$Record)
-    $select = 'id,userPrincipalName,accountEnabled,onPremisesSyncEnabled,onPremisesImmutableId,usageLocation,assignedLicenses,assignedPlans,licenseAssignmentStates,serviceProvisioningErrors'
-    $user = $null; $matchedBy = ''
-    if ($Record.immutable_id) {
-        $filter = [uri]::EscapeDataString(("onPremisesImmutableId eq '{0}'" -f ([string]$Record.immutable_id).Replace("'", "''")))
-        $found = @((Invoke-Pra2Graph -Uri ("v1.0/users?`$filter={0}&`$select={1}" -f $filter, $select)).value)
-        if ($found.Count -eq 1) { $user = $found[0]; $matchedBy = 'immutableId' }
-    }
-    if (-not $user -and $Record.user_principal_name) {
-        $user = Invoke-Pra2Graph -Uri ("v1.0/users/{0}?`$select={1}" -f [uri]::EscapeDataString([string]$Record.user_principal_name), $select) -AllowNotFound
-        if ($user) { $matchedBy = 'UPN' }
-    }
-    $behavior = $null; $recipient = $null; $mailUser = $null; $mailbox = $null; $locations = @()
-    if ($user) {
-        $behavior = Invoke-Pra2Graph -Uri ("v1.0/users/{0}/onPremisesSyncBehavior?`$select=isCloudManaged" -f $user.id) -AllowNotFound
-        $recipient = Get-Recipient -Identity ([string]$user.id) -ErrorAction SilentlyContinue
-        if ($recipient) {
-            if ([string]$recipient.RecipientTypeDetails -eq 'MailUser') { $mailUser = Get-MailUser -Identity ([string]$user.id) -ErrorAction SilentlyContinue }
-            elseif ([string]$recipient.RecipientTypeDetails -match 'Mailbox$') { $mailbox = Get-Mailbox -Identity ([string]$user.id) -ErrorAction SilentlyContinue }
-        }
-        $locations = @(Get-MailboxLocation -User ([string]$user.id) -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | ForEach-Object {
-                [pscustomobject]@{ Type = [string]$_.MailboxLocationType; Guid = [string]$_.MailboxGuid } })
-    }
-    $holds = @()
-    if ($mailUser) { $holds = @($mailUser.InPlaceHolds | ForEach-Object { [string]$_ }) }
-    elseif ($mailbox) { $holds = @($mailbox.InPlaceHolds | ForEach-Object { [string]$_ }); if ($mailbox.LitigationHoldEnabled) { $holds += 'LitigationHold' } }
-    $tagAttribute = [string]$Context.Config.Retention.TagAttribute
-    $tagValue = if ($recipient -and $recipient.PSObject.Properties[$tagAttribute]) { [string]$recipient.$tagAttribute } else { '' }
-    return [pscustomobject]@{
-        MatchedBy = $matchedBy; User = $user; IsCloudManaged = $(if ($behavior) { [bool]$behavior.isCloudManaged } else { $null })
-        RecipientType = $(if ($recipient) { [string]$recipient.RecipientTypeDetails } else { '' })
-        ExchangeGuid = $(if ($mailUser) { [string]$mailUser.ExchangeGuid } elseif ($recipient) { [string]$recipient.ExchangeGuid } else { '' })
-        Holds = $holds; Locations = $locations; TagValue = $tagValue
-    }
+    $state = (Get-Pra2CloudStateSet -Context $Context -Records @($Record))[[string]$Record.object_guid]
+    if ($state -is [System.Management.Automation.ErrorRecord]) { throw $state }
+    return $state
 }
+#endregion
+
+#region Many objects at once ------------------------------------------------------------------------
+# A state read one object at a time costs five calls (about 3 s): 15 hours for 21,000 objects. These functions read
+# the same states in bulk (measured in a lab tenant of 21,700 users and 16,000 mailboxes): every user page by page
+# (20 s), the source of authority by Graph batches of 20 (0.4 s each), Exchange Online by filters of 50 object IDs
+# (0.3 to 0.7 s each).
+
+$script:ExoFilterSize = 50
+$script:GraphBatchSize = 20
+
+function ConvertFrom-Pra2MailboxLocation {
+    <# MailboxLocations of Get-MailUser / Get-EXOMailbox ('1;<guid>;<type>;<database>;<id>') as Type and Guid, like Get-MailboxLocation. #>
+    param([AllowNull()][AllowEmptyCollection()][object[]]$Value = @())
+    return @(foreach ($text in @($Value | Where-Object { $_ })) {
+            $parts = ([string]$text).Split(';')
+            if ($parts.Count -ge 3 -and $parts[2]) { [pscustomobject]@{ Type = $parts[2]; Guid = $parts[1] } }
+        })
+}
+
+function Get-Pra2ExoFilter {
+    <# An OPATH filter that matches any of the object IDs. #>
+    param([Parameter(Mandatory)][string[]]$Id)
+    return (@($Id | ForEach-Object { "ExternalDirectoryObjectId -eq '{0}'" -f $_.Replace("'", "''") }) -join ' -or ')
+}
+
+function Get-Pra2ExoStateSet {
+    <#
+    .SYNOPSIS
+        Get-Pra2ExoState of many Entra object IDs, with their mailbox locations (Teams storage): filters of 50 IDs on
+        Get-EXORecipient, Get-User, Get-MailUser and Get-EXOMailbox. A chunk that fails is read again one object at a
+        time. Returns a hashtable ID -> state (Type '' when there is no recipient).
+    #>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$Id = @(), [string]$TagAttribute = 'CustomAttribute1')
+    $result = @{}
+    $ids = @($Id | Where-Object { $_ } | Select-Object -Unique)
+    for ($start = 0; $start -lt $ids.Count; $start += $script:ExoFilterSize) {
+        $chunk = [string[]]@($ids[$start..([Math]::Min($ids.Count, $start + $script:ExoFilterSize) - 1)])
+        try {
+            $filter = Get-Pra2ExoFilter -Id $chunk
+            $recipients = @{}; $users = @{}; $mailUsers = @{}; $mailboxes = @{}
+            foreach ($r in @(Get-EXORecipient -Filter $filter -ResultSize Unlimited -Properties ExternalDirectoryObjectId, ExchangeGuid, $TagAttribute -ErrorAction Stop)) { $recipients[[string]$r.ExternalDirectoryObjectId] = $r }
+            foreach ($u in @(Get-User -Filter $filter -ResultSize Unlimited -ErrorAction Stop)) { $users[[string]$u.ExternalDirectoryObjectId] = $u }
+            $mailUserIds = [string[]]@($recipients.Keys | Where-Object { [string]$recipients[$_].RecipientTypeDetails -eq 'MailUser' })
+            $mailboxIds = [string[]]@($recipients.Keys | Where-Object { [string]$recipients[$_].RecipientTypeDetails -match 'Mailbox$' })
+            if ($mailUserIds.Count) { foreach ($m in @(Get-MailUser -Filter (Get-Pra2ExoFilter -Id $mailUserIds) -ResultSize Unlimited -ErrorAction Stop)) { $mailUsers[[string]$m.ExternalDirectoryObjectId] = $m } }
+            if ($mailboxIds.Count) {
+                foreach ($m in @(Get-EXOMailbox -Filter (Get-Pra2ExoFilter -Id $mailboxIds) -ResultSize Unlimited -Properties ExternalDirectoryObjectId, InPlaceHolds, LitigationHoldEnabled, MailboxLocations -ErrorAction Stop)) { $mailboxes[[string]$m.ExternalDirectoryObjectId] = $m }
+            }
+            foreach ($one in $chunk) {
+                $recipient = $recipients[$one]; $user = $users[$one]; $holds = @(); $locations = @(); $guid = ''
+                if ($recipient) {
+                    $guid = [string]$recipient.ExchangeGuid
+                    if ($mailUsers.ContainsKey($one)) {
+                        $holds = @($mailUsers[$one].InPlaceHolds | ForEach-Object { [string]$_ }); $guid = [string]$mailUsers[$one].ExchangeGuid
+                        $locations = @(ConvertFrom-Pra2MailboxLocation @($mailUsers[$one].MailboxLocations))
+                    } elseif ($mailboxes.ContainsKey($one)) {
+                        $mailbox = $mailboxes[$one]
+                        $holds = @($mailbox.InPlaceHolds | ForEach-Object { [string]$_ }); if ($mailbox.LitigationHoldEnabled) { $holds += 'LitigationHold' }
+                        $locations = @(ConvertFrom-Pra2MailboxLocation @($mailbox.MailboxLocations))
+                    }
+                }
+                $result[$one] = [pscustomobject]@{
+                    Type = $(if ($recipient) { [string]$recipient.RecipientTypeDetails } else { '' }); ExchangeGuid = $guid
+                    IsDirSynced = $(if ($user) { [bool]$user.IsDirSynced } else { $null }); Holds = $holds
+                    Tag = $(if ($recipient -and $recipient.PSObject.Properties[$TagAttribute]) { [string]$recipient.$TagAttribute } else { '' })
+                    UserType = $(if ($user) { [string]$user.RecipientTypeDetails } else { '' }); Locations = $locations
+                }
+            }
+        } catch {
+            Write-Verbose ("Exchange Online filter of {0} object(s) failed ({1}): one object at a time." -f $chunk.Count, $_.Exception.Message)
+            foreach ($one in $chunk) {
+                $state = Get-Pra2ExoState -Identity $one -TagAttribute $TagAttribute
+                $locations = @(Get-MailboxLocation -User $one -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Type = [string]$_.MailboxLocationType; Guid = [string]$_.MailboxGuid } })
+                $state | Add-Member -NotePropertyName Locations -NotePropertyValue $locations
+                $result[$one] = $state
+            }
+        }
+    }
+    return $result
+}
+
+function Invoke-Pra2GraphBatch {
+    <#
+    .SYNOPSIS
+        Many Microsoft Graph requests in batches of 20 (JSON batching). Throttled (429) or unavailable (5xx) requests
+        are sent again (three rounds), then one by one. Every other answer is returned as it is.
+    .PARAMETER Requests
+        Hashtables: Method (GET, PATCH, POST, DELETE), Url (relative to v1.0, e.g. /users/<id>), Body (optional).
+    .OUTPUTS
+        One result per request, in the same order: Ok (2xx), Status, Body, Error ('code: message').
+    #>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][object[]]$Requests = @())
+    $results = New-Object object[] $Requests.Count
+    $pending = [System.Collections.Generic.List[int]]::new()
+    for ($i = 0; $i -lt $Requests.Count; $i++) { $pending.Add($i) }
+    $toResult = {
+        param([int]$Status, [object]$Body)
+        $text = ''
+        if ($Status -ge 300 -and $Body) { $graphError = Get-PraValue $Body 'error' $null; if ($graphError) { $text = '{0}: {1}' -f (Get-PraValue $graphError 'code' ''), (Get-PraValue $graphError 'message' '') } }
+        [pscustomobject]@{ Ok = ($Status -ge 200 -and $Status -lt 300); Status = $Status; Body = $Body; Error = $text }
+    }
+    for ($round = 1; $round -le 3 -and $pending.Count; $round++) {
+        $again = [System.Collections.Generic.List[int]]::new()
+        for ($start = 0; $start -lt $pending.Count; $start += $script:GraphBatchSize) {
+            $chunk = @($pending.GetRange($start, [Math]::Min($script:GraphBatchSize, $pending.Count - $start)))
+            $batch = @(foreach ($index in $chunk) {
+                    $request = $Requests[$index]
+                    $item = @{ id = [string]$index; method = [string]$request.Method; url = [string]$request.Url }
+                    if ($request.ContainsKey('Body') -and $null -ne $request.Body) { $item.body = $request.Body; $item.headers = @{ 'Content-Type' = 'application/json' } }
+                    $item
+                })
+            $answer = Invoke-Pra2Graph -Method POST -Uri 'v1.0/$batch' -Body @{ requests = $batch }
+            $seen = @{}
+            foreach ($response in @($answer.responses)) {
+                $index = [int]$response.id; $seen[$index] = $true
+                $status = [int]$response.status
+                if ($status -eq 429 -or $status -ge 500) { $again.Add($index) } else { $results[$index] = & $toResult $status (Get-PraValue $response 'body' $null) }
+            }
+            foreach ($index in $chunk) { if (-not $seen.ContainsKey($index)) { $again.Add($index) } }
+        }
+        $pending = $again
+        if ($pending.Count -and $round -lt 3) { Start-Sleep -Seconds (5 * $round) }
+    }
+    foreach ($index in $pending) {
+        $request = $Requests[$index]
+        $parameters = @{ Method = [string]$request.Method; Uri = ('v1.0' + [string]$request.Url) }
+        if ($request.ContainsKey('Body') -and $null -ne $request.Body) { $parameters.Body = $request.Body }
+        try { $results[$index] = & $toResult 200 (Invoke-Pra2Graph @parameters) }
+        catch {
+            $code = 0; try { $code = [int]$_.Exception.InnerException.Response.StatusCode } catch { $code = 0 }
+            if (-not $code) { try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = 0 } }
+            $results[$index] = [pscustomobject]@{ Ok = $false; Status = $code; Body = $null; Error = ($_.Exception.Message -replace '\s+', ' ') }
+        }
+    }
+    return , $results
+}
+
+function Get-Pra2SyncBehaviorSet {
+    <#
+    .SYNOPSIS
+        isCloudManaged of many users (source of authority), by Graph batches. Returns a hashtable user ID -> $true,
+        $false or $null (none). A request that keeps failing stops the read.
+    #>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$UserId = @())
+    $result = @{}
+    $ids = @($UserId | Where-Object { $_ } | Select-Object -Unique)
+    $answers = Invoke-Pra2GraphBatch -Requests @($ids | ForEach-Object { @{ Method = 'GET'; Url = ('/users/{0}/onPremisesSyncBehavior?$select=isCloudManaged' -f $_) } })
+    for ($i = 0; $i -lt $ids.Count; $i++) {
+        $answer = $answers[$i]
+        if ($answer.Ok) { $result[$ids[$i]] = [bool](Get-PraValue $answer.Body 'isCloudManaged' $false) }
+        elseif ($answer.Status -eq 404) { $result[$ids[$i]] = $null }
+        else { throw ('Source of authority of {0} not readable ({1}): {2}' -f $ids[$i], $answer.Status, $answer.Error) }
+    }
+    return $result
+}
+
+function Get-Pra2GraphUserSet {
+    <#
+    .SYNOPSIS
+        The Entra ID user of many snapshot rows: by onPremisesImmutableId (one match only), otherwise by UPN. Up to
+        PageThreshold rows: one query per row; more: every user of the tenant, page by page. Returns a hashtable
+        object_guid -> User and MatchedBy (immutableId, UPN or '' when none).
+    #>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][object[]]$Records = @(), [int]$PageThreshold = 100)
+    $select = 'id,userPrincipalName,accountEnabled,onPremisesSyncEnabled,onPremisesImmutableId,usageLocation,assignedLicenses,assignedPlans,licenseAssignmentStates,serviceProvisioningErrors'
+    $result = @{}
+    if ($Records.Count -le $PageThreshold) {
+        foreach ($record in $Records) {
+            $user = $null; $matchedBy = ''
+            if ($record.immutable_id) {
+                $filter = [uri]::EscapeDataString(("onPremisesImmutableId eq '{0}'" -f ([string]$record.immutable_id).Replace("'", "''")))
+                $found = @((Invoke-Pra2Graph -Uri ("v1.0/users?`$filter={0}&`$select={1}" -f $filter, $select)).value)
+                if ($found.Count -eq 1) { $user = $found[0]; $matchedBy = 'immutableId' }
+            }
+            if (-not $user -and $record.user_principal_name) {
+                $user = Invoke-Pra2Graph -Uri ("v1.0/users/{0}?`$select={1}" -f [uri]::EscapeDataString([string]$record.user_principal_name), $select) -AllowNotFound
+                if ($user) { $matchedBy = 'UPN' }
+            }
+            $result[[string]$record.object_guid] = [pscustomobject]@{ User = $user; MatchedBy = $matchedBy }
+        }
+        return $result
+    }
+    # onPremisesImmutableId is base64: case-sensitive.
+    $byImmutable = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $byUpn = @{}
+    $uri = 'v1.0/users?$select={0}&$top=999' -f $select
+    while ($uri) {
+        $page = Invoke-Pra2Graph -Uri $uri
+        foreach ($user in @($page.value)) {
+            if ($user.onPremisesImmutableId) {
+                $key = [string]$user.onPremisesImmutableId
+                if ($byImmutable.ContainsKey($key)) { $byImmutable[$key] = $null } else { $byImmutable[$key] = $user }
+            }
+            if ($user.userPrincipalName) { $byUpn[[string]$user.userPrincipalName] = $user }
+        }
+        $uri = [string](Get-PraValue $page '@odata.nextLink' '')
+    }
+    foreach ($record in $Records) {
+        $user = $null; $matchedBy = ''
+        # Several users with the same immutableId count as none, as the query by row does.
+        if ($record.immutable_id -and $byImmutable.ContainsKey([string]$record.immutable_id) -and $byImmutable[[string]$record.immutable_id]) { $user = $byImmutable[[string]$record.immutable_id]; $matchedBy = 'immutableId' }
+        elseif ($record.user_principal_name -and $byUpn.ContainsKey([string]$record.user_principal_name)) { $user = $byUpn[[string]$record.user_principal_name]; $matchedBy = 'UPN' }
+        $result[[string]$record.object_guid] = [pscustomobject]@{ User = $user; MatchedBy = $matchedBy }
+    }
+    return $result
+}
+
+function Get-Pra2CloudStateSet {
+    <#
+    .SYNOPSIS
+        Get-Pra2CloudState of many snapshot rows: Entra ID users, source of authority and Exchange Online in bulk.
+        Returns a hashtable object_guid -> state, or the ErrorRecord of a row that could not be read.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context, [AllowEmptyCollection()][object[]]$Records = @(), [int]$PageThreshold = 100)
+    $result = @{}
+    if (-not $Records.Count) { return $result }
+    $users = Get-Pra2GraphUserSet -Records $Records -PageThreshold $PageThreshold
+    $ids = [string[]]@($users.Values | Where-Object { $_.User } | ForEach-Object { [string]$_.User.id })
+    $behaviors = Get-Pra2SyncBehaviorSet -UserId $ids
+    $exo = Get-Pra2ExoStateSet -Id $ids -TagAttribute ([string]$Context.Config.Retention.TagAttribute)
+    foreach ($record in $Records) {
+        $guid = [string]$record.object_guid
+        try {
+            $match = $users[$guid]
+            $user = $match.User
+            $state = if ($user) { $exo[[string]$user.id] } else { $null }
+            $behavior = if ($user -and $behaviors.ContainsKey([string]$user.id)) { $behaviors[[string]$user.id] } else { $null }
+            $result[$guid] = [pscustomobject]@{
+                MatchedBy = $match.MatchedBy; User = $user; IsCloudManaged = $behavior
+                RecipientType = $(if ($state) { $state.Type } else { '' })
+                ExchangeGuid = $(if ($state) { $state.ExchangeGuid } else { '' })
+                Holds = @(if ($state) { $state.Holds }); Locations = @(if ($state) { $state.Locations }); TagValue = $(if ($state) { $state.Tag } else { '' })
+            }
+        } catch { $result[$guid] = $_ }
+    }
+    return $result
+}
+#endregion
+
+#region Readiness rules (pure functions) -----------------------------------------------------------
 
 function Get-Pra2Readiness {
     <#
@@ -330,7 +549,11 @@ function Get-Pra2Readiness {
     $add = { param($Level, $Field, $Code, $Message) [void]$findings.Add([pscustomobject]@{ Level = $Level; Field = $Field; Code = $Code; Message = $Message }) }
     $isUser = [string]$Record.kind -eq 'User'
     if ([string]$Record.kind -in @('Room', 'Equipment')) {
-        & $add 'Error' 'ExchangeOnline' 'KIND_NOT_SUPPORTED' ("{0} mailbox: not converted by this version (booking settings not collected, not validated in the lab). It stays unreachable during the disaster; recreate it in Exchange Online by hand if needed." -f $Record.kind)
+        if (-not $Config.Scope.ConvertRooms) {
+            & $add 'Error' 'ExchangeOnline' 'KIND_NOT_SUPPORTED' ("{0} mailbox: not converted (Scope.ConvertRooms = `$false). It stays unreachable during the disaster; recreate it in Exchange Online by hand if needed, or set Scope.ConvertRooms to convert it like a shared mailbox." -f $Record.kind)
+        } else {
+            & $add 'Info' 'ExchangeOnline' 'ROOM_CONVERT_ENABLED' ("{0} mailbox: converted like a shared mailbox (Scope.ConvertRooms). Booking settings (capacity, auto-accept, booking policies) are not collected or recreated by this tool; the on-premises object is authoritative and comes back unchanged at Recover." -f $Record.kind)
+        }
     }
     $user = $State.User
     if (-not $user) {
@@ -624,45 +847,137 @@ function Connect-Pra2Compliance {
     # -CommandName is required: the full session also loads Get-Recipient and Get-User, which hide the Exchange
     # Online cmdlets and return a stale view (a rolled back user still seen as UserMailbox - lab 2026-10-07).
     Connect-IPPSSession -AppId $cloud.AppId -CertificateThumbprint $cloud.CertificateThumbprint -Organization $cloud.Organization -ShowBanner:$false -EnableSearchOnlySession `
-        -CommandName Get-CaseHoldPolicy, Set-CaseHoldPolicy -ErrorAction Stop
+        -CommandName Get-CaseHoldPolicy, Set-CaseHoldPolicy, New-CaseHoldPolicy, New-CaseHoldRule -ErrorAction Stop
     $Context['ComplianceConnected'] = $true
 }
 
-function Get-Pra2HoldTag {
-    <# InPlaceHolds value of the configured case hold policy ('UniH' + policy GUID). #>
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Policy)
-    $item = Get-CaseHoldPolicy -Identity $Policy -ErrorAction Stop
-    return ('UniH{0}' -f $item.Guid)
-}
+# An eDiscovery case hold policy holds 1,000 mailboxes at most: the tool uses the configured policy, then <name>-02,
+# <name>-03... in the same case (created with a rule that holds everything). Set-CaseHoldPolicy takes many locations
+# in one call (12 to 15 s per call in the lab, whatever their number).
+$script:HoldLocationChunk = 100
 
-function Set-Pra2HoldLocation {
+function Get-Pra2HoldPolicySet {
     <#
     .SYNOPSIS
-        Adds or removes an Exchange location of the case hold policy; already there / already gone is not an error.
-    .DESCRIPTION
-        Set-CaseHoldPolicy can answer "Policy ... failed to be deployed" while the change is recorded (the hold then
-        follows when the distribution goes through, lab 7-8 Oct 2026): the policy is read again and, when the location
-        list shows the change, the call counts as done (the caller waits for InPlaceHolds anyway).
+        The case hold policies of the tool: the configured one and its siblings <name>-NN in the same case, with their
+        tag (UniH + GUID) and their locations (Entra object IDs). A sibling being deleted (Mode PendingDeletion, still
+        listed for hours - lab 9 Oct) is left out, but its number is not used again.
+    .PARAMETER Limit
+        Locations per policy (Retention.HoldPolicyLimit, 1,000 = the Microsoft Purview limit).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Policy, [ValidateRange(1, 1000)][int]$Limit = 1000)
+    $base = Get-CaseHoldPolicy -Identity $Policy -ErrorAction Stop
+    if ([string]$base.Mode -eq 'PendingDeletion') { throw "Case hold policy $Policy (Retention.HoldPolicy) is being deleted: use another policy." }
+    $pattern = '^{0}-(\d{{2,3}})$' -f [regex]::Escape($Policy)
+    $taken = [System.Collections.Generic.List[int]]::new()
+    $names = @($Policy)
+    foreach ($sibling in @(Get-CaseHoldPolicy -Case ([string]$base.CaseId) -ErrorAction Stop | Where-Object { [string]$_.Name -match $pattern } | Sort-Object { [int]([string]$_.Name -replace '^.*-', '') })) {
+        $taken.Add([int]([string]$sibling.Name -replace '^.*-', ''))
+        if ([string]$sibling.Mode -ne 'PendingDeletion') { $names += [string]$sibling.Name }
+    }
+    $policies = [System.Collections.Generic.List[object]]::new()
+    $tags = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $names) {
+        $item = if ($name -eq $Policy) { $base } else { Get-CaseHoldPolicy -Identity $name -ErrorAction Stop }
+        $locations = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($location in @($item.ExchangeLocation)) { foreach ($value in @([string]$location.ImmutableIdentity, [string]$location.Name)) { if ($value) { [void]$locations.Add($value) } } }
+        $tag = 'UniH{0}' -f $item.Guid
+        [void]$tags.Add($tag)
+        $policies.Add([pscustomobject]@{ Name = [string]$item.Name; Tag = $tag; Locations = $locations; Count = @($item.ExchangeLocation).Count })
+    }
+    return [pscustomobject]@{ Base = $Policy; CaseId = [string]$base.CaseId; Limit = $Limit; Policies = $policies; Tags = $tags; Taken = $taken }
+}
+
+function Test-Pra2ToolHold {
+    <# Is one of the holds of an object a case hold of the tool? #>
+    param([Parameter(Mandatory)][object]$Set, [AllowEmptyCollection()][string[]]$Holds = @())
+    foreach ($hold in $Holds) { if ($hold -and $Set.Tags.Contains($hold)) { return $true } }
+    return $false
+}
+
+function Invoke-Pra2HoldChange {
+    <#
+    One Set-CaseHoldPolicy call for many locations. 'failed to be deployed' while the change is recorded (lab 7-8 Oct)
+    counts as done for the locations the policy shows afterwards. Returns the IDs that were not changed.
+    #>
+    param([Parameter(Mandatory)][string]$Policy, [Parameter(Mandatory)][string[]]$Id, [Parameter(Mandatory)][ValidateSet('Add', 'Remove')][string]$Operation)
+    try {
+        if ($Operation -eq 'Add') { Set-CaseHoldPolicy -Identity $Policy -AddExchangeLocation $Id -ErrorAction Stop }
+        else { Set-CaseHoldPolicy -Identity $Policy -RemoveExchangeLocation $Id -ErrorAction Stop }
+        return @()
+    } catch {
+        $message = $_.Exception.Message -replace '\s+', ' '
+        if ($message -notmatch 'failed to be deployed|PolicyDeploymentException|already|déjà|not found in|introuvable dans|does not exist in') { throw }
+        $now = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($location in @((Get-CaseHoldPolicy -Identity $Policy -ErrorAction Stop).ExchangeLocation)) { foreach ($value in @([string]$location.ImmutableIdentity, [string]$location.Name)) { if ($value) { [void]$now.Add($value) } } }
+        $missed = @($Id | Where-Object { ($Operation -eq 'Add') -ne $now.Contains($_) })
+        if ($missed.Count -and $message -match 'failed to be deployed|PolicyDeploymentException') { Write-Warning "Case hold policy $Policy`: $Operation recorded, distribution pending ($message)" }
+        return $missed
+    }
+}
+
+function Add-Pra2HoldLocationSet {
+    <#
+    .SYNOPSIS
+        Puts many Entra object IDs on the case hold of the tool, in groups of 100 per call: the policies with room first
+        (1,000 locations each), then new policies <name>-NN created in the same case. An ID already held is left as it
+        is. Returns Policy (ID -> policy name) and Failed (ID -> message).
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
-    param([Parameter(Mandatory)][string]$Policy, [Parameter(Mandatory)][string]$Identity, [Parameter(Mandatory)][ValidateSet('Add','Remove')][string]$Operation)
-    if (-not $PSCmdlet.ShouldProcess($Policy, "$Operation $Identity")) { return }
-    try {
-        if ($Operation -eq 'Add') { Set-CaseHoldPolicy -Identity $Policy -AddExchangeLocation $Identity -ErrorAction Stop }
-        else { Set-CaseHoldPolicy -Identity $Policy -RemoveExchangeLocation $Identity -ErrorAction Stop }
-    } catch {
-        if ("$_" -match 'already|déjà|not found in|introuvable dans|does not exist in') { return }
-        if ("$_" -match 'failed to be deployed|PolicyDeploymentException') {
-            $locations = @((Get-CaseHoldPolicy -Identity $Policy -ErrorAction Stop).ExchangeLocation | ForEach-Object { [string]$_.Name; [string]$_.ImmutableIdentity; [string]$_ } | Where-Object { $_ })
-            $present = $locations -contains $Identity
-            if (($Operation -eq 'Add') -eq $present) {
-                Write-Warning "Case hold policy $Policy`: $Operation $Identity recorded, distribution pending ($($_.Exception.Message -replace '\s+', ' '))"
-                return
+    param([Parameter(Mandatory)][object]$Set, [AllowEmptyCollection()][string[]]$Id = @())
+    $result = [pscustomobject]@{ Policy = @{}; Failed = @{} }
+    $todo = [System.Collections.Generic.List[string]]::new()
+    foreach ($one in @($Id | Where-Object { $_ } | Select-Object -Unique)) {
+        $holder = $Set.Policies | Where-Object { $_.Locations.Contains($one) } | Select-Object -First 1
+        if ($holder) { $result.Policy[$one] = $holder.Name } else { $todo.Add($one) }
+    }
+    if (-not $todo.Count -or -not $PSCmdlet.ShouldProcess($Set.Base, "Add $($todo.Count) location(s)")) { return $result }
+    $next = 0
+    while ($next -lt $todo.Count) {
+        $policy = $Set.Policies | Where-Object { $_.Count -lt $Set.Limit } | Select-Object -First 1
+        if (-not $policy) {
+            $number = ((@($Set.Taken) + 1) | Measure-Object -Maximum).Maximum + 1
+            $name = '{0}-{1:00}' -f $Set.Base, $number
+            $created = New-CaseHoldPolicy -Name $name -Case $Set.CaseId -Enabled $true -ErrorAction Stop
+            $null = New-CaseHoldRule -Name "$name-Rule" -Policy $name -ErrorAction Stop
+            $policy = [pscustomobject]@{ Name = $name; Tag = ('UniH{0}' -f $created.Guid); Locations = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); Count = 0 }
+            $Set.Policies.Add($policy); [void]$Set.Tags.Add($policy.Tag); $Set.Taken.Add($number)
+        }
+        $size = [Math]::Min($script:HoldLocationChunk, [Math]::Min($Set.Limit - $policy.Count, $todo.Count - $next))
+        $chunk = [string[]]@($todo.GetRange($next, $size))
+        $next += $size
+        $missed = @()
+        try { $missed = @(Invoke-Pra2HoldChange -Policy $policy.Name -Id $chunk -Operation Add) }
+        catch { foreach ($one in $chunk) { $result.Failed[$one] = "case hold policy $($policy.Name): $($_.Exception.Message -replace '\s+', ' ')" }; continue }
+        foreach ($one in $chunk) {
+            if ($missed -contains $one) { $result.Failed[$one] = "not added to the case hold policy $($policy.Name)"; continue }
+            [void]$policy.Locations.Add($one); $policy.Count++; $result.Policy[$one] = $policy.Name
+        }
+    }
+    return $result
+}
+
+function Remove-Pra2HoldLocationSet {
+    <# Takes many Entra object IDs off the policy of the tool that holds each one (one call per policy and 100 IDs). Returns Failed (ID -> message). #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([Parameter(Mandatory)][object]$Set, [AllowEmptyCollection()][string[]]$Id = @())
+    $result = [pscustomobject]@{ Failed = @{} }
+    foreach ($policy in @($Set.Policies)) {
+        $mine = @($Id | Where-Object { $_ -and $policy.Locations.Contains($_) } | Select-Object -Unique)
+        if (-not $mine.Count -or -not $PSCmdlet.ShouldProcess($policy.Name, "Remove $($mine.Count) location(s)")) { continue }
+        for ($start = 0; $start -lt $mine.Count; $start += $script:HoldLocationChunk) {
+            $chunk = [string[]]@($mine[$start..([Math]::Min($mine.Count, $start + $script:HoldLocationChunk) - 1)])
+            $missed = @()
+            try { $missed = @(Invoke-Pra2HoldChange -Policy $policy.Name -Id $chunk -Operation Remove) }
+            catch { foreach ($one in $chunk) { $result.Failed[$one] = "case hold policy $($policy.Name): $($_.Exception.Message -replace '\s+', ' ')" }; continue }
+            foreach ($one in $chunk) {
+                if ($missed -contains $one) { $result.Failed[$one] = "not removed from the case hold policy $($policy.Name)"; continue }
+                [void]$policy.Locations.Remove($one); $policy.Count = [Math]::Max(0, $policy.Count - 1)
             }
         }
-        throw
     }
+    return $result
 }
 
 function Get-Pra2KioskAssignment {
@@ -801,7 +1116,8 @@ function Invoke-Pra2EntraConnect {
 
 Export-ModuleMember -Function Connect-Pra2Cloud, Disconnect-Pra2Cloud, Invoke-Pra2Graph, Get-Pra2GraphRole, Get-Pra2TenantFact, Get-Pra2SkuExchangePlan,
     Get-Pra2MailboxPlanId, Get-Pra2FreeUnit, Test-Pra2TenantReadiness, Get-Pra2CloudState, Get-Pra2Readiness, Get-Pra2TrusteeFinding,
+    Get-Pra2CloudStateSet, Get-Pra2ExoStateSet, Get-Pra2SyncBehaviorSet, Invoke-Pra2GraphBatch, Get-Pra2GraphUserSet, ConvertFrom-Pra2MailboxLocation, Test-Pra2NetworkFailure,
     Wait-Pra2Condition, Get-Pra2ExoState, Set-Pra2SourceOfAuthority, Get-Pra2SourceOfAuthority, Set-Pra2UsageLocation, Set-Pra2GroupMember,
     Test-Pra2GroupMember, Get-Pra2DisabledPlanForExchangeOnly, Set-Pra2Licence, Get-Pra2UserLicence, Get-Pra2DirectLicence, Enable-Pra2LicencePlan,
     Restore-Pra2Licence, Remove-Pra2Identity, Test-Pra2DeletedIdentity,
-    Connect-Pra2Compliance, Get-Pra2HoldTag, Set-Pra2HoldLocation, Get-Pra2KioskAssignment, Get-Pra2SharedGrant, Grant-Pra2SharedPermission, Invoke-Pra2EntraConnect
+    Connect-Pra2Compliance, Get-Pra2HoldPolicySet, Test-Pra2ToolHold, Add-Pra2HoldLocationSet, Remove-Pra2HoldLocationSet, Get-Pra2KioskAssignment, Get-Pra2SharedGrant, Grant-Pra2SharedPermission, Invoke-Pra2EntraConnect
