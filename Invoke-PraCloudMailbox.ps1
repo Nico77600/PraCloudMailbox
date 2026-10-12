@@ -100,6 +100,14 @@
                  Check, Convert, Recover: PowerShell 7.4+, Microsoft.Graph.Authentication, ExchangeOnlineManagement 3.10+.
     Exit codes : 0 = done, 1 = failed (or an object is not ready), 2 = done, next step required.
     Documentation : docs\PraCloudMailbox-UserGuide.md (user guide), docs\PraCloudMailbox-Guide.md (developer guide)
+
+    Disclaimer:
+    This Script is a Personal project.
+    It's provided "AS-IS". It's not an official Microsoft product so no support can be expected from Microsoft.
+
+    As any scripts you must read carefully the documentation and test it first in a Test environment before any run in Production.
+
+    The tool changes production objects in Entra ID and Exchange Online: run the preview, review the plan, keep the journal and test the whole cycle in a lab before using it in a real disaster.
 #>
 #Requires -Version 5.1
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'Force', Justification = 'Read by Invoke-PraCollect (script scope).')]

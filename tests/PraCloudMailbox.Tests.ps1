@@ -621,6 +621,22 @@ Describe 'Rough duration estimate' {
     }
 }
 
+Describe 'Runtime disclaimer' -Tag 'Disclaimer' {
+    It 'keeps public script help identical to the root runtime readme disclaimer' {
+        $readme = [IO.File]::ReadAllText((Join-Path $script:Root 'README.md')).Replace("`r`n", "`n")
+        $sections = [regex]::Matches($readme, '(?ms)^## Disclaimer\n\n(?<Text>.*?)(?=^## |\z)')
+        $sections.Count | Should -Be 1
+        $canonical = $sections[0].Groups['Text'].Value.TrimEnd([char[]]"`n")
+        $canonical | Should -Not -BeNullOrEmpty
+
+        $entry = Join-Path $script:Root 'Invoke-PraCloudMailbox.ps1'
+        $notes = ((Get-Help $entry -Full).alertSet.alert.Text -join "`n").Replace("`r`n", "`n")
+        $disclaimers = [regex]::Matches($notes, '(?ms)^Disclaimer:\n(?<Text>.*?)(?=\n\nRequires -Version|\z)')
+        $disclaimers.Count | Should -Be 1
+        $disclaimers[0].Groups['Text'].Value.TrimEnd([char[]]"`n") | Should -BeExactly $canonical
+    }
+}
+
 Describe 'Entry script' {
     It 'uses no $PSScriptRoot in the parameter defaults (empty in Windows PowerShell 5.1 with -File, e.g. a scheduled task)' {
         $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:Root 'Invoke-PraCloudMailbox.ps1'), [ref]$null, [ref]$null)
