@@ -81,6 +81,11 @@ BeforeAll {
 }
 
 Describe 'Window: data (pure functions)' {
+    It 'describes the configured resource path rather than refusing every resource' {
+        & $script:Gui { Get-PraGuiResourceText -Config @{ Scope = @{ ConvertRooms = $false } } } | Should -BeLike '*not converted*'
+        & $script:Gui { Get-PraGuiResourceText -Config @{ Scope = @{ ConvertRooms = $true; ResourceMode = 'CloudResource' } } } | Should -BeLike '*true cloud room/equipment*'
+        & $script:Gui { Get-PraGuiResourceText -Config @{ Scope = @{ ConvertRooms = $true } } } | Should -BeLike '*legacy synchronised*'
+    }
     It 'builds the command line of a run: same script and parameters, -Force only for Apply, -NonInteractive always' {
         $preview = Get-PraGuiCommand -Root 'C:\PRA' -ConfigPath 'C:\PRA\config\c.psd1' -Engine 'pwsh.exe' -Request @{ Action = 'Convert'; Mode = 'Preview'; IdentityPath = 'C:\PRA\data\gui\wave.csv' }
         $preview.Arguments | Should -Match '^-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\\PRA\\Invoke-PraCloudMailbox.ps1" -Action Convert -Mode Preview -IdentityPath "C:\\PRA\\data\\gui\\wave.csv" -ConfigPath "C:\\PRA\\config\\c.psd1"$'
@@ -183,6 +188,17 @@ Describe 'Window: data (pure functions)' {
         & $script:Gui { Format-PraGuiPath -Path 'C:\PRA\data\x.db' -Root 'C:\PRA\' } | Should -Be '.\data\x.db'
         & $script:Gui { Format-PraGuiPath -Path 'D:\other\x.db' -Root 'C:\PRA' } | Should -Be 'D:\other\x.db'
     }
+    It 'counts room and equipment previews separately from shared mailboxes' {
+        $path = Join-Path $TestDrive 'resources-preview.csv'
+        Write-TestCsv -Path $path -Rows @(
+            @{ ObjectGuid = 'room'; Kind = 'Room'; FinalStatus = 'Planned' }
+            @{ ObjectGuid = 'equipment'; Kind = 'Equipment'; FinalStatus = 'Planned' }
+            @{ ObjectGuid = 'shared'; Kind = 'Shared'; FinalStatus = 'Planned' })
+        $count = Get-PraGuiPlanCount -Path $path
+        $count.Planned | Should -Be 3
+        $count.Resources | Should -Be 2
+        $count.Shared | Should -Be 1
+    }
 }
 
 Describe 'Window: fresh installation' {
@@ -265,7 +281,8 @@ Describe 'Window: built on a test state' {
         & $script:Gui { Get-PraGuiTicked $script:Gui.Tables.Convert } | Should -Be @($script:Compta)
         $script:C.ConvertWave.IsChecked | Should -BeTrue
         $selection = & $script:Gui { Get-PraGuiSelection -Page Convert }
-        $selection.Key | Should -Be (Get-PraGuiSelectionKey -Prefix ('Convert|{0}' -f $script:State.Snapshot) -Guids @($script:Compta))
+        $selection.ConfigKey | Should -Be (Get-FileHash -LiteralPath $script:State.Config -Algorithm SHA256).Hash
+        $selection.Key | Should -Be (Get-PraGuiSelectionKey -Prefix ('Convert|{0}|config|{1}' -f $script:State.Snapshot, $selection.ConfigKey) -Guids @($script:Compta))
         $script:C.ConvertTicked.Text | Should -BeLike '1 ticked*'
     }
     It 'opens Apply only after a preview of the same selection, and closes it when the selection changes' {
@@ -295,6 +312,43 @@ Describe 'Window: built on a test state' {
         $global:PraGuiConfirm | Should -BeLike 'CONVERT|pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply -Force'
         & $script:Gui { [bool]$script:Gui.Run } | Should -BeFalse
         $script:Window.Lines[$script:Window.Lines.Count - 1].Text | Should -Be 'Cancelled: nothing was run.'
+    }
+    It 'invalidates Apply when the configuration changes after Preview' {
+        & $script:Gui {
+            $selection = Get-PraGuiSelection -Page Convert
+            $script:Gui.Pending.Convert = @{ Key = $selection.Key; Guard = $selection.Key; Resume = $false; Batch = ''; Request = @{ Action = 'Convert'; Mode = 'Preview' }; Selection = $selection
+                Planned = 3; Tone = 'Success'; Confirm = 'three objects'; Hint = 'preview ok' }
+            Update-PraGuiApplyState
+        }
+        $script:C.ConvertApply.IsEnabled | Should -BeTrue
+        Add-Content -LiteralPath $script:State.Config -Value "`r`n# resource recovery settings changed" -Encoding UTF8
+        & $script:Gui { Update-PraGuiApplyState }
+        $script:C.ConvertApply.IsEnabled | Should -BeFalse
+        & $script:Gui { $script:Gui.Pending.Convert } | Should -BeNullOrEmpty
+    }
+    It 'refuses a preview result if its configuration changed while it ran' {
+        & $script:Gui {
+            $selection = Get-PraGuiSelection -Page Convert
+            Add-Content -LiteralPath $script:Gui.ConfigPath -Value "`r`n# changed during preview" -Encoding UTF8
+            Complete-PraGuiAction -Run @{ Request = @{ Action = 'Convert'; Mode = 'Preview' }; Selection = $selection } -Result ([pscustomobject]@{ planned = 3; csvReport = ''; exitCode = 0 })
+        }
+        $script:C.ConvertApply.IsEnabled | Should -BeFalse
+        $script:C.ConvertHint.Text | Should -BeLike '*configuration changed during Preview*'
+    }
+    It 'rechecks the configuration after the typed confirmation' {
+        & $script:Gui {
+            $selection = Get-PraGuiSelection -Page Convert
+            $script:Gui.Pending.Convert = @{ Key = $selection.Key; Guard = $selection.Key; Resume = $false; Batch = ''; Request = @{ Action = 'Convert'; Mode = 'Preview' }; Selection = $selection
+                Planned = 3; Tone = 'Success'; Confirm = 'three objects'; Hint = 'preview ok' }
+            $script:Gui.Hooks.Confirm = {
+                Add-Content -LiteralPath $script:Gui.ConfigPath -Value "`r`n# changed during confirmation" -Encoding UTF8
+                $true
+            }
+            Start-PraGuiApply -Page Convert
+            [bool]$script:Gui.Run
+        } | Should -BeFalse
+        $script:C.ConvertApply.IsEnabled | Should -BeFalse
+        $script:C.ConvertHint.Text | Should -BeLike '*configuration changed*'
     }
     It 'follows the events of a run: steps, counters, questions answered in the named file only' {
         $events = Join-Path $TestDrive 'stub.events.jsonl'

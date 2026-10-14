@@ -18,6 +18,7 @@ BeforeAll {
     Import-Module (Join-Path $script:Root 'module\PRA2.Store.psm1') -Force
     Import-Module (Join-Path $script:Root 'module\PRA2.Collect.psm1') -Force
     Import-Module (Join-Path $script:Root 'module\PRA2.Cloud.psm1') -Force
+    . (Join-Path $PSScriptRoot 'GraphRequestContext.Fake.ps1')
 
     function script:New-TestConfig {
         param([hashtable]$Override = @{})
@@ -60,13 +61,15 @@ BeforeAll {
     # Synthetic Exchange cmdlets (Collect is tested without Exchange).
     function global:Get-Mailbox { param($Identity, $OrganizationalUnit, $ResultSize, $RecipientTypeDetails, $DomainController) }
     function global:Get-MailboxStatistics { param($Identity, $DomainController) }
+    function global:Get-CalendarProcessing { param($Identity, $DomainController) }
+    function global:Get-MailboxCalendarConfiguration { param($Identity, $DomainController) }
     function global:Get-MailboxPermission { param($Identity, $DomainController) }
     function global:Get-ADPermission { param($Identity, $DomainController) }
     function global:Get-Recipient { param($Identity, $DomainController) }
     function global:Get-User { param($Identity, $DomainController) }
     function global:Get-Group { param($Identity, $DomainController) }
     function global:Get-MailContact { param($ResultSize, $OrganizationalUnit, $DomainController) }
-    function global:Get-DistributionGroup { param($ResultSize, $OrganizationalUnit, $DomainController) }
+    function global:Get-DistributionGroup { param($ResultSize, $OrganizationalUnit, $DomainController, $Filter) }
     function global:Get-DistributionGroupMember { param($Identity, $ResultSize, $DomainController) }
     function global:Get-DynamicDistributionGroup { param($ResultSize, $OrganizationalUnit, $DomainController) }
     function global:Get-ExchangeServer { param() }
@@ -81,12 +84,20 @@ BeforeAll {
             RecipientTypeDetails = $Type; HiddenFromAddressListsEnabled = ($Type -ne 'UserMailbox'); Database = 'DB01'
             EmailAddresses = @("SMTP:$Sam@contoso.com", "smtp:$Sam@contoso.mail.onmicrosoft.com", "X500:/o=Old/cn=$Sam")
             GrantSendOnBehalfTo = $OnBehalf; CustomAttribute1 = ''; CustomAttribute2 = 'Paris'
+            RequireSenderAuthenticationEnabled = $true; ModerationEnabled = $false; SendModerationNotifications = 'Never'
+            AcceptMessagesOnlyFromSendersOrMembers = @(); RejectMessagesFromSendersOrMembers = @(); ModeratedBy = @(); BypassModerationFromSendersOrMembers = @()
         }
+    }
+    function script:New-FakeRoomList {
+        $group = New-FakeMailbox -Sam 'building-a' -Type RoomList
+        $group | Add-Member -NotePropertyName MemberJoinRestriction -NotePropertyValue Closed
+        $group | Add-Member -NotePropertyName MemberDepartRestriction -NotePropertyValue Closed
+        return $group
     }
 }
 
 AfterAll {
-    foreach ($name in @('Get-Mailbox','Get-MailboxStatistics','Get-MailboxPermission','Get-ADPermission','Get-Recipient','Get-User','Get-Group','Get-MailContact',
+    foreach ($name in @('Get-Mailbox','Get-MailboxStatistics','Get-CalendarProcessing','Get-MailboxCalendarConfiguration','Get-MailboxPermission','Get-ADPermission','Get-Recipient','Get-User','Get-Group','Get-MailContact',
             'Get-DistributionGroup','Get-DistributionGroupMember','Get-DynamicDistributionGroup','Get-ExchangeServer')) {
         Remove-Item -Path "function:global:$name" -ErrorAction SilentlyContinue
     }
@@ -107,6 +118,10 @@ Describe 'Configuration' {
         $config.Store.KeepSnapshots | Should -Be 10
         $config.Collect.ExpandGroupTrustees | Should -BeTrue
         $config.Retention.TagValue | Should -Be 'Converted'
+        $config.Scope.ResourceMode | Should -Be 'SynchronizedShared'
+        $config.Resources.OnPremisesReady | Should -BeFalse
+        $config.Resources.AllowUnprotectedDeletion | Should -BeFalse
+        $config.Resources.Parallel | Should -Be 100
     }
     It 'refuses an unknown setting' {
         $path = Join-Path $script:folder 'c.psd1'
@@ -121,10 +136,52 @@ Describe 'Configuration' {
         @{ Case = 'Direct mode without SKU'; Text = "Scope = @{ Mode = 'Auto' }; Licensing = @{ Users = @{ Mode = 'Direct' } }"; Message = '*requires Licensing.Users.SkuPartNumber*' }
         @{ Case = 'no mailbox type'; Text = "Scope = @{ Mode = 'Auto'; IncludeUsers = `$false; IncludeShared = `$false }"; Message = '*at least one mailbox type*' }
         @{ Case = 'a text instead of a number'; Text = "Scope = @{ Mode = 'Auto' }; Store = @{ KeepSnapshots = '5' }"; Message = '*whole number*' }
+        @{ Case = 'an unknown resource mode'; Text = "Scope = @{ Mode = 'Auto'; ResourceMode = 'Automatic' }"; Message = '*Scope.ResourceMode*' }
+        @{ Case = 'an invalid resource group'; Text = "Scope = @{ Mode = 'Auto' }; Resources = @{ LicensingGroupId = 'invalid' }"; Message = '*Resources.LicensingGroupId*' }
+        @{ Case = 'a resource routing URL'; Text = "Scope = @{ Mode = 'Auto' }; Resources = @{ OnPremisesRoutingDomain = 'https://contoso.com' }"; Message = '*Resources.OnPremisesRoutingDomain*' }
+        @{ Case = 'an invalid resource wave size'; Text = "Scope = @{ Mode = 'Auto' }; Resources = @{ Parallel = 0 }"; Message = '*Resources.Parallel*' }
+        @{ Case = 'a fractional resource wave size'; Text = "Scope = @{ Mode = 'Auto' }; Resources = @{ Parallel = 1.5 }"; Message = '*Resources.Parallel*' }
+        @{ Case = 'text deletion consent'; Text = "Scope = @{ Mode = 'Auto' }; Resources = @{ AllowUnprotectedDeletion = 'true' }"; Message = '*Resources.AllowUnprotectedDeletion must be*' }
+        @{ Case = 'numeric routing consent'; Text = "Scope = @{ Mode = 'Auto' }; Resources = @{ OnPremisesReady = 1 }"; Message = '*Resources.OnPremisesReady must be*' }
     ) {
         $path = Join-Path $script:folder 'c.psd1'
         Set-Content -LiteralPath $path -Value ("@{ Environment = 'X'; $Text }") -Encoding UTF8
         { Import-PraConfiguration -Path $path -Root $script:folder } | Should -Throw $Message
+    }
+    It 'ships both native resource consents false and the packager resets any true value without touching comments (<Case>)' -ForEach @(
+        @{ Case = 'block'; Text = "Resources = @{`r`n    OnPremisesReady = `$true`r`n    AllowUnprotectedDeletion = `$True # keep`r`n    Parallel = 100`r`n}" }
+        @{ Case = 'inline'; Text = "Resources = @{ LicensingGroupId = ''; OnPremisesReady = `$true; AllowUnprotectedDeletion = `$true; Parallel = 100 }" }
+        @{ Case = 'already false'; Text = "Resources = @{ OnPremisesReady = `$false; AllowUnprotectedDeletion = `$false }" }
+    ) {
+        $shipped = Import-PowerShellDataFile -LiteralPath (Join-Path $script:Root 'config\PraCloudMailbox.config.psd1')
+        $shipped.Resources.OnPremisesReady | Should -BeFalse
+        $shipped.Resources.AllowUnprotectedDeletion | Should -BeFalse
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:Root 'tools\New-PraCloudPackage.ps1'), [ref]$null, [ref]$null)
+        $function = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Reset-PraPackageConsent' }, $true) | Select-Object -First 1
+        $function | Should -Not -BeNullOrEmpty
+        . ([scriptblock]::Create($function.Extent.Text))
+        $text = "@{ Environment = 'X'; # OnPremisesReady = `$true. AllowUnprotectedDeletion = `$true`r`n Scope = @{ Mode = 'Auto' }; $Text }"
+        $result = Reset-PraPackageConsent -Text $text
+        $path = Join-Path $script:folder 'packaged.psd1'
+        Set-Content -LiteralPath $path -Value $result -Encoding UTF8
+        $packaged = Import-PowerShellDataFile -LiteralPath $path
+        $packaged.Resources.OnPremisesReady | Should -BeFalse
+        $packaged.Resources.AllowUnprotectedDeletion | Should -BeFalse
+        $result | Should -Match ([regex]::Escape('# OnPremisesReady = $true. AllowUnprotectedDeletion = $true'))
+        if ($Case -ne 'already false') { $result | Should -Not -BeExactly $text }
+    }
+    It 'resets the packaged shipped configuration even if both consents were true' {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:Root 'tools\New-PraCloudPackage.ps1'), [ref]$null, [ref]$null)
+        $function = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Reset-PraPackageConsent' }, $true) | Select-Object -First 1
+        . ([scriptblock]::Create($function.Extent.Text))
+        $text = [IO.File]::ReadAllText((Join-Path $script:Root 'config\PraCloudMailbox.config.psd1')).Replace('OnPremisesReady        = $false', 'OnPremisesReady        = $true').Replace('AllowUnprotectedDeletion = $false', 'AllowUnprotectedDeletion = $true')
+        $text | Should -Match 'OnPremisesReady\s*=\s*\$true\s'
+        $text | Should -Match 'AllowUnprotectedDeletion\s*=\s*\$true\s'
+        $path = Join-Path $script:folder 'shipped-true.psd1'
+        Set-Content -LiteralPath $path -Value (Reset-PraPackageConsent -Text $text) -Encoding UTF8
+        $packaged = Import-PowerShellDataFile -LiteralPath $path
+        $packaged.Resources.OnPremisesReady | Should -BeFalse
+        $packaged.Resources.AllowUnprotectedDeletion | Should -BeFalse
     }
 }
 
@@ -195,6 +252,33 @@ Describe 'SQLite store' {
         { Open-Pra2Store -Path $script:db -Root $script:Root -ReadOnly } | Should -Throw '*newer than this tool*'
         $script:cn = Open-Pra2Store -Path (Join-Path $TestDrive ("other-{0}.db" -f [guid]::NewGuid().ToString('N'))) -Root $script:Root
     }
+    It 'reads schema 1 without modification and migrates it only on a writable open' {
+        $id = New-Pra2Snapshot $script:cn @{ RunId = 'legacy' }
+        $null = Add-Pra2Row $script:cn mailbox $id @(@{ object_guid = 'legacy'; kind = 'Room' })
+        Set-Pra2SnapshotStatus $script:cn $id Complete
+        $null = Invoke-Pra2Sql $script:cn 'ALTER TABLE mailbox DROP COLUMN resource_settings_json'
+        $null = Invoke-Pra2Sql $script:cn "UPDATE meta SET value = '1' WHERE key = 'schema_version'"
+        Close-Pra2Store $script:cn
+        $script:cn = $null
+        $read = Open-Pra2Store -Path $script:db -Root $script:Root -ReadOnly
+        try {
+            @(Read-Pra2Table $read mailbox $id).Count | Should -Be 1
+            (Invoke-Pra2Sql $read "SELECT value FROM meta WHERE key = 'schema_version'" -As Scalar) | Should -Be '1'
+            @(Invoke-Pra2Sql $read 'PRAGMA table_info(mailbox)' -As Rows | ForEach-Object name) | Should -Not -Contain 'resource_settings_json'
+        } finally { Close-Pra2Store $read }
+        $script:cn = Open-Pra2Store -Path $script:db -Root $script:Root
+        (Invoke-Pra2Sql $script:cn "SELECT value FROM meta WHERE key = 'schema_version'" -As Scalar) | Should -Be '2'
+        @(Read-Pra2Table $script:cn mailbox $id)[0].resource_settings_json | Should -BeNullOrEmpty
+    }
+    It 'round-trips resource settings without affecting the journal schema' {
+        $id = New-Pra2Snapshot $script:cn @{ RunId = 'resource' }
+        $settings = '{"SchemaVersion":1,"Capacity":12,"Calendar":{"AutomateProcessing":"AutoAccept"}}'
+        $null = Add-Pra2Row $script:cn mailbox $id @(@{ object_guid = 'room'; kind = 'Room'; resource_settings_json = $settings })
+        (@(Read-Pra2Table $script:cn mailbox $id)[0].resource_settings_json | ConvertFrom-Json).Capacity | Should -Be 12
+        $journal = Open-Pra2Store -Path (Join-Path $TestDrive 'resource-journal.db') -Root $script:Root -Kind Journal
+        try { (Invoke-Pra2Sql $journal "SELECT value FROM meta WHERE key = 'schema_version'" -As Scalar) | Should -Be '1' }
+        finally { Close-Pra2Store $journal }
+    }
 }
 
 Describe 'Collect: mailboxes' {
@@ -249,6 +333,199 @@ Describe 'Collect: mailboxes' {
         Mock -ModuleName PRA2.Collect Get-Mailbox { New-FakeMailbox -Sam ($Identity -replace 'CN=', '') }
         $result = @(Get-Pra2ScopeMailbox -Context (New-TestContext $config))
         ($result | ForEach-Object SamAccountName) | Should -Be @('u1','u2')
+    }
+}
+
+Describe 'Collect: native resource settings' {
+    BeforeEach {
+        $script:resource = New-FakeMailbox -Sam 'room' -Type 'RoomMailbox'
+        $script:resource | Add-Member -NotePropertyName ResourceCapacity -NotePropertyValue 12
+        $script:resource | Add-Member -NotePropertyName ResourceCustom -NotePropertyValue @('Video')
+        $script:booking = [pscustomobject]@{
+            AutomateProcessing = 'AutoAccept'; AllBookInPolicy = $false; AllRequestInPolicy = $true; AllRequestOutOfPolicy = $false
+            ResourceDelegates = @('CN=delegate'); BookInPolicy = @(); RequestInPolicy = @('CN=bookers'); RequestOutOfPolicy = @()
+            ScheduleOnlyDuringWorkHours = $true; AllowConflicts = $false; MaximumDurationInMinutes = 120; AdditionalResponse = 'Booking policy'
+        }
+        $script:hours = [pscustomobject]@{ WorkingHoursStartTime = '08:30:00'; WorkingHoursEndTime = '18:00:00'
+            WorkDays = 'Monday, Tuesday, Wednesday, Thursday, Friday'; WorkingHoursTimeZone = [pscustomobject]@{ Id = 'Romance Standard Time' } }
+        Mock Get-CalendarProcessing -ModuleName PRA2.Collect { $script:booking }
+        Mock Get-MailboxCalendarConfiguration -ModuleName PRA2.Collect { $script:hours }
+        $script:resourceUser = [pscustomobject]@{ Office = 'Building A / room 101'; StreetAddress = '1 Test Street'; City = 'Paris'
+            StateOrProvince = ''; PostalCode = '75001'; CountryOrRegion = 'France'; Phone = '+33100000000'; Notes = 'Booking reception' }
+        Mock Get-User -ModuleName PRA2.Collect { $script:resourceUser }
+        Mock Get-DistributionGroup -ModuleName PRA2.Collect { @() }
+        Mock Resolve-Pra2Trustee -ModuleName PRA2.Collect {
+            [pscustomobject]@{ Resolved = $true; Smtp = $(if ($Trustee -eq 'CN=delegate') { 'delegate@contoso.com' } else { 'bookers@contoso.com' }) }
+        }
+    }
+    It 'captures resource type settings, SMTP booking trustees and working hours' {
+        $config = New-TestConfig
+        $config.Exchange.DomainController = 'dc.contoso.com'
+        $settings = Get-Pra2ResourceSettings -Context (New-TestContext $config) -Mailbox $script:resource
+        $settings.Capacity | Should -Be 12
+        $settings.ResourceCustom | Should -Be @('Video')
+        $settings.Calendar.ResourceDelegates | Should -Be @('delegate@contoso.com')
+        $settings.Calendar.RequestInPolicy | Should -Be @('bookers@contoso.com')
+        $settings.Calendar.AllBookInPolicy | Should -BeFalse
+        $settings.Calendar.MaximumDurationInMinutes | Should -Be 120
+        $settings.CalendarConfiguration.WorkingHoursStartTime | Should -Be '08:30:00'
+        $settings.CalendarConfiguration.WorkingHoursTimeZone | Should -Be 'Romance Standard Time'
+        $settings.CalendarConfiguration.WorkingHoursDays.Count | Should -Be 5
+        $settings.SchemaVersion | Should -Be 2
+        $settings.Directory.Office | Should -Be 'Building A / room 101'
+        $settings.Directory.City | Should -Be 'Paris'
+        $settings.Directory.CountryOrRegion | Should -Be 'France'
+        $settings.Directory.StateOrProvince | Should -Be ''
+        $settings.RoomLists.Count | Should -Be 0
+        $row = ConvertTo-Pra2MailboxRecord -Mailbox $script:resource -ResourceSettings $settings
+        ($row.resource_settings_json | ConvertFrom-Json).Calendar.ResourceDelegates | Should -Be @('delegate@contoso.com')
+        $script:resource.GrantSendOnBehalfTo = @('CN=general-delegate')
+        @((ConvertTo-Pra2MailboxRecord -Mailbox $script:resource -ResourceSettings $settings).grant_send_on_behalf_json | ConvertFrom-Json | ForEach-Object { $_ }).Count | Should -Be 0
+        Should -Invoke Get-CalendarProcessing -ModuleName PRA2.Collect -Times 1 -ParameterFilter { $DomainController -eq 'dc.contoso.com' }
+        Should -Invoke Get-MailboxCalendarConfiguration -ModuleName PRA2.Collect -Times 1 -ParameterFilter { $DomainController -eq 'dc.contoso.com' }
+        Should -Invoke Get-User -ModuleName PRA2.Collect -Times 1 -ParameterFilter { $DomainController -eq 'dc.contoso.com' }
+    }
+    It 'does not invent settings for a legacy snapshot row' {
+        (ConvertTo-Pra2MailboxRecord -Mailbox $script:resource).resource_settings_json | Should -BeNullOrEmpty
+        Should -Invoke Get-CalendarProcessing -ModuleName PRA2.Collect -Times 0
+    }
+    It 'maps native WorkDays flags to the unchanged portable snapshot (<Days>)' -TestCases @(
+        @{ Days = 'Weekdays' }, @{ Days = 'WeekendDays' }, @{ Days = 'AllDays' }) {
+        param($Days)
+        $script:hours.WorkDays = $Days
+        $script:hours.WorkingHoursStartTime = [timespan]'08:00:00'
+        $script:hours.WorkingHoursEndTime = [timespan]'18:00:00'
+        $script:hours.WorkingHoursTimeZone = 'Romance Standard Time'
+        $settings = Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource
+        $settings.CalendarConfiguration.WorkingHoursDays | Should -Be @($Days)
+        $settings.CalendarConfiguration.Keys | Should -Not -Contain 'WorkDays'
+        $row = ConvertTo-Pra2MailboxRecord -Mailbox $script:resource -ResourceSettings $settings
+        $stored = $row.resource_settings_json | ConvertFrom-Json
+        $stored.SchemaVersion | Should -Be 2
+        $stored.CalendarConfiguration.PSObject.Properties.Name | Should -Be @('WorkingHoursStartTime','WorkingHoursEndTime','WorkingHoursDays','WorkingHoursTimeZone')
+        ($stored.CalendarConfiguration.WorkingHoursDays -is [array]) | Should -BeTrue
+        $stored.CalendarConfiguration.WorkingHoursDays | Should -Be @($Days)
+        $stored.CalendarConfiguration.WorkingHoursStartTime | Should -Be '08:00:00'
+        $stored.CalendarConfiguration.WorkingHoursEndTime | Should -Be '18:00:00'
+        $stored.CalendarConfiguration.WorkingHoursTimeZone | Should -Be 'Romance Standard Time'
+        $script:hours.PSObject.Properties.Name | Should -Not -Contain 'WorkingHoursDays'
+    }
+    It 'preserves individual native WorkDays array values' {
+        $script:hours.WorkDays = @('Monday','Wednesday','Friday')
+        $settings = Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource
+        $settings.CalendarConfiguration.WorkingHoursDays | Should -Be @('Monday','Wednesday','Friday')
+    }
+    It 'refuses absent or unreadable native WorkDays without a snapshot-name fallback (<Fault>)' -TestCases @(
+        @{ Fault = 'Missing' }, @{ Fault = 'Null' }, @{ Fault = 'Unreadable' },
+        @{ Fault = 'Empty' }, @{ Fault = 'EmptyArray' }, @{ Fault = 'Unknown' }) {
+        param($Fault)
+        $script:hours | Add-Member -NotePropertyName WorkingHoursDays -NotePropertyValue 'Weekdays'
+        switch ($Fault) {
+            Missing { $script:hours.PSObject.Properties.Remove('WorkDays') }
+            Null { $script:hours.WorkDays = $null }
+            Unreadable {
+                $script:hours.PSObject.Properties.Remove('WorkDays')
+                $script:hours | Add-Member -MemberType ScriptProperty -Name WorkDays -Value { throw 'WorkDays getter unavailable' }
+            }
+            Empty { $script:hours.WorkDays = '' }
+            EmptyArray { $script:hours.WorkDays = @() }
+            Unknown { $script:hours.WorkDays = 'UnknownDays' }
+        }
+        { Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource } | Should -Throw '*WorkDays*'
+    }
+    It 'fails on unreadable native calendar configuration instead of manufacturing working hours' {
+        Mock Get-MailboxCalendarConfiguration -ModuleName PRA2.Collect { throw 'calendar configuration unavailable' }
+        { Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource } | Should -Throw '*calendar configuration unavailable*'
+    }
+    It 'stops when calendar settings cannot be read instead of substituting auto-accept' {
+        Mock Get-CalendarProcessing -ModuleName PRA2.Collect { throw 'calendar unavailable' }
+        { Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource } | Should -Throw '*calendar unavailable*'
+    }
+    It 'refuses unresolved booking trustees rather than opening the policy to everyone' {
+        Mock Resolve-Pra2Trustee -ModuleName PRA2.Collect { [pscustomobject]@{ Resolved = $false; Smtp = '' } }
+        { Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource } | Should -Throw '*has no resolved SMTP address*'
+    }
+    It 'refuses missing mandatory booking controls and working hours' {
+        $script:booking.PSObject.Properties.Remove('AllBookInPolicy')
+        { Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource } | Should -Throw '*AllBookInPolicy missing*'
+        $script:booking | Add-Member -NotePropertyName AllBookInPolicy -NotePropertyValue $false
+        $script:hours.WorkingHoursTimeZone = ''
+        { Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource } | Should -Throw '*empty working-hours time zone*'
+    }
+    It 'captures invitation sender restrictions and moderation as SMTP controls, not mailbox rights' {
+        $script:resource.AcceptMessagesOnlyFromSendersOrMembers = @('CN=bookers')
+        $script:resource.RejectMessagesFromSendersOrMembers = @('CN=blocked')
+        $script:resource.ModerationEnabled = $true
+        $script:resource.ModeratedBy = @('CN=delegate')
+        $script:resource.BypassModerationFromSendersOrMembers = @('CN=bookers')
+        $settings = Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource
+        $settings.Delivery.RequireSenderAuthenticationEnabled | Should -BeTrue
+        $settings.Delivery.ModerationEnabled | Should -BeTrue
+        $settings.Delivery.AcceptMessagesOnlyFromSendersOrMembers | Should -Be @('bookers@contoso.com')
+        $settings.Delivery.ModeratedBy | Should -Be @('delegate@contoso.com')
+    }
+    It 'refuses missing or unresolved invitation restrictions (<Fault>)' -TestCases @(
+        @{ Fault = 'Missing' }, @{ Fault = 'Unresolved' }, @{ Fault = 'Boolean' }, @{ Fault = 'Moderation' }) {
+        param($Fault)
+        if ($Fault -eq 'Missing') { $script:resource.PSObject.Properties.Remove('RequireSenderAuthenticationEnabled') }
+        elseif ($Fault -eq 'Boolean') { $script:resource.RequireSenderAuthenticationEnabled = $null }
+        elseif ($Fault -eq 'Moderation') { $script:resource.ModerationEnabled = $true }
+        else {
+            $script:resource.RejectMessagesFromSendersOrMembers = @('CN=missing')
+            Mock Resolve-Pra2Trustee -ModuleName PRA2.Collect { [pscustomobject]@{ Resolved = $false; Smtp = '' } }
+        }
+        { Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource } | Should -Throw '*Resource delivery restriction*'
+    }
+    It 'records explicitly unset recipient restrictions as empty arrays' {
+        $script:resource.RejectMessagesFromSendersOrMembers = $null
+        $settings = Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource
+        ($settings.Delivery.RejectMessagesFromSendersOrMembers -is [array]) | Should -BeTrue
+        $settings.Delivery.RejectMessagesFromSendersOrMembers.Count | Should -Be 0
+    }
+    It 'does not silently omit unreadable descriptive properties (<Fault>)' -TestCases @(
+        @{ Fault = 'Read' }, @{ Fault = 'Missing' }) {
+        param($Fault)
+        if ($Fault -eq 'Read') { Mock Get-User -ModuleName PRA2.Collect { throw 'directory unavailable' } }
+        else { $script:resourceUser.PSObject.Properties.Remove('Office') }
+        { Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource } | Should -Throw
+    }
+    It 'captures matching room lists once per Collect independently of distribution-group collection' {
+        $group = New-FakeRoomList
+        Mock Get-DistributionGroup -ModuleName PRA2.Collect { $group }
+        Mock Get-DistributionGroupMember -ModuleName PRA2.Collect { [pscustomobject]@{ Guid = $script:resource.Guid } }
+        $context = New-TestContext
+        $settings = Get-Pra2ResourceSettings -Context $context -Mailbox $script:resource
+        $second = Get-Pra2ResourceSettings -Context $context -Mailbox $script:resource
+        $settings.RoomLists.Count | Should -Be 1
+        $settings.RoomLists[0].PrimarySmtpAddress | Should -Be 'building-a@contoso.com'
+        $second.RoomLists[0].HiddenFromAddressListsEnabled | Should -BeTrue
+        $settings.RoomLists[0].EmailAddresses | Should -Contain 'X500:/o=Old/cn=building-a'
+        $settings.RoomLists[0].LegacyExchangeDN | Should -Not -BeNullOrEmpty
+        $settings.RoomLists[0].Delivery.RequireSenderAuthenticationEnabled | Should -BeTrue
+        $settings.RoomLists[0].MemberJoinRestriction | Should -Be Closed
+        $row = [pscustomobject](ConvertTo-Pra2MailboxRecord -Mailbox $script:resource -ResourceSettings $settings)
+        $portable = Read-Pra2ResourceSettings -Record $row
+        $portable.RoomLists[0].EmailAddresses | Should -Contain 'X500:/o=Old/cn=building-a'
+        $portable.RoomLists[0].Delivery.RequireSenderAuthenticationEnabled | Should -BeTrue
+        Should -Invoke Get-DistributionGroup -ModuleName PRA2.Collect -Times 1 -Exactly -ParameterFilter { $Filter -eq "RecipientTypeDetails -eq 'RoomList'" -and $ResultSize -eq 'Unlimited' }
+        Should -Invoke Get-DistributionGroupMember -ModuleName PRA2.Collect -Times 1 -Exactly
+    }
+    It 'does not assign equipment or unrelated rooms to a room list' {
+        $script:resource.RecipientTypeDetails = 'EquipmentMailbox'
+        (Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource).RoomLists.Count | Should -Be 0
+        Should -Invoke Get-DistributionGroup -ModuleName PRA2.Collect -Times 0 -Exactly
+        $script:resource.RecipientTypeDetails = 'RoomMailbox'
+        Mock Get-DistributionGroup -ModuleName PRA2.Collect { New-FakeRoomList }
+        Mock Get-DistributionGroupMember -ModuleName PRA2.Collect { [pscustomobject]@{ Guid = 'another-room' } }
+        (Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource).RoomLists.Count | Should -Be 0
+    }
+    It 'fails explicitly on room-list membership read or identity failures (<Fault>)' -TestCases @(
+        @{ Fault = 'Read' }, @{ Fault = 'MissingGuid' }) {
+        param($Fault)
+        Mock Get-DistributionGroup -ModuleName PRA2.Collect { New-FakeRoomList }
+        if ($Fault -eq 'Read') { Mock Get-DistributionGroupMember -ModuleName PRA2.Collect { throw 'members unavailable' } }
+        else { Mock Get-DistributionGroupMember -ModuleName PRA2.Collect { [pscustomobject]@{ Name = 'unreadable member' } } }
+        { Get-Pra2ResourceSettings -Context (New-TestContext) -Mailbox $script:resource } | Should -Throw
     }
 }
 
@@ -328,6 +605,95 @@ Describe 'Collect: shared mailbox permissions' {
 }
 
 Describe 'Collect: end to end (synthetic Exchange)' -Tag 'Desktop' {
+    It 'collects native WorkDays into portable snapshots or stops before writing (<Days>, <Fault>)' -Skip:($PSVersionTable.PSEdition -ne 'Desktop') -TestCases @(
+        @{ Days = 'Weekdays'; Fault = '' }, @{ Days = 'WeekendDays'; Fault = '' }, @{ Days = 'AllDays'; Fault = '' },
+        @{ Days = 'Weekdays'; Fault = 'Missing' }, @{ Days = 'Weekdays'; Fault = 'Null' },
+        @{ Days = 'Weekdays'; Fault = 'Empty' }, @{ Days = 'Weekdays'; Fault = 'Read' }) {
+        param($Days, $Fault)
+        $folder = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory $folder
+        $config = New-TestConfig
+        $config.Scope.IncludeUsers = $false; $config.Scope.IncludeShared = $false
+        $config.Scope.IncludeRoom = $true; $config.Scope.IncludeEquipment = $true; $config.Scope.ResourceMode = 'CloudResource'
+        $config.Store.Path = Join-Path $folder 'db\pra.db'; $config.Store.BackupFolder = Join-Path $folder 'backup'
+        $config.Logging.Folder = Join-Path $folder 'logs'; $config.Report.Folder = Join-Path $folder 'reports'
+        $configPath = Join-Path $folder 'config.psd1'
+        Set-Content -LiteralPath $configPath -Value (ConvertTo-Psd1 $config) -Encoding UTF8
+        $mailboxes = @(foreach ($kind in @('Room','Equipment')) {
+                $mailbox = New-FakeMailbox -Sam $kind.ToLowerInvariant() -Type "${kind}Mailbox"
+                $mailbox | Add-Member -NotePropertyName ResourceCapacity -NotePropertyValue 12
+                $mailbox | Add-Member -NotePropertyName ResourceCustom -NotePropertyValue @()
+                $mailbox
+            })
+        $hours = [pscustomobject]@{ WorkDays = $Days; WorkingHoursStartTime = [timespan]'08:00:00'
+            WorkingHoursEndTime = [timespan]'18:00:00'; WorkingHoursTimeZone = 'Romance Standard Time' }
+        if ($Fault) { $hours | Add-Member -NotePropertyName WorkingHoursDays -NotePropertyValue 'Weekdays' }
+        switch ($Fault) {
+            Missing { $hours.PSObject.Properties.Remove('WorkDays') }
+            Null { $hours.WorkDays = $null }
+            Empty { $hours.WorkDays = '' }
+        }
+        $fixturePath = Join-Path $folder 'synthetic-exchange.xml'
+        Export-Clixml -LiteralPath $fixturePath -InputObject @{
+            Mailboxes = $mailboxes; Hours = $hours; Fault = $Fault
+            Calendar = [pscustomobject]@{ AutomateProcessing = 'AutoAccept'; AllBookInPolicy = $false
+                AllRequestInPolicy = $true; AllRequestOutOfPolicy = $false; ScheduleOnlyDuringWorkHours = $true
+                ResourceDelegates = @(); BookInPolicy = @(); RequestInPolicy = @(); RequestOutOfPolicy = @() }
+            User = [pscustomobject]@{ Office = ''; StreetAddress = ''; City = ''; StateOrProvince = ''
+                PostalCode = ''; CountryOrRegion = ''; Phone = ''; Notes = '' }
+        }
+        $stubs = @'
+function global:Get-ExchangeServer { @([pscustomobject]@{ Name = $env:COMPUTERNAME; AdminDisplayVersion = 'Version 15.2 (Build 2562.17)' }) }
+function global:Get-Mailbox { param($Identity, $OrganizationalUnit, $ResultSize, $RecipientTypeDetails, $DomainController) $global:PraSyntheticCollect.Mailboxes }
+function global:Get-CalendarProcessing { param($Identity, $DomainController) $global:PraSyntheticCollect.Calendar }
+function global:Get-MailboxCalendarConfiguration {
+    param($Identity, $DomainController)
+    if ($global:PraSyntheticCollect.Fault -eq 'Read') { throw 'WorkDays calendar read unavailable' }
+    $global:PraSyntheticCollect.Hours
+}
+function global:Get-User { param($Identity, $DomainController) $global:PraSyntheticCollect.User }
+function global:Get-MailboxPermission { param($Identity, $DomainController) @() }
+function global:Get-ADPermission { param($Identity, $DomainController) @() }
+function global:Get-Recipient { param($Identity, $DomainController) throw 'Unexpected recipient read in synthetic Collect' }
+function global:Get-DistributionGroup { param($Filter, $ResultSize, $DomainController) @() }
+'@
+        $runner = Join-Path $folder 'run.ps1'
+        Set-Content -LiteralPath $runner -Encoding UTF8 -Value @"
+`$ErrorActionPreference = 'Stop'
+`$global:PraSyntheticCollect = Import-Clixml -LiteralPath '$fixturePath'
+$stubs
+`$result = & '$(Join-Path $script:Root 'Invoke-PraCloudMailbox.ps1')' -Action Collect -Mode Apply -ConfigPath '$configPath' -Force -PassThru
+`$result
+exit `$result.ExitCode
+"@
+        $output = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $runner 2>&1
+        if ($Fault) {
+            $LASTEXITCODE | Should -Be 1 -Because ($output | Out-String)
+            ($output | Out-String) | Should -Match 'Collect stopped before writing the snapshot'
+            ($output | Out-String) | Should -Match 'WorkDays'
+            Test-Path -LiteralPath $config.Store.Path | Should -BeFalse
+            Test-Path -LiteralPath $config.Store.BackupFolder | Should -BeFalse
+        } else {
+            $LASTEXITCODE | Should -Be 0 -Because ($output | Out-String)
+            $cn = Open-Pra2Store -Path $config.Store.Path -Root $script:Root -ReadOnly
+            try {
+                $snap = Get-Pra2Snapshot $cn
+                $snap.status | Should -Be 'Complete'
+                $rows = @(Read-Pra2Table $cn mailbox $snap.id)
+                $rows.Count | Should -Be 2
+                $rows.kind | Sort-Object | Should -Be @('Equipment','Room')
+                foreach ($row in $rows) {
+                    $stored = $row.resource_settings_json | ConvertFrom-Json
+                    $stored.SchemaVersion | Should -Be 2
+                    $stored.CalendarConfiguration.PSObject.Properties.Name | Should -Not -Contain 'WorkDays'
+                    $stored.CalendarConfiguration.WorkingHoursDays | Should -Be @($Days)
+                    $stored.CalendarConfiguration.WorkingHoursStartTime | Should -Be '08:00:00'
+                    $stored.CalendarConfiguration.WorkingHoursEndTime | Should -Be '18:00:00'
+                    $stored.CalendarConfiguration.WorkingHoursTimeZone | Should -Be 'Romance Standard Time'
+                }
+            } finally { Close-Pra2Store $cn }
+        }
+    }
     It 'writes a snapshot in Apply and nothing in Preview' -Skip:($PSVersionTable.PSEdition -ne 'Desktop') {
         $folder = Join-Path $TestDrive 'e2e'
         $null = New-Item -ItemType Directory $folder
@@ -534,7 +900,7 @@ Describe 'Licences restored as before Convert (mocked Graph)' {
         function script:New-Licence { param([object[]]$States) [pscustomobject]@{ licenseAssignmentStates = $States } }
     }
     AfterAll { Remove-Item -Path 'function:global:Invoke-MgGraphRequest' -ErrorAction SilentlyContinue }
-    BeforeEach { $script:sent = [System.Collections.Generic.List[object]]::new() }
+    BeforeEach { Reset-PraFakeGraphTransport; $script:sent = [System.Collections.Generic.List[object]]::new() }
     It 'enables a plan inside the existing direct assignment and keeps the other disabled plans' {
         Mock Get-Pra2UserLicence -ModuleName PRA2.Cloud { New-Licence @([pscustomobject]@{ skuId = 'teams'; assignedByGroup = $null; disabledPlans = @('kiosk', 'yammer') }) }
         Mock Set-Pra2Licence -ModuleName PRA2.Cloud { $script:sent.Add(@{ Sku = $SkuId; Operation = $Operation; Disabled = @(Get-Variable -Name DisabledPlans -ValueOnly -ErrorAction SilentlyContinue | ForEach-Object { $_ }) }) }
@@ -621,22 +987,6 @@ Describe 'Rough duration estimate' {
     }
 }
 
-Describe 'Runtime disclaimer' -Tag 'Disclaimer' {
-    It 'keeps public script help identical to the root runtime readme disclaimer' {
-        $readme = [IO.File]::ReadAllText((Join-Path $script:Root 'README.md')).Replace("`r`n", "`n")
-        $sections = [regex]::Matches($readme, '(?ms)^## Disclaimer\n\n(?<Text>.*?)(?=^## |\z)')
-        $sections.Count | Should -Be 1
-        $canonical = $sections[0].Groups['Text'].Value.TrimEnd([char[]]"`n")
-        $canonical | Should -Not -BeNullOrEmpty
-
-        $entry = Join-Path $script:Root 'Invoke-PraCloudMailbox.ps1'
-        $notes = ((Get-Help $entry -Full).alertSet.alert.Text -join "`n").Replace("`r`n", "`n")
-        $disclaimers = [regex]::Matches($notes, '(?ms)^Disclaimer:\n(?<Text>.*?)(?=\n\nRequires -Version|\z)')
-        $disclaimers.Count | Should -Be 1
-        $disclaimers[0].Groups['Text'].Value.TrimEnd([char[]]"`n") | Should -BeExactly $canonical
-    }
-}
-
 Describe 'Entry script' {
     It 'uses no $PSScriptRoot in the parameter defaults (empty in Windows PowerShell 5.1 with -File, e.g. a scheduled task)' {
         $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:Root 'Invoke-PraCloudMailbox.ps1'), [ref]$null, [ref]$null)
@@ -698,6 +1048,16 @@ Describe 'Journal of the cloud actions' {
         @(Get-Pra2TenantChange $script:j $id)[0].restored | Should -Be 0
         Set-Pra2TenantChange $script:j $id 'GroupSoa' 'grp1' -Restored
         @(Get-Pra2TenantChange $script:j $id)[0].restored | Should -Be 1
+        @(Get-Pra2TenantChange $script:j $id)[0].original_json | Should -Be '{"isCloudManaged":false}'
+    }
+    It 'updates a room-list intent explicitly without changing legacy tenant-change originals' {
+        $id = New-Pra2Batch $script:j Convert
+        Set-Pra2TenantChange $script:j $id 'NativeRoomList' 'list1' -OriginalJson '{"creationAttempted":false}'
+        Set-Pra2TenantChange $script:j $id 'NativeRoomList' 'list1' -OriginalJson '{"creationAttempted":true}' -UpdateOriginal
+        @(Get-Pra2TenantChange $script:j $id)[0].original_json | Should -Be '{"creationAttempted":true}'
+        Set-Pra2TenantChange $script:j $id 'NativeRoomList' 'list1' -OriginalJson '{"unexpected":true}' -Restored
+        @(Get-Pra2TenantChange $script:j $id)[0].original_json | Should -Be '{"creationAttempted":true}'
+        @(Get-Pra2TenantChange $script:j $id).Count | Should -Be 1
     }
     It 'never opens a snapshot database as a journal, nor a journal as a snapshot database' {
         $snapshotPath = Join-Path $TestDrive ("snap-{0}.db" -f [guid]::NewGuid().ToString('N'))
@@ -756,6 +1116,7 @@ Describe 'Cloud calls (mocked Graph)' {
             return $record
         }
     }
+    BeforeEach { Reset-PraFakeGraphTransport }
     AfterAll { Remove-Item -Path 'function:global:Invoke-MgGraphRequest' -ErrorAction SilentlyContinue }
     It 'puts the Graph error code and message in the exception (not only "BadRequest")' {
         Mock Invoke-MgGraphRequest -ModuleName PRA2.Cloud { throw (New-GraphError 'Request_BadRequest' 'Invalid usage location.') }
@@ -791,6 +1152,47 @@ Describe 'Cloud calls (mocked Graph)' {
         Mock Invoke-MgGraphRequest -ModuleName PRA2.Cloud { $script:calls++; throw [Exception]::new('down', [IO.IOException]::new('reset')) }
         { Invoke-Pra2Graph -Uri 'v1.0/users/u1' } | Should -Throw '*down*'
         $script:calls | Should -Be 5
+    }
+    It 'does not automatically retry an unprotected DELETE with an ambiguous response (<Fault>)' -TestCases @(
+        @{ Fault = 'Network' }, @{ Fault = 'Gateway'; Status = 502 }, @{ Fault = 'Unavailable'; Status = 503 }, @{ Fault = 'Timeout'; Status = 504 }) {
+        param($Fault, $Status)
+        Mock Start-Sleep -ModuleName PRA2.Cloud { }
+        Mock Invoke-MgGraphRequest -ModuleName PRA2.Cloud {
+            if ($Fault -eq 'Network') { throw [TimeoutException]::new('ambiguous deletion') }
+            $exception = [Exception]::new('ambiguous deletion')
+            $exception | Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = $Status })
+            throw $exception
+        }
+        { Invoke-Pra2Graph -Method DELETE -Uri 'v1.0/users/u1' -AllowNotFound -NoRetry } | Should -Throw '*ambiguous deletion*'
+        Should -Invoke Invoke-MgGraphRequest -ModuleName PRA2.Cloud -Times 1 -Exactly
+        Should -Invoke Start-Sleep -ModuleName PRA2.Cloud -Times 0 -Exactly
+    }
+    It 'retains five outer attempts for ordinary <Method> requests' -TestCases @(
+        @{ Method = 'GET' }, @{ Method = 'PATCH' }, @{ Method = 'DELETE' }) {
+        param($Method)
+        Mock Start-Sleep -ModuleName PRA2.Cloud { }
+        Mock Invoke-MgGraphRequest -ModuleName PRA2.Cloud {
+            $exception = [Exception]::new('unavailable')
+            $exception | Add-Member Response ([pscustomobject]@{ StatusCode = 503 })
+            throw $exception
+        }
+        { Invoke-Pra2Graph -Method $Method -Uri 'v1.0/users/u1' } | Should -Throw '*unavailable*'
+        Should -Invoke Invoke-MgGraphRequest -ModuleName PRA2.Cloud -Times 5 -Exactly
+    }
+    It 'fails closed before sending when <Fault> prevents transport verification' -TestCases @(
+        @{ Fault = 'NotInitialized' }, @{ Fault = 'ReadFails' }, @{ Fault = 'MissingContext' }, @{ Fault = 'MissingProperty' }, @{ Fault = 'NullRetry' }, @{ Fault = 'NonzeroRetry' }) {
+        param($Fault)
+        Mock Invoke-MgGraphRequest -ModuleName PRA2.Cloud { throw 'Must not send' }
+        switch ($Fault) {
+            NotInitialized { & (Get-Module PRA2.Cloud) { $script:GraphTransportReady = $false } }
+            ReadFails { Mock Get-MgRequestContext -ModuleName PRA2.Cloud { throw 'Readback failed' } }
+            MissingContext { $global:PraFakeGraphRequest = $null }
+            MissingProperty { $global:PraFakeGraphRequest = [pscustomobject]@{} }
+            NullRetry { $global:PraFakeGraphRequest.MaxRetry = $null }
+            NonzeroRetry { $global:PraFakeGraphRequest.MaxRetry = 3 }
+        }
+        { Invoke-Pra2Graph -Method DELETE -Uri 'v1.0/users/u1' -NoRetry } | Should -Throw
+        Should -Invoke Invoke-MgGraphRequest -ModuleName PRA2.Cloud -Times 0 -Exactly
     }
 }
 

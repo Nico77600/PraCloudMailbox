@@ -25,6 +25,15 @@
                 Shared mailboxes: case hold, scheduler paused, identity deleted (the mailbox becomes inactive),
                 deleted permanently, recreated from AD by a delta sync.
 
+    Opt-in unsynchronised native rooms/equipment (CloudResource): Collect captures metadata, room lists,
+    booking/delivery controls and work hours, never old contents or general mailbox rights. Convert creates
+    required lists first, then each unlicensed, disabled-sign-in resource and its membership. New journals
+    use protectionMode None: Recover has NO hold/NO inactive copy and does NOT preserve cloud-created
+    reservations/messages. Export/reconcile and explicitly set Resources.AllowUnprotectedDeletion and
+    OnPremisesReady to $true before deleting only the journal-owned cloud identity. Soft-deleted addresses
+    remain Pending; no purge or hold/licence removal. Ambiguous deletion requests and restored identities
+    are never automatically deleted again. Old protected journals and legacy synced paths are unchanged.
+
     Every run starts in Preview. Collect -Mode Apply writes the snapshot (nothing is ever written to
     Exchange). Check is always read-only. Convert and Recover -Mode Apply ask one confirmation (or none
     with -Force); an interrupted batch is resumed with the same -Batch.
@@ -55,7 +64,8 @@
     Configuration file. Default: config\PraCloudMailbox.config.psd1 next to this script.
 
 .PARAMETER Force
-    No confirmation prompt. Collect asks one only before writing a snapshot of ONE object (-Identity -Mode Apply).
+    No confirmation prompt; never bypasses native-resource deletion consent or routing guards.
+    Collect asks one only before writing a snapshot of ONE object (-Identity -Mode Apply).
 
 .PARAMETER PassThru
     Also returns the result of the run as an object (Status, ExitCode, counters, file paths).
@@ -95,19 +105,11 @@
 
 .NOTES
     Author     : Nicolas Fabert
-    Version    : 1.2.0
+    Version    : 1.3.0 (UNRELEASED)
     Requires   : Collect: Windows PowerShell 5.1 and the Exchange cmdlets (local or remote).
                  Check, Convert, Recover: PowerShell 7.4+, Microsoft.Graph.Authentication, ExchangeOnlineManagement 3.10+.
     Exit codes : 0 = done, 1 = failed (or an object is not ready), 2 = done, next step required.
     Documentation : docs\PraCloudMailbox-UserGuide.md (user guide), docs\PraCloudMailbox-Guide.md (developer guide)
-
-    Disclaimer:
-    This Script is a Personal project.
-    It's provided "AS-IS". It's not an official Microsoft product so no support can be expected from Microsoft.
-
-    As any scripts you must read carefully the documentation and test it first in a Test environment before any run in Production.
-
-    The tool changes production objects in Entra ID and Exchange Online: run the preview, review the plan, keep the journal and test the whole cycle in a lab before using it in a real disaster.
 #>
 #Requires -Version 5.1
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'Force', Justification = 'Read by Invoke-PraCollect (script scope).')]
@@ -129,7 +131,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$toolVersion = '1.2.0'
+$toolVersion = '1.3.0'
 # Not a parameter default: Windows PowerShell 5.1 leaves $PSScriptRoot empty in param() defaults when run with -File (scheduled task).
 if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot 'config\PraCloudMailbox.config.psd1' }
 
@@ -299,7 +301,19 @@ function Invoke-PraCollect {
             try { $statistics = Get-MailboxStatistics -Identity ([string]$mailbox.DistinguishedName) -WarningAction SilentlyContinue -ErrorAction Stop }
             catch { Write-PraLog -Context $context -Message ("Statistics of {0}: {1}" -f $mailbox.PrimarySmtpAddress, $_.Exception.Message) -Level Detail }
         }
-        [void]$records.Add((ConvertTo-Pra2MailboxRecord -Mailbox $mailbox -Statistics $statistics))
+        $recordParameters = @{ Mailbox = $mailbox; Statistics = $statistics }
+        if ([string]$mailbox.RecipientTypeDetails -in @('RoomMailbox','EquipmentMailbox') -and
+            [string](Get-PraValue $config.Scope 'ResourceMode' 'SynchronizedShared') -eq 'CloudResource') {
+            $context.CurrentOperation = 'Get-ResourceSettings'
+            try {
+                $resourceSettings = Get-Pra2ResourceSettings -Context $context -Mailbox $mailbox
+                if (-not $resourceSettings) { throw 'No resource settings were returned.' }
+                $recordParameters.ResourceSettings = $resourceSettings
+            } catch {
+                throw ("Collect stopped before writing the snapshot: resource settings of {0} could not be collected. Booking settings must not be silently omitted or broadened. {1}" -f $mailbox.PrimarySmtpAddress, $_.Exception.Message)
+            }
+        }
+        [void]$records.Add((ConvertTo-Pra2MailboxRecord @recordParameters))
     }
     $context.CurrentIdentity = ''
     $byKind = $records | Group-Object { $_.kind }
@@ -312,11 +326,14 @@ function Invoke-PraCollect {
     $permissions = [System.Collections.Generic.List[object]]::new()
     $members = [System.Collections.Generic.List[object]]::new()
     $permissionText = @{}
-    $sharedRecords = @($records | Where-Object { $_.kind -ne 'User' })
+    $sharedRecords = @($records | Where-Object { $_.kind -ne 'User' -and -not (
+                $_.kind -in @('Room','Equipment') -and [string](Get-PraValue $config.Scope 'ResourceMode' 'SynchronizedShared') -eq 'CloudResource') })
     if ($collect.SharedPermissions -and $sharedRecords.Count) {
         Write-PraStep -Context $context -Title 'Shared mailbox permissions' -Icon Key
         $context.CurrentOperation = 'Get-SharedPermission'
-        foreach ($mailbox in @($mailboxes | Where-Object { [string]$_.RecipientTypeDetails -ne 'UserMailbox' })) {
+        $permissionMailboxGuids = @{}
+        foreach ($record in $sharedRecords) { $permissionMailboxGuids[[string]$record.object_guid] = $true }
+        foreach ($mailbox in @($mailboxes | Where-Object { $permissionMailboxGuids.ContainsKey([string]$_.Guid) })) {
             $context.CurrentIdentity = [string]$mailbox.PrimarySmtpAddress
             $result = Get-Pra2SharedPermission -Context $context -Mailbox $mailbox
             foreach ($row in $result.Permissions) { [void]$permissions.Add($row) }
@@ -462,6 +479,8 @@ function Invoke-PraCheck {
 
     $data = Read-PraSnapshotData -Id $Snapshot -Verb 'check'
     $records = @($data.Records); $permissions = @($data.Permissions); $members = @($data.Members)
+    $context.NativeResourceScope = @($records | Where-Object { Test-Pra2NativeResource -Config $config -Record $_ }).Count -gt 0
+    $nativeOnly = $records.Count -gt 0 -and @($records | Where-Object { -not (Test-Pra2NativeResource -Config $config -Record $_) }).Count -eq 0
 
     Write-PraStep -Context $context -Title 'Microsoft 365 connection' -Icon Cloud
     $context.CurrentOperation = 'Connect-Cloud'
@@ -471,13 +490,15 @@ function Invoke-PraCheck {
 
     Write-PraStep -Context $context -Title 'Tenant prerequisites' -Icon Key
     $context.CurrentOperation = 'Tenant-Facts'
-    $tenant = Get-Pra2TenantFact -Context $context
+    $skipUserGroup = @($records | Where-Object { $_.kind -eq 'User' }).Count -eq 0 -and @($records | Where-Object { Test-Pra2NativeResource -Config $config -Record $_ }).Count -gt 0
+    $tenant = Get-Pra2TenantFact -Context $context -SkipUserGroup:$skipUserGroup -NativeOnly:$nativeOnly
     $roles = @(Get-Pra2GraphRole)
     # The state of every object first: the licence units really needed depend on what each one already holds.
     if (Test-PraStop) { throw 'Check stopped by the operator before reading the cloud state.' }
     $states = Read-PraCloudStates -Records $records
     $need = Get-PraLicenceNeed -Entries @($records | ForEach-Object { $s = $states[[string]$_.object_guid]; [pscustomobject]@{ Record = $_; State = $(if ($s -is [System.Management.Automation.ErrorRecord]) { $null } else { $s }); Step = '' } }) -Tenant $tenant
-    $tenantFindings = Test-Pra2TenantReadiness -Config $config -Roles $roles -Tenant $tenant -UserCount $need.Users -SharedCount $need.Shared
+    $tenantFindings = @(Test-Pra2TenantReadiness -Config $config -Roles $roles -Tenant $tenant -UserCount $need.Users -SharedCount $need.Shared -ResourceCount $need.Resources -SkipUserLicensing:$need.SkipUserLicensing -NativeOnly:$nativeOnly)
+    $tenantFindings += @(Get-PraResourceLicenceFinding -Need $need -Tenant $tenant)
     foreach ($finding in $tenantFindings) {
         switch ($finding.Level) {
             'Error' { Write-PraLog -Context $context -Message $finding.Message -Level Error }
@@ -500,7 +521,10 @@ function Invoke-PraCheck {
             $state = $states[[string]$record.object_guid]
             if ($state -is [System.Management.Automation.ErrorRecord]) { throw $state.Exception }
             $findings = @(Get-Pra2Readiness -Config $config -Record $record -State $state -Skus @($tenant.Skus))
-            if ($record.kind -ne 'User') {
+            if (Get-PraValue $state 'NativeResource' $false) {
+                try { Test-Pra2ResourceConfigurationReadiness -Record $record -AllowRoomListCreation -RoomListPlan @((Read-Pra2ResourceSettings $record).RoomLists) }
+                catch { $findings += [pscustomobject]@{ Level = 'Error'; Field = 'ExchangeOnline'; Code = 'RESOURCE_CONFIGURATION_REQUIRED'; Message = $_.Exception.Message } }
+            } elseif ($record.kind -ne 'User') {
                 $subset = Get-PraPermissionSubset -Index $permissionIndex -MailboxGuid ([string]$record.object_guid)
                 $findings += @(Get-Pra2TrusteeFinding -Record $record -Permissions $subset.Permissions -Members $subset.Members -Lookup $lookup)
             }
@@ -584,11 +608,18 @@ function Get-PraLicenceNeed {
             'Direct' { $Tenant.Skus | Where-Object { [string]$_.skuPartNumber -eq [string]$config.Licensing.Users.SkuPartNumber } | ForEach-Object { [string]$_.skuId } }
         })
     $sharedSkus = @($Tenant.Skus | Where-Object { [string]$_.skuPartNumber -eq [string]$config.Licensing.Shared.SkuPartNumber } | ForEach-Object { [string]$_.skuId })
-    $users = 0; $shared = 0
+    $users = 0; $shared = 0; $resources = 0; $resourceGroups = @{}
     foreach ($entry in $Entries) {
         $user = if ($entry.State) { $entry.State.User } else { $null }
         $held = @(if ($user -and $user.PSObject.Properties['assignedLicenses']) { $user.assignedLicenses | ForEach-Object { [string]$_.skuId } })
-        if ($entry.Record.kind -eq 'User') {
+        if ((Get-PraValue $entry.State 'NativeResource' $false) -or (Test-Pra2NativeResource -Config $config -Record $entry.Record)) {
+            $intent = if ($context.ContainsKey('ResourceJournal')) { Get-Pra2ResourceIntent -Item $context.ResourceJournal[[string]$entry.Record.object_guid] } else { $null }
+            if ((Get-Pra2ResourceProtectionMode $intent) -eq 'None') { continue }
+            $groupId = [string]$intent.licensingGroupId
+            if (-not $resourceGroups.ContainsKey($groupId)) { $resourceGroups[$groupId] = 0 }
+            $licensed = $user -and @($user.licenseAssignmentStates | Where-Object { [string]$_.assignedByGroup -eq $groupId -and [string]$_.state -eq 'Active' }).Count
+            if (-not $licensed) { $resources++; $resourceGroups[$groupId]++ }
+        } elseif ($entry.Record.kind -eq 'User') {
             if ($config.Licensing.Users.Mode -eq 'Kiosk' -or @($held | Where-Object { $_ -in $userSkus }).Count) { continue }
             $users++
         } else {
@@ -597,7 +628,40 @@ function Get-PraLicenceNeed {
             $shared++
         }
     }
-    return [pscustomobject]@{ Users = $users; Shared = $shared }
+    return [pscustomobject]@{ Users = $users; Shared = $shared; Resources = $resources; ResourceGroups = $resourceGroups
+        SkipUserLicensing = (@($Entries | Where-Object { $_.Record.kind -eq 'User' }).Count -eq 0 -and @($Entries | Where-Object {
+                    (Get-PraValue $_.State 'NativeResource' $false) -or (Test-Pra2NativeResource -Config $config -Record $_.Record)
+                }).Count -gt 0) }
+}
+
+function Get-PraResourceLicenceFinding {
+    param([object]$Need, [object]$Tenant)
+    $groups = @{}; $demand = @{}
+    $userSkus = @(switch ($context.Config.Licensing.Users.Mode) {
+            Group { if ($Tenant.LicenceGroup) { $Tenant.LicenceGroup.assignedLicenses | ForEach-Object { [string]$_.skuId } } }
+            Direct { $Tenant.Skus | Where-Object { [string]$_.skuPartNumber -eq [string]$context.Config.Licensing.Users.SkuPartNumber } | ForEach-Object { [string]$_.skuId } }
+        })
+    foreach ($id in $Need.ResourceGroups.Keys) {
+        try {
+            if (-not $id) { throw 'Resources.LicensingGroupId is empty: native resources need enterprise licensing throughout their active lifetime.' }
+            $group = Get-Pra2ResourceGroup -Id $id -Skus @($Tenant.Skus)
+            $groups[$id] = $group
+            foreach ($assignment in $group.Group.assignedLicenses) {
+                $skuId = [string]$assignment.skuId
+                if (-not $demand.ContainsKey($skuId)) { $demand[$skuId] = $(if ($skuId -in $userSkus) { $Need.Users } else { 0 }) }
+                $demand[$skuId] += $Need.ResourceGroups[$id]
+            }
+        } catch { [pscustomobject]@{ Level = 'Error'; Code = 'RESOURCE_LICENCE'; Message = $_.Exception.Message } }
+    }
+    foreach ($skuId in $demand.Keys) {
+        $sku = $Tenant.Skus | Where-Object { [string]$_.skuId -eq $skuId } | Select-Object -First 1
+        if ($demand[$skuId] -gt 0 -and (Get-Pra2FreeUnit $sku) -lt $demand[$skuId]) {
+            [pscustomobject]@{ Level = 'Error'; Code = 'RESOURCE_LICENCE'; Message = "Resource licensing capacity insufficient: $($sku.skuPartNumber) needs $($demand[$skuId]) new permanent unit(s) across selected users and resources." }
+        }
+    }
+    foreach ($id in $groups.Keys) {
+        [pscustomobject]@{ Level = 'Ok'; Code = 'RESOURCE_LICENCE'; Message = "Resource licence group ${id}: enterprise plan checked ($($Need.ResourceGroups[$id]) new permanent unit(s)); resources do not recycle temporary shared units." }
+    }
 }
 
 function Get-PraObjectAssessment {
@@ -606,7 +670,12 @@ function Get-PraObjectAssessment {
     if ($State -is [System.Management.Automation.ErrorRecord]) { throw $State }
     $state = if ($State) { $State } else { Get-Pra2CloudState -Context $context -Record $Record }
     $findings = @(Get-Pra2Readiness -Config $context.Config -Record $Record -State $state -Skus @($Tenant.Skus))
-    if ($Record.kind -ne 'User' -and $Lookup) { $findings += @(Get-Pra2TrusteeFinding -Record $Record -Permissions $Permissions -Members $Members -Lookup $Lookup) }
+    if (Get-PraValue $state 'NativeResource' $false) {
+        if ($context.Mode -eq 'Preview') {
+            try { Test-Pra2ResourceConfigurationReadiness -Record $Record -AllowRoomListCreation -RoomListPlan @((Read-Pra2ResourceSettings $Record).RoomLists) -RoomListIntents (Get-PraValue $context 'RoomListIntents' @{}) }
+            catch { $findings += [pscustomobject]@{ Level = 'Error'; Field = 'ExchangeOnline'; Code = 'RESOURCE_CONFIGURATION_REQUIRED'; Message = $_.Exception.Message } }
+        }
+    } elseif ($Record.kind -ne 'User' -and $Lookup) { $findings += @(Get-Pra2TrusteeFinding -Record $Record -Permissions $Permissions -Members $Members -Lookup $Lookup) }
     return [pscustomobject]@{ State = $state; Findings = $findings; Errors = @($findings | Where-Object Level -eq 'Error'); Warnings = @($findings | Where-Object Level -eq 'Warn') }
 }
 
@@ -916,6 +985,253 @@ function Invoke-PraConvertSharedWave {
 }
 
 
+function Write-PraResourceJournal {
+    param([object]$Entry, [string]$Step, [string]$Status = 'Running', [string]$Detail = '', [hashtable]$Extra = @{})
+    $guid = [string]$(if ($Entry.PSObject.Properties['Record']) { $Entry.Record.object_guid } else { $Entry.Item.object_guid })
+    $result = @{ lifecycle = 'CloudResource'; cloudId = [string]$Entry.Intent.cloudId; cloudGuid = [string]$Entry.Intent.cloudGuid
+        cloudType = [string]$Entry.Intent.cloudType; ownedName = [string]$Entry.Intent.creationName; markerAttribute = [string]$Entry.Intent.markerAttribute; token = [string]$Entry.Intent.token }
+    foreach ($key in $Extra.Keys) { $result[$key] = $Extra[$key] }
+    Write-PraJournal -ObjectGuid $guid -Step $Step -Detail $Detail -Item @{ step = $Step; status = $Status; entra_id = [string]$Entry.Intent.cloudId
+        original_json = ($Entry.Intent | ConvertTo-Json -Depth 15 -Compress); result_json = ($result | ConvertTo-Json -Depth 15 -Compress) }
+}
+
+function ConvertTo-PraRoomListSignature {
+    param([object]$List)
+    $values = [ordered]@{}
+    foreach ($field in @('SchemaVersion','SourceGuid','Name','DisplayName','Alias','PrimarySmtpAddress','LegacyExchangeDN',
+            'HiddenFromAddressListsEnabled','MemberJoinRestriction','MemberDepartRestriction')) { $values[$field] = $List.$field }
+    $values.EmailAddresses = @($List.EmailAddresses | Sort-Object -Unique)
+    $delivery = [ordered]@{}
+    foreach ($field in @('RequireSenderAuthenticationEnabled','ModerationEnabled','SendModerationNotifications')) { $delivery[$field] = $List.Delivery.$field }
+    foreach ($field in @('AcceptMessagesOnlyFromSendersOrMembers','RejectMessagesFromSendersOrMembers','ModeratedBy','BypassModerationFromSendersOrMembers')) {
+        $delivery[$field] = @($List.Delivery.$field | Sort-Object -Unique)
+    }
+    $values.Delivery = $delivery
+    return ConvertTo-Json -InputObject $values -Depth 10 -Compress
+}
+
+function Get-PraRoomListPlan {
+    param([object[]]$Entries, [object[]]$Records)
+    $lists = @{}
+    $keys = @{}
+    if (-not $Entries.Count) { return @() }
+    $mailboxKeys = @{}
+    foreach ($record in $Records) {
+        foreach ($key in @(Get-Pra2ResourceKeys $record)) { $mailboxKeys[$key] = [string]$record.primary_smtp_address }
+    }
+    foreach ($entry in $Entries) {
+        foreach ($list in (Read-Pra2ResourceSettings $entry.Record).RoomLists) {
+            $source = [string]$list.SourceGuid
+            if ($lists.ContainsKey($source)) {
+                if ((ConvertTo-PraRoomListSignature $lists[$source]) -cne (ConvertTo-PraRoomListSignature $list)) { throw "Conflicting room-list snapshot metadata for $source; nothing is changed." }
+                continue
+            }
+            foreach ($key in @(Get-Pra2ResourceKeys (ConvertTo-Pra2RoomListRecord $list))) {
+                if ($keys.ContainsKey($key)) { throw "Competing room lists claim $key; nothing is changed." }
+                if ($mailboxKeys.ContainsKey($key)) { throw "Room list $($list.PrimarySmtpAddress) conflicts with selected mailbox $($mailboxKeys[$key]); nothing is changed." }
+                $keys[$key] = $source
+            }
+            $lists[$source] = $list
+        }
+    }
+    return @($lists.Values | Sort-Object PrimarySmtpAddress)
+}
+
+function Write-PraRoomListJournal {
+    param([object]$Intent, [string]$Step, [string]$Status = 'Running', [string]$Detail = '')
+    $Intent.status = $Status
+    Set-Pra2TenantChange -Connection $context.Journal -BatchId $context.BatchId -Kind 'NativeRoomList' -TargetId ([string]$Intent.sourceGuid) `
+        -OriginalJson (ConvertTo-Json -InputObject $Intent -Depth 15 -Compress) -UpdateOriginal
+    Write-PraJournal -ObjectGuid ("RoomList:{0}" -f $Intent.sourceGuid) -Step $Step -Outcome $(if ($Status -eq 'Failed') { 'Fail' } else { 'Ok' }) -Detail $Detail
+}
+
+function Write-PraRoomListIdentityPin {
+    param([object]$Intent, [object]$Group)
+    $guid = [string](Get-PraValue $Group 'Guid' '')
+    $id = [string](Get-PraValue $Group 'ExternalDirectoryObjectId' '')
+    if (-not $guid -or $guid -eq [guid]::Empty.ToString() -or $guid -eq [string]$Intent.sourceGuid -or
+        ($Intent.cloudGuid -and [string]$Intent.cloudGuid -ne $guid) -or ($Intent.cloudId -and [string]$Intent.cloudId -ne $id)) {
+        throw 'Room-list immutable creation identity is missing/inconsistent; no configuration.'
+    }
+    $Intent.cloudGuid = $guid
+    if ($id) { $Intent.cloudId = $id }
+    Write-PraRoomListJournal -Intent $Intent -Step 'RoomListIdentityPinned' -Detail "Exchange GUID $guid; directory ID recorded only when exposed"
+}
+
+function Write-PraResourceIdentityPin {
+    param([object]$Entry, [object]$Mailbox)
+    $intent = $Entry.Intent
+    $guid = [string](Get-PraValue $Mailbox 'ExchangeGuid' '')
+    $id = [string](Get-PraValue $Mailbox 'ExternalDirectoryObjectId' '')
+    if (-not $id -or -not $guid -or $guid -eq [guid]::Empty.ToString() -or $guid -eq [string]$Entry.Record.exchange_guid -or
+        ($intent.cloudId -and [string]$intent.cloudId -ne $id) -or ($intent.cloudGuid -and [string]$intent.cloudGuid -ne $guid)) {
+        throw 'Resource immutable creation identity is missing/inconsistent; no configuration.'
+    }
+    $intent.cloudId = $id; $intent.cloudGuid = $guid
+    $Entry.EntraId = $id
+    Write-PraResourceJournal -Entry $Entry -Step 'ResourceIdentityPinned' -Detail "cloud ID $id, ExchangeGuid $guid recorded before further reads or mutations"
+}
+
+function Invoke-PraConvertRoomLists {
+    param([object[]]$Lists, [switch]$Unprotected)
+    foreach ($list in $Lists) {
+        if (Test-PraStop) { break }
+        $context.CurrentIdentity = [string]$list.PrimarySmtpAddress
+        $intent = $context.RoomListIntents[[string]$list.SourceGuid]
+        try {
+            if ($Unprotected) { Assert-Pra2ResourceOrganizationUnheld }
+            if ($intent) {
+                if ((ConvertTo-PraRoomListSignature $intent.list) -cne (ConvertTo-PraRoomListSignature $list)) { throw 'Room-list metadata differs from its creation journal; nothing is changed.' }
+            } else {
+                $existing = Get-Pra2ResourceCloudRoomList -List $list -AllowMissing
+                $token = [guid]::NewGuid().ToString('N')
+                $intent = [pscustomobject]@{ sourceGuid = [string]$list.SourceGuid; lifecycle = 'CloudRoomList'; list = $list
+                    operation = $(if ($existing) { 'Reuse' } else { 'Create' }); status = 'Planned'; creationAttempted = $false
+                    token = $token; creationName = ('PRA-L-{0}-{1}-{2}' -f $context.BatchId.Substring(0,8), $token.Substring(0,8), $token)
+                    cloudGuid = $(if ($existing) { [string]$existing.Guid } else { '' }); cloudId = $(if ($existing) { [string](Get-PraValue $existing 'ExternalDirectoryObjectId' '') } else { '' }) }
+                $context.RoomListIntents[[string]$list.SourceGuid] = $intent
+                Write-PraRoomListJournal -Intent $intent -Step 'RoomListIntent' -Detail "$($intent.operation) $($list.PrimarySmtpAddress); selected native rooms only"
+            }
+            $group = Get-Pra2ResourceCloudRoomList -List $list -Intent $intent -AllowMissing
+            $wasDone = $intent.status -eq 'Done'
+            if ($intent.operation -eq 'Create' -and $intent.status -ne 'Done') {
+                Test-Pra2RoomListCreationReadiness -List $list
+                if (-not $group) {
+                    if ($intent.creationAttempted) { throw 'Room-list creation was already attempted but its exact object is not visible; resume only after visibility is resolved, never issue a second create.' }
+                    $intent.creationAttempted = $true
+                    Write-PraRoomListJournal -Intent $intent -Step 'RoomListCreationIntent' -Detail "create $($intent.creationName); token recorded before New-DistributionGroup"
+                    $created = @(New-DistributionGroup -Name $intent.creationName -Alias $list.Alias -DisplayName $list.DisplayName `
+                        -PrimarySmtpAddress $list.PrimarySmtpAddress -RoomList -IgnoreNamingPolicy `
+                        -MemberJoinRestriction Closed -MemberDepartRestriction Closed -RequireSenderAuthenticationEnabled $true -ErrorAction Stop)
+                    if ($created.Count -ne 1) { throw 'Room-list creation response is missing/ambiguous; never repeat creation.' }
+                    $intent | Add-Member -NotePropertyName markerPending -NotePropertyValue $true -Force
+                    Write-PraRoomListIdentityPin -Intent $intent -Group $created[0]
+                    $group = Get-Pra2ResourceCloudRoomList -List $list -Intent $intent
+                }
+                if (-not $intent.cloudGuid) { $intent | Add-Member -NotePropertyName markerPending -NotePropertyValue $true -Force }
+                Write-PraRoomListIdentityPin -Intent $intent -Group $group
+                Set-Pra2RoomListConfiguration -List $list -Intent $intent -Group $group
+                $intent | Add-Member -NotePropertyName markerPending -NotePropertyValue $false -Force
+                $group = Get-Pra2ResourceCloudRoomList -List $list -Intent $intent
+            }
+            if (-not $group) { throw 'Room list is not visible/verified; dependent rooms are not created.' }
+            Write-PraRoomListIdentityPin -Intent $intent -Group $group
+            if ($wasDone) { $intent.status = 'Done' }
+            $null = Get-DistributionGroupMember -Identity ([string]$group.Guid) -ResultSize Unlimited -ErrorAction Stop
+            Write-PraRoomListJournal -Intent $intent -Step 'RoomListReady' -Status Done -Detail "$($intent.operation) RoomList $($list.PrimarySmtpAddress), cloud GUID $($group.Guid); members added only after room provisioning"
+            Write-PraItem -Context $context -Status Ok -Text "Room list ready: $($list.PrimarySmtpAddress) ($($intent.operation))"
+        } catch {
+            $message = $_.Exception.Message
+            if ($intent) { Write-PraRoomListJournal -Intent $intent -Step 'ConvertRoomList' -Status Failed -Detail $message }
+            Write-PraLog -Context $context -Message ("Room list {0} failed; dependent rooms are blocked: {1}" -f $list.PrimarySmtpAddress, $message) -Level Error
+        }
+    }
+    $context.CurrentIdentity = ''
+}
+
+function Invoke-PraConvertResourceWave {
+    param([object[]]$Entries, [object[]]$NativeEntries = @(), [object[]]$NativeRecords = @())
+    $intents = @{}
+    foreach ($native in $NativeEntries) { $intents[[string]$native.Record.object_guid] = $native.Intent }
+    foreach ($entry in $Entries) {
+        $context.CurrentIdentity = $entry.Row.Identity
+        $provisioningId = ''
+        try {
+            $intent = $entry.Intent
+            if (-not $intent -or $intent.lifecycle -ne 'CloudResource') { throw 'Resource creation intent is missing; do not guess an existing cloud identity.' }
+            $protected = (Get-Pra2ResourceProtectionMode $intent) -eq 'CaseHold'
+            $owned = Get-Pra2OwnedResource -Intent $intent -Record $entry.Record
+            if ($owned) {
+                $provisioningId = $owned.Id
+                Set-Pra2ResourceProvisioningDisabled -Identity $provisioningId
+            }
+            if (-not $protected) { Assert-Pra2ResourceOrganizationUnheld }
+            Test-Pra2ResourceConfigurationReadiness -Record $entry.Record -FutureResources $NativeRecords -ResourceIntents $intents -RoomListIntents $context.RoomListIntents
+            if (-not $owned) {
+                if ($intent.cloudId -or $intent.cloudGuid) { throw 'Journal-owned resource is missing; use Recover, never replace its identity.' }
+                if (Get-PraValue $intent 'creationAttempted' $false) { throw 'Resource creation was already attempted but its exact object is not visible; never issue a second create.' }
+                $collisions = @(Get-Pra2ResourceCollisions -Record $entry.Record -Inventory (Get-Pra2ResourceInventory -Records @($entry.Record)))
+                if ($collisions.Count) { throw ($collisions -join '; ') }
+                if ($protected) {
+                    $skus = @((Invoke-Pra2Graph -Uri 'v1.0/subscribedSkus').value)
+                    $null = Get-Pra2ResourceGroup -Id $intent.licensingGroupId -Skus $skus -NewUnits 1
+                }
+                # Persist BEFORE New-Mailbox. The creation Name contains the journal's unpredictable token.
+                $intent | Add-Member -NotePropertyName creationAttempted -NotePropertyValue $true -Force
+                Write-PraResourceJournal -Entry $entry -Step 'ResourceCreationIntent' -Detail "create $($intent.creationName) ($($intent.cloudType)); ownership token recorded before creation"
+                $parameters = @{ Name = [string]$intent.creationName; Alias = [string](Get-PraValue $entry.Record 'alias' (($entry.Record.primary_smtp_address -split '@')[0]))
+                    DisplayName = [string](Get-PraValue $entry.Record 'display_name' $entry.Row.Identity); PrimarySmtpAddress = [string]$entry.Record.primary_smtp_address; ErrorAction = 'Stop' }
+                if (-not $parameters.Alias) { $parameters.Alias = ($entry.Record.primary_smtp_address -split '@')[0] }
+                if (-not $parameters.DisplayName) { $parameters.DisplayName = $entry.Row.Identity }
+                $parameters[[string]$entry.Record.kind] = $true
+                $created = @(New-Mailbox @parameters)
+                if ($created.Count -ne 1) { throw 'Resource creation response is missing/ambiguous; never repeat creation.' }
+                $intent | Add-Member -NotePropertyName markerPending -NotePropertyValue $true -Force
+                Write-PraResourceIdentityPin -Entry $entry -Mailbox $created[0]
+                $provisioningId = [string]$intent.cloudId
+                Set-Pra2ResourceProvisioningDisabled -Identity $provisioningId
+                $owned = Get-Pra2OwnedResource -Intent $intent -Record $entry.Record
+                if (-not $owned) { throw 'Resource creation accepted but mailbox not visible yet; resume the same batch, do not create by another name.' }
+            }
+            if (-not $intent.cloudId -or -not $intent.cloudGuid) { $intent | Add-Member -NotePropertyName markerPending -NotePropertyValue $true -Force }
+            Write-PraResourceIdentityPin -Entry $entry -Mailbox $owned.Mailbox
+            if (-not $protected) { Assert-Pra2UnprotectedResource -Owned $owned }
+            $identitySettings = @{ accountEnabled = $false }
+            if ($protected) { $identitySettings.usageLocation = [string]$context.Config.Cloud.DefaultUsageLocation }
+            $null = Invoke-Pra2Graph -Method PATCH -Uri ("v1.0/users/{0}" -f $owned.Id) -Body $identitySettings
+            $disabled = Wait-Pra2Condition -TimeoutSeconds (Get-PraWaitSeconds 'MailboxTimeoutMinutes') -IntervalSeconds $context.Config.Polling.IntervalSeconds -Test {
+                $now = Get-Pra2OwnedResource -Intent $intent -Record $entry.Record
+                if (-not $now) { throw 'Pinned resource disappeared while verifying disabled sign-in; nothing is adopted.' }
+                return ($now.User.accountEnabled -eq $false)
+            }
+            if (-not $disabled.Ok) { throw 'Resource sign-in disable verification timed out; IDs retained, resume the same batch.' }
+            $marker = @{ Identity = $owned.Id; ErrorAction = 'Stop' }; $marker[[string]$intent.markerAttribute] = [string]$intent.token
+            Set-Mailbox @marker
+            $intent | Add-Member -NotePropertyName markerPending -NotePropertyValue $false -Force
+            $null = Get-Pra2OwnedResource -Intent $intent -Record $entry.Record
+            Write-PraResourceJournal -Entry $entry -Step 'ResourceOwned' -Detail "owned cloud-only $($intent.cloudType), ID $($owned.Id), ExchangeGuid $($owned.Guid), sign-in disabled"
+            if ($protected) {
+            $skus = @((Invoke-Pra2Graph -Uri 'v1.0/subscribedSkus').value)
+            $member = Test-Pra2GroupMember -GroupId $intent.licensingGroupId -UserId $owned.Id
+            $group = Get-Pra2ResourceGroup -Id $intent.licensingGroupId -Skus $skus -NewUnits $(if ($member) { 0 } else { 1 })
+            if (-not $member) { Set-Pra2GroupMember -GroupId $group.Id -UserId $owned.Id -Operation Add }
+            $licensed = Wait-Pra2Condition -TimeoutSeconds (Get-PraWaitSeconds 'MailboxTimeoutMinutes') -IntervalSeconds $context.Config.Polling.IntervalSeconds -Test {
+                $now = Invoke-Pra2Graph -Uri ("v1.0/users/{0}?`$select=id,assignedPlans,licenseAssignmentStates" -f $owned.Id)
+                Test-Pra2ResourceLicence -User $now -Group $group
+            }
+            if (-not $licensed.Ok) {
+                Write-PraResourceJournal -Entry $entry -Step 'ResourceLicencePending' -Detail 'Enterprise group plan not enabled yet; licence membership and data retained. Resume this batch.'
+                Set-PraRowResult -Row $entry.Row -Status Pending -Detail 'Resource enterprise licensing is not enabled yet; data retained, resume this Convert batch.'
+                continue
+            }
+            }
+            $calendar = Set-Pra2ResourceConfiguration -Record $entry.Record -Owned $owned -Intent $intent
+            $verified = Get-Pra2OwnedResource -Intent $intent -Record $entry.Record
+            if ($verified.User.accountEnabled -ne $false) { throw 'Final resource disabled sign-in verification failed.' }
+            if ($protected) {
+                if (-not (Test-Pra2ResourceLicence -User $verified.User -Group $group)) { throw 'Final resource enterprise licensing verification failed.' }
+            } else { Assert-Pra2UnprotectedResource -Owned $verified }
+            $collisions = @(Get-Pra2ResourceCollisions -Record $entry.Record -Inventory (Get-Pra2ResourceInventory -Records @($entry.Record)) -OwnedId $intent.cloudId)
+            if ($collisions.Count) { throw ($collisions -join '; ') }
+            Set-Pra2ResourceRoomListMembership -Record $entry.Record -Owned $verified -RoomListIntents $context.RoomListIntents
+            Enable-Pra2ResourceBooking -Record $entry.Record -Owned $verified -Calendar $calendar
+            $protectionText = if ($protected) { 'legacy enterprise licence retained throughout active lifetime' } else { 'no dedicated licence or hold; Recover has no inactive copy and does NOT preserve cloud reservations/messages' }
+            Write-PraResourceJournal -Entry $entry -Step 'ResourceReady' -Status Done -Detail "Native resource configured; $protectionText."
+            Set-PraRowResult -Row $entry.Row -Status Success -Field ExchangeOnline -Value $intent.cloudType -Detail "native $($intent.cloudType) $($owned.Guid), disabled sign-in, descriptive properties/room lists and booking restrictions/work hours restored, $protectionText; no general mailbox permissions or old on-premises content restored"
+        } catch {
+            $message = $_.Exception.Message
+            if ($provisioningId) {
+                try {
+                    Set-Pra2ResourceProvisioningDisabled -Identity $provisioningId
+                    $message += ' | Owned resource booking disabled and hidden; resume the same batch after resolving the failure.'
+                } catch { $message += " | FAIL-CLOSED CLEANUP FAILED: $($_.Exception.Message); verify the pinned resource booking and visibility immediately." }
+            }
+            Stop-PraEntry -Entry $entry -Step 'ConvertResource' -Message $message
+        }
+    }
+    $context.CurrentIdentity = ''
+}
+
 function Invoke-PraConvert {
     $config = $context.Config
     $dot = [char]0x00B7
@@ -932,6 +1248,22 @@ function Invoke-PraConvert {
     }
     $data = Read-PraSnapshotData -Id $snapshotId @read
     $records = @($data.Records); $permissions = @($data.Permissions); $members = @($data.Members)
+    $context.ResourceJournal = $resumeItems
+    $context.RoomListIntents = @{}
+    if ($resume) {
+        foreach ($change in @(Get-Pra2TenantChange $context.Journal $resume.id | Where-Object kind -eq 'NativeRoomList')) {
+            $intent = [string]$change.original_json | ConvertFrom-Json -ErrorAction Stop
+            if ([string]$intent.lifecycle -ne 'CloudRoomList' -or [string]$intent.sourceGuid -ne [string]$change.target_id) { throw 'Invalid room-list creation journal.' }
+            $context.RoomListIntents[[string]$change.target_id] = $intent
+        }
+    }
+    $context.NativeResourceScope = @($records | Where-Object {
+            (Test-Pra2NativeResource -Config $config -Record $_) -or (Get-Pra2ResourceIntent -Item $resumeItems[[string]$_.object_guid])
+        }).Count -gt 0
+    $nativeOnly = $records.Count -gt 0 -and @($records | Where-Object {
+            $intent = Get-Pra2ResourceIntent -Item $resumeItems[[string]$_.object_guid]
+            -not ((Test-Pra2NativeResource -Config $config -Record $_) -or $intent) -or (Get-Pra2ResourceProtectionMode $intent) -ne 'None'
+        }).Count -eq 0
     if ($resume) { Write-PraItem -Context $context -Status Info -Icon Batch -Text ('Resuming batch {0}: {1} object(s) not finished' -f $resume.id, $records.Count) }
 
     Write-PraStep -Context $context -Title 'Microsoft 365 connection' -Icon Cloud
@@ -941,7 +1273,10 @@ function Invoke-PraConvert {
 
     Write-PraStep -Context $context -Title 'Readiness' -Icon Key
     $context.CurrentOperation = 'Readiness'
-    $tenant = Get-Pra2TenantFact -Context $context
+    $skipUserGroup = @($records | Where-Object { $_.kind -eq 'User' }).Count -eq 0 -and @($records | Where-Object {
+            (Test-Pra2NativeResource -Config $config -Record $_) -or (Get-Pra2ResourceIntent -Item $resumeItems[[string]$_.object_guid])
+        }).Count -gt 0
+    $tenant = Get-Pra2TenantFact -Context $context -SkipUserGroup:$skipUserGroup -NativeOnly:$nativeOnly
     $states = Read-PraCloudStates -Records $records
     $lookup = New-PraTrusteeLookup -States $states -Records $records
     $permissionIndex = Get-PraPermissionIndex -Permissions $permissions -Members $members
@@ -957,7 +1292,8 @@ function Invoke-PraConvert {
     }
     $context.CurrentIdentity = ''
     $need = Get-PraLicenceNeed -Entries @($assessed) -Tenant $tenant
-    $tenantFindings = @(Test-Pra2TenantReadiness -Config $config -Roles @(Get-Pra2GraphRole) -Tenant $tenant -UserCount $need.Users -SharedCount $need.Shared)
+    $tenantFindings = @(Test-Pra2TenantReadiness -Config $config -Roles @(Get-Pra2GraphRole) -Tenant $tenant -UserCount $need.Users -SharedCount $need.Shared -ResourceCount $need.Resources -SkipUserLicensing:$need.SkipUserLicensing -NativeOnly:$nativeOnly)
+    $tenantFindings += @(Get-PraResourceLicenceFinding -Need $need -Tenant $tenant)
     foreach ($finding in $tenantFindings | Where-Object { $_.Level -eq 'Error' }) { Write-PraLog -Context $context -Message $finding.Message -Level Error }
     if (@($tenantFindings | Where-Object Level -eq 'Error').Count) { throw 'Tenant prerequisites not met (see above): nothing was changed.' }
     Write-PraItem -Context $context -Status Ok -Text ('Tenant prerequisites met (permissions, licences: {0} new unit(s) for users{1})' -f $need.Users, $(if ($need.Shared) { ', up to {0} at a time for the temporary licence of the shared mailboxes' -f [Math]::Min([Math]::Max(1, [int]$config.Licensing.Shared.Parallel), $need.Shared) } else { '' }))
@@ -971,17 +1307,25 @@ function Invoke-PraConvert {
         if ($resume) { $blocking = @($blocking | Where-Object { $_.Code -notin @('ALREADY_CLOUD_MAILBOX','EXCHANGE_PLAN_PRESENT') }) }
         $row.Warnings = (@($assessment.Warnings | ForEach-Object { $_.Message })) -join ' | '
         if ($blocking.Count) { Set-PraRowResult -Row $row -Status Error -Detail ('Not converted: ' + (($blocking | ForEach-Object { $_.Message }) -join ' | ')); continue }
-        [void]$plan.Add([pscustomobject]@{ Record = $record; Row = $row; EntraId = [string]$assessment.State.User.id; State = $assessment.State })
+        [void]$plan.Add([pscustomobject]@{ Record = $record; Row = $row; EntraId = $(if ($assessment.State.User) { [string]$assessment.State.User.id } else { '' }); State = $assessment.State
+                Intent = $(if ($resumeItems.ContainsKey([string]$record.object_guid)) { Get-Pra2ResourceIntent -Item $resumeItems[[string]$record.object_guid] } else { $null }) })
     }
     $context.CurrentIdentity = ''
     $planUsers = @($plan | Where-Object { $_.Record.kind -eq 'User' })
-    $planShared = @($plan | Where-Object { $_.Record.kind -ne 'User' })
-    Write-PraItem -Context $context -Status Info -Icon Target -Text ('{0} object(s) ready: {1} user(s), {2} shared {3} {4} blocked' -f $plan.Count, $planUsers.Count, $planShared.Count, $dot, ($records.Count - $plan.Count))
+    $planResources = @($plan | Where-Object { Get-PraValue $_.State 'NativeResource' $false })
+    $planShared = @($plan | Where-Object { $_.Record.kind -ne 'User' -and $_ -notin $planResources })
+    $roomLists = @(Get-PraRoomListPlan -Entries $planResources -Records $records)
+    Write-PraItem -Context $context -Status Info -Icon Target -Text ('{0} object(s) ready: {1} user(s), {2} shared, {5} native resources {3} {4} blocked' -f $plan.Count, $planUsers.Count, $planShared.Count, $dot, ($records.Count - $plan.Count), $planResources.Count)
 
     Write-PraStep -Context $context -Title 'Plan and confirmation' -Icon Plan
     $modeText = @{ Group = "licence group $($config.Licensing.Users.GroupId)"; Kiosk = 'Exchange Kiosk plan of the user licence'; Direct = "$($config.Licensing.Users.SkuPartNumber) (Exchange only)" }[$config.Licensing.Users.Mode]
     Write-PraItem -Context $context -Status Info -Text ("Users: ExchangeGuid cleared, source of authority to the cloud, usageLocation, Exchange plan by $modeText; the Teams storage becomes the mailbox")
     if ($planShared.Count) { Write-PraItem -Context $context -Status Info -Text ("Shared mailboxes, in waves of up to $($config.Licensing.Shared.Parallel) (one temporary unit each): temporary $($config.Licensing.Shared.SkuPartNumber), shared, $($config.Retention.TagAttribute) = $($config.Retention.TagValue), licence given back, permissions from the snapshot") }
+    foreach ($entry in $planResources) {
+        $protectionText = if ((Get-Pra2ResourceProtectionMode $entry.Intent) -eq 'CaseHold') { 'legacy enterprise licence/case-hold lifecycle retained' } else { 'no dedicated licence or hold (standard resources up to 50 GB); Recover has no inactive copy, cloud reservations/messages NOT preserved' }
+        Write-PraItem -Context $context -Status Info -Text ("Native $($entry.Record.kind): New-Mailbox, disabled cloud-only identity, independent GUID, $protectionText; addresses: " + ((Get-Pra2ResourceAddresses $entry.Record) -join ', ') + '; booking/work hours restored, no on-premises content restored.')
+    }
+    foreach ($list in $roomLists) { Write-PraItem -Context $context -Status Info -Text "RoomList $($list.PrimarySmtpAddress): create if missing, or reuse verified cloud-only list; before its rooms, then add only selected room members." }
     $convertEstimate = Get-PraDurationEstimate -UserWaves ([Math]::Ceiling($planUsers.Count / [Math]::Max(1, [int](Get-PraValue $context 'UserWaveSize' 500)))) -SharedRounds ([Math]::Ceiling($planShared.Count / [Math]::Max(1, [int]$config.Licensing.Shared.Parallel)))
     if ($convertEstimate.Text) { Write-PraItem -Context $context -Status Info -Icon Clock -Text ('Rough estimate: about {0} (typical tenant; a slow Microsoft 365 evening can take much longer)' -f $convertEstimate.Text) }
     foreach ($entry in $plan) { $entry.Row.FinalStatus = 'Planned'; Write-PraLog -Context $context -Message ('Planned: {0} ({1})' -f $entry.Row.Identity, $entry.Record.kind) -Level Sub }
@@ -993,11 +1337,21 @@ function Invoke-PraConvert {
         return
     }
     if (-not $plan.Count) { throw 'No object can be converted (see the reasons above).' }
-    Confirm-PraApply ('Convert {0} object(s) to Exchange Online ({1} user(s), {2} shared)?' -f $plan.Count, $planUsers.Count, $planShared.Count)
+    Confirm-PraApply ('Convert {0} object(s) to Exchange Online ({1} user(s), {2} shared, {3} native resources)?' -f $plan.Count, $planUsers.Count, $planShared.Count, $planResources.Count)
     if (-not $resume) {
         $context.BatchId = New-Pra2Batch $context.Journal Convert @{ SnapshotId = [long]$data.Snapshot.id; Environment = $config.Environment; Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
             ToolVersion = $toolVersion; ScopeJson = (@{ Identity = $Identity; IdentityPath = $IdentityPath; Identities = @(Get-PraIdentityList).Count; Scope = $Scope; UsersMode = $config.Licensing.Users.Mode } | ConvertTo-Json -Compress) }
         foreach ($entry in $plan) {
+            if ($entry -in $planResources) {
+                $token = [guid]::NewGuid().ToString('N')
+                $attribute = if ($config.Retention.TagAttribute -eq 'CustomAttribute15') { 'CustomAttribute14' } else { 'CustomAttribute15' }
+                $entry.Intent = [pscustomobject]@{ lifecycle = 'CloudResource'; protectionMode = 'None'; token = $token; markerAttribute = $attribute
+                    creationName = ('PRA-R-{0}-{1}-{2}' -f $context.BatchId.Substring(0,8), ([string]$entry.Record.object_guid).Substring(0,8), $token)
+                    creationAttempted = $false; cloudId = ''; cloudGuid = ''; cloudType = "$($entry.Record.kind)Mailbox" }
+                Set-Pra2BatchItem $context.Journal $context.BatchId ([string]$entry.Record.object_guid) @{ kind = [string]$entry.Record.kind; identity = $entry.Row.Identity
+                    status = 'Planned'; step = 'ResourceIntent'; original_json = ($entry.Intent | ConvertTo-Json -Depth 15 -Compress) }
+                continue
+            }
             $original = @{ entraId = $entry.EntraId; isCloudManaged = $entry.State.IsCloudManaged; exchangeGuid = [string]$entry.Record.exchange_guid
                 usageLocation = [string]$entry.State.User.usageLocation; recipientType = $entry.State.RecipientType; tag = $entry.State.TagValue; holds = @($entry.State.Holds)
                 licences = @(Get-Pra2DirectLicence $entry.State.User) }
@@ -1082,13 +1436,26 @@ function Invoke-PraConvert {
         Invoke-PraConvertSharedWave -Entries $wave.ToArray() -Tenant $tenant -PermissionIndex $permissionIndex -Originals $originals
     }
     if (-not $planShared.Count) { Write-PraItem -Context $context -Status Skip -Text 'No shared mailbox in this batch.' }
+    if (-not $stopped -and -not (Test-PraStop) -and $roomLists.Count) {
+        $context.CurrentOperation = 'Convert-RoomLists'
+        Invoke-PraConvertRoomLists -Lists $roomLists -Unprotected:(@($planResources | Where-Object { (Get-Pra2ResourceProtectionMode $_.Intent) -eq 'None' }).Count -gt 0)
+    }
+    $resourceParallel = [Math]::Max(1, [int](Get-PraValue (Get-PraValue $config 'Resources' @{}) 'Parallel' 100))
+    for ($start = 0; $start -lt $planResources.Count; $start += $resourceParallel) {
+        $wave = @($planResources[$start..([Math]::Min($planResources.Count, $start + $resourceParallel) - 1)])
+        if ($stopped -or (Test-PraStop)) { $stopped = $true; foreach ($entry in $wave) { Set-PraRowStopped $entry.Row }; continue }
+        Invoke-PraConvertResourceWave -Entries $wave -NativeEntries $planResources -NativeRecords @($records | Where-Object { Get-PraValue $states[[string]$_.object_guid] 'NativeResource' $false })
+    }
     $context.CurrentIdentity = ''
     $items = @(Get-Pra2BatchItem $context.Journal $context.BatchId)
     $counts = @{ done = @($items | Where-Object status -eq 'Done').Count; failed = @($items | Where-Object status -eq 'Failed').Count; running = @($items | Where-Object status -in @('Running','Planned')).Count }
-    Set-Pra2Batch $context.Journal $context.BatchId $(if ($counts.done -eq $items.Count) { 'Complete' } else { 'Partial' }) $counts
+    $pendingLists = @($context.RoomListIntents.Values | Where-Object status -ne 'Done').Count
+    $counts.roomListsDone = @($context.RoomListIntents.Values | Where-Object status -eq 'Done').Count
+    $counts.roomListsPending = $pendingLists
+    Set-Pra2Batch $context.Journal $context.BatchId $(if ($counts.done -eq $items.Count -and -not $pendingLists) { 'Complete' } else { 'Partial' }) $counts
     $context.SnapshotLabel = $context.SnapshotLabel
     $context.NextSteps = @(
-        $(if ($counts.done -ne $items.Count) { "pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply -Batch $($context.BatchId)   # resume the objects not finished" }),
+        $(if ($counts.done -ne $items.Count -or $pendingLists) { "pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply -Batch $($context.BatchId)   # resume the objects/lists not finished" }),
         "When AD, Exchange and Entra Connect are rebuilt: pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Recover -Batch $($context.BatchId)") | Where-Object { $_ }
 }
 
@@ -1350,10 +1717,197 @@ function Invoke-PraRecoverSharedWave {
     foreach ($entry in $waiting) { Set-PraRowResult -Row $entry.Row -Status Pending -Detail "identity deleted permanently, mailbox inactive; not recreated by Entra Connect yet: run a delta sync, then Recover -Batch $Batch again" }
 }
 
+function Get-PraOwnedResourceContact {
+    param([object]$Intent)
+    $name = [string](Get-PraValue $Intent 'contactName' '')
+    if (-not $name) { return $null }
+    $found = @(Get-Recipient -Filter ("Name -eq '{0}'" -f $name.Replace("'", "''")) -ResultSize Unlimited -ErrorAction Stop)
+    if (-not $found.Count) { return $null }
+    if ($found.Count -ne 1 -or [string]$found[0].Name -cne $name -or [string]$found[0].RecipientTypeDetails -ne 'MailContact') { throw 'Routing contact creation identity is ambiguous or not journal-owned.' }
+    $id = [string]$found[0].Guid
+    $persisted = [string](Get-PraValue $Intent 'contactId' '')
+    if (-not $id -or ($persisted -and $persisted -ne $id)) { throw 'Routing contact immutable ID differs from the journal.' }
+    $contact = Get-MailContact -Identity $id -ErrorAction Stop
+    if (-not [bool](Get-PraValue $Intent 'contactCreationAttempted' $false)) { throw 'Routing contact creation was never journaled as attempted; pre-existing contact is not adopted.' }
+    $marker = [string](Get-PraValue $contact ([string]$Intent.markerAttribute) '')
+    $markerPending = Get-PraValue $Intent 'contactMarkerPending' $false
+    if ($markerPending -isnot [bool]) { throw 'Routing contact marker progress is invalid; no contact is adopted.' }
+    if ($marker -cne [string]$Intent.token -and ($marker -or ($persisted -and -not $markerPending))) { throw 'Routing contact ownership marker differs from the journal.' }
+    return $contact
+}
+
+function Invoke-PraRecoverResourceWave {
+    param([object[]]$Entries, [object]$HoldSet)
+    foreach ($entry in $Entries) {
+        $context.CurrentIdentity = $entry.Row.Identity
+        try {
+            $intent = $entry.Intent
+            $protected = (Get-Pra2ResourceProtectionMode $intent) -eq 'CaseHold'
+            if (-not $protected -and (Get-PraValue $context.Config.Resources 'AllowUnprotectedDeletion' $false) -ne $true) {
+                throw 'Resources.AllowUnprotectedDeletion = $true is required: explicitly acknowledge no hold/no inactive copy and loss of cloud-created reservations/messages after export/reconciliation. No mutation.'
+            }
+            if (-not $intent.cloudId -or -not $intent.cloudGuid -or $intent.cloudGuid -eq [string]$entry.Record.exchange_guid) { throw 'Native resource immutable IDs were not persisted. Resume Convert first to prove ownership; no deletion.' }
+            $route = Get-Pra2ResourceRoute -Config $context.Config -Record $entry.Record -RequireReady
+            $oldRoute = [string](Get-PraValue $intent 'route' '')
+            if ($oldRoute -and $oldRoute -ine $route) { throw "Routing domain changed mid-Recover: keep the journaled destination $oldRoute until this batch is complete." }
+            $intent | Add-Member -NotePropertyName route -NotePropertyValue $route -Force
+            $intent | Add-Member -NotePropertyName contactName -NotePropertyValue (([string]$intent.creationName) -replace '^PRA-R-', 'PRA-C-') -Force
+            $contact = Get-PraOwnedResourceContact -Intent $intent
+            $live = Invoke-Pra2Graph -Uri ("v1.0/users/{0}?`$select=id" -f $intent.cloudId) -AllowNotFound
+            if ($live) {
+                if (-not $protected) { Assert-Pra2UnprotectedDeletionRepeatable -Intent $intent }
+                $null = Get-Pra2ResourceRoute -Config $context.Config -Record $entry.Record -RequireReady
+                $owned = Get-Pra2OwnedResource -Intent $intent -Record $entry.Record
+                if (-not $owned -or $owned.User.accountEnabled -ne $false) { throw 'Native resource ownership/disabled identity cannot be verified; no deletion.' }
+                if (-not $protected) {
+                    Assert-Pra2UnprotectedResource -Owned $owned -CheckOrganization
+                    $collisions = @(Get-Pra2ResourceCollisions -Record $entry.Record -Inventory (Get-Pra2ResourceInventory -Records @($entry.Record)) -OwnedId $intent.cloudId)
+                    if ($collisions.Count) { throw ($collisions -join '; ') }
+                    $intent | Add-Member -NotePropertyName unprotectedDeletionAttempted -NotePropertyValue $true -Force
+                    $intent | Add-Member -NotePropertyName unprotectedDeletionProgress -NotePropertyValue 'Intent' -Force
+                    Write-PraResourceJournal -Entry $entry -Step 'ResourceDeleteIntent' -Detail "Unprotected deletion acknowledged: exact $($intent.cloudId)/$($intent.cloudGuid); NO hold, NO inactive copy, cloud reservations/messages NOT preserved; route $route."
+                    $final = Get-Pra2OwnedResource -Intent $intent -Record $entry.Record
+                    if (-not $final -or $final.User.accountEnabled -ne $false) { throw 'Final resource ownership/disabled identity verification failed; no deletion.' }
+                    Assert-Pra2UnprotectedResource -Owned $final -CheckOrganization
+                    $intent | Add-Member -NotePropertyName unprotectedDeletionProgress -NotePropertyValue 'Issuing' -Force
+                    Write-PraResourceJournal -Entry $entry -Step 'ResourceDeleteIssuing' -Detail 'Deletion request starting; ambiguous/interrupted response cannot authorise another deletion of a restored identity.'
+                    try {
+                        $null = Invoke-Pra2Graph -Method DELETE -Uri ("v1.0/users/{0}" -f $intent.cloudId) -AllowNotFound -NoRetry
+                    } catch {
+                        $failure = $_
+                        $code = 0
+                        for ($exception = $failure.Exception; $exception; $exception = $exception.InnerException) {
+                            $direct = $exception.PSObject.Properties['StatusCode']
+                            $response = $exception.PSObject.Properties['Response']
+                            if ($direct -and $null -ne $direct.Value) { $code = [int]$direct.Value; break }
+                            if ($response -and $null -ne $response.Value -and $response.Value.PSObject.Properties['StatusCode']) {
+                                $code = [int]$response.Value.StatusCode; break
+                            }
+                        }
+                        if ($code -in @(400, 401, 403, 409, 412, 422, 429)) {
+                            $intent.unprotectedDeletionProgress = 'Intent'
+                            Write-PraResourceJournal -Entry $entry -Step 'ResourceDeleteRejected' -Detail "DELETE rejected with HTTP $code; no accepted deletion is recorded."
+                        }
+                        throw $failure
+                    }
+                    $intent | Add-Member -NotePropertyName unprotectedDeletionProgress -NotePropertyValue 'Issued' -Force
+                    Write-PraResourceJournal -Entry $entry -Step 'ResourceIdentityDeleted' -Detail 'Only journal-owned unprotected cloud identity delete issued; NO inactive copy/data preservation guaranteed. Deletion still to be verified; no purge.'
+                } else {
+                $group = Get-Pra2ResourceGroup -Id $intent.licensingGroupId -Skus @((Invoke-Pra2Graph -Uri 'v1.0/subscribedSkus').value)
+                if (-not (Test-Pra2ResourceLicence -User $owned.User -Group $group)) { throw 'Native resource enterprise licensing is not active before the hold; no deletion.' }
+                $collisions = @(Get-Pra2ResourceCollisions -Record $entry.Record -Inventory (Get-Pra2ResourceInventory -Records @($entry.Record)) -OwnedId $intent.cloudId)
+                if ($collisions.Count) { throw ($collisions -join '; ') }
+                $added = Add-Pra2HoldLocationSet -Set $HoldSet -Id @([string]$intent.cloudId)
+                if ($added.Failed.ContainsKey([string]$intent.cloudId)) { throw $added.Failed[[string]$intent.cloudId] }
+                $tag = Get-PraHoldTagOf -HoldSet $HoldSet -Id $intent.cloudId
+                if (-not $tag) { throw 'No specific tool hold policy contains this native resource; no deletion.' }
+                $intent | Add-Member -NotePropertyName holdTag -NotePropertyValue $tag -Force
+                $held = Wait-Pra2Condition -TimeoutSeconds (Get-PraWaitSeconds 'HoldTimeoutMinutes') -IntervalSeconds $context.Config.Polling.IntervalSeconds -Test {
+                    $now = Get-Pra2OwnedResource -Intent $intent -Record $entry.Record
+                    if (-not $now -or $now.User.accountEnabled -ne $false -or -not (Test-Pra2ResourceLicence -User $now.User -Group $group)) { throw 'Resource ownership/disabled sign-in/enterprise licence changed while waiting for hold; no deletion.' }
+                    @($now.Mailbox.InPlaceHolds | ForEach-Object { [string]$_ }) -contains $tag
+                }
+                if (-not $held.Ok) {
+                    Write-PraResourceJournal -Entry $entry -Step 'ResourceHoldPending' -Detail 'Specific tool hold not stamped yet; resource, identity and licence retained.'
+                    Set-PraRowResult -Row $entry.Row -Status Pending -Detail 'Specific tool hold not stamped; identity NOT deleted. Retry Recover after hold deployment.'
+                    continue
+                }
+                # Record the exact IDs/GUID and expected hold before the irreversible side effect.
+                Write-PraResourceJournal -Entry $entry -Step 'ResourceDeleteIntent' -Detail "verified $($intent.cloudId)/$($intent.cloudGuid), hold $tag, enterprise licence active; route $route"
+                $final = Get-Pra2OwnedResource -Intent $intent -Record $entry.Record
+                if (-not $final -or $final.User.accountEnabled -ne $false -or -not (Test-Pra2ResourceLicence -User $final.User -Group $group) -or
+                    @($final.Mailbox.InPlaceHolds | ForEach-Object { [string]$_ }) -notcontains $tag) { throw 'Final ownership/licence/hold verification failed immediately before deletion.' }
+                $null = Invoke-Pra2Graph -Method DELETE -Uri ("v1.0/users/{0}" -f $intent.cloudId) -AllowNotFound
+                Write-PraResourceJournal -Entry $entry -Step 'ResourceIdentityDeleted' -Detail 'Only the journal-owned cloud identity deleted; recycle bin and mailbox data retained.'
+                }
+            }
+            if ($protected) {
+            $expectedHold = [string](Get-PraValue $intent 'holdTag' '')
+            if (-not $expectedHold -or -not $HoldSet.Tags.Contains($expectedHold)) { throw 'Expected tool hold was not journaled before deletion; verify the inactive mailbox manually. No routing contact is created.' }
+            $inactive = Wait-Pra2Condition -TimeoutSeconds (Get-PraWaitSeconds 'HoldTimeoutMinutes') -IntervalSeconds $context.Config.Polling.IntervalSeconds -Test {
+                # A filtered zero-result is absence, not a swallowed cmdlet/service failure.
+                $found = @(Get-Mailbox -InactiveMailboxOnly -ResultSize Unlimited -ErrorAction Stop | Where-Object { [string]$_.ExchangeGuid -eq [string]$intent.cloudGuid })
+                if (-not $found.Count) { return $false }
+                if ($found.Count -ne 1 -or [string]$found[0].ExchangeGuid -ne [string]$intent.cloudGuid -or
+                    @($found[0].InPlaceHolds | ForEach-Object { [string]$_ }) -notcontains $expectedHold) { throw 'Inactive resource GUID/specific tool hold verification failed; no contact, no purge.' }
+                return $found[0]
+            }
+            if (-not $inactive.Ok) {
+                Write-PraResourceJournal -Entry $entry -Step 'ResourceInactivePending' -Detail "Identity deleted; exact mailbox $($intent.cloudGuid) not yet inactive with expected hold. Recycle bin retained."
+                Set-PraRowResult -Row $entry.Row -Status Pending -Detail "Identity deleted; wait for exact inactive GUID $($intent.cloudGuid) with $expectedHold, then resume Recover. No mailbox data purged."
+                continue
+            }
+            if (Invoke-Pra2Graph -Uri ("v1.0/users/{0}?`$select=id" -f $intent.cloudId) -AllowNotFound) { throw 'Deleted resource identity is active again; routing contact creation refused.' }
+            Write-PraResourceJournal -Entry $entry -Step 'ResourceInactiveVerified' -Detail "Exact mailbox $($intent.cloudGuid) inactive under $expectedHold; mailbox and recycle-bin identity never purged."
+            $collisions = @(Get-Pra2ResourceCollisions -Record $entry.Record -Inventory (Get-Pra2ResourceInventory -Records @($entry.Record)) -OwnedId $intent.cloudId -OwnedGuid $intent.cloudGuid -OwnedContactId $(if ($contact) { [string]$contact.Guid } else { '' }))
+            } else {
+                $deleted = Wait-Pra2Condition -TimeoutSeconds (Get-PraWaitSeconds 'MailboxTimeoutMinutes') -IntervalSeconds $context.Config.Polling.IntervalSeconds -Test {
+                    Test-Pra2UnprotectedResourceDeleted -Intent $intent
+                }
+                if (-not $deleted.Ok) {
+                    Write-PraResourceJournal -Entry $entry -Step 'ResourceDeletionPending' -Detail "Exact $($intent.cloudId)/$($intent.cloudGuid) not yet verified deleted/soft-deleted. No inactive copy or purge; resume."
+                    Set-PraRowResult -Row $entry.Row -Status Pending -Detail "Wait for journal-owned identity $($intent.cloudId) and soft-deleted non-inactive mailbox $($intent.cloudGuid), then resume Recover. Cloud reservations/messages NOT preserved; no purge."
+                    continue
+                }
+                $intent | Add-Member -NotePropertyName unprotectedDeletionProgress -NotePropertyValue 'Verified' -Force
+                Write-PraResourceJournal -Entry $entry -Step 'ResourceDeletionVerified' -Detail 'Exact identity deleted and mailbox soft-deleted, not inactive; foreign collisions and Exchange contact writes still to be checked. No purge/data preservation.'
+                $inventory = Get-Pra2ResourceInventory -Records @($entry.Record)
+                $collisions = @(Get-Pra2UnprotectedRecoverCollisions -Intent $intent -Record $entry.Record -Inventory $inventory -OwnedContactId $(if ($contact) { [string]$contact.Guid } else { '' }))
+                if ($collisions.Count) {
+                    $reason = "Address release pending: $($collisions -join '; ') No automatic purge; resolve safely and resume this Recover batch."
+                    Write-PraResourceJournal -Entry $entry -Step 'ResourceAddressReleasePending' -Detail $reason
+                    Set-PraRowResult -Row $entry.Row -Status Pending -Detail $reason
+                    continue
+                }
+            }
+            if ($collisions.Count) { throw ($collisions -join '; ') }
+            if (Invoke-Pra2Graph -Uri ("v1.0/users/{0}?`$select=id" -f $intent.cloudId) -AllowNotFound) { throw 'Deleted resource identity is active again; routing contact creation/configuration refused.' }
+            if (-not $contact) {
+                $intent | Add-Member -NotePropertyName contactCreationAttempted -NotePropertyValue $true -Force
+                Write-PraResourceJournal -Entry $entry -Step 'ResourceContactIntent' -Detail "create owned contact $($intent.contactName); addresses $((Get-Pra2ResourceAddresses $entry.Record) -join ', '), destination $route"
+                $alias = [string](Get-PraValue $entry.Record 'alias' '')
+                if (-not $alias) { $alias = ([string]$entry.Record.primary_smtp_address -split '@')[0] }
+                $created = New-MailContact -Name $intent.contactName -Alias $alias -ExternalEmailAddress $route -ErrorAction Stop
+                $createdId = [string](Get-PraValue $created 'Guid' '')
+                if ($createdId) {
+                    $intent | Add-Member -NotePropertyName contactId -NotePropertyValue $createdId -Force
+                    $intent | Add-Member -NotePropertyName contactMarkerPending -NotePropertyValue $true -Force
+                    Write-PraResourceJournal -Entry $entry -Step 'ResourceContactCreated' -Detail "Returned routing contact immutable ID $createdId pinned before configuration."
+                }
+                $contact = Get-PraOwnedResourceContact -Intent $intent
+                if (-not $contact) { throw 'Routing contact creation accepted but not visible; resume this batch by its journaled name.' }
+            }
+            if (-not (Get-PraValue $intent 'contactId' '')) {
+                $intent | Add-Member -NotePropertyName contactId -NotePropertyValue ([string]$contact.Guid) -Force
+                $intent | Add-Member -NotePropertyName contactMarkerPending -NotePropertyValue $true -Force
+                Write-PraResourceJournal -Entry $entry -Step 'ResourceContactCreated' -Detail "Journal-owned routing contact immutable ID $($contact.Guid) pinned before configuration."
+            }
+            $parameters = @{ Identity = [string]$contact.Guid; ExternalEmailAddress = $route; EmailAddresses = @(Get-Pra2ResourceAddresses $entry.Record)
+                HiddenFromAddressListsEnabled = [bool](Get-PraValue $entry.Record 'hidden_from_address_lists' $false); ErrorAction = 'Stop' }
+            $parameters[[string]$intent.markerAttribute] = [string]$intent.token
+            Set-MailContact @parameters
+            $intent | Add-Member -NotePropertyName contactMarkerPending -NotePropertyValue $false -Force
+            $contact = Get-PraOwnedResourceContact -Intent $intent
+            if (([string]$contact.ExternalEmailAddress -replace '^smtp:', '') -ine $route -or
+                [string]$contact.PrimarySmtpAddress -ine [string]$entry.Record.primary_smtp_address -or
+                [bool]$contact.HiddenFromAddressListsEnabled -ne $parameters.HiddenFromAddressListsEnabled) { throw 'Routing contact destination/primary/hidden verification failed.' }
+            foreach ($address in @(Get-Pra2ResourceAddresses $entry.Record)) {
+                if ($address -notin @($contact.EmailAddresses | ForEach-Object { [string]$_ })) { throw "Routing contact address not applied: $address." }
+            }
+            $result = @{ contactId = [string]$contact.Guid; route = $route }
+            $protectionText = if ($protected) { $result.inactiveGuid = $intent.cloudGuid; 'inactive cloud data and deleted identity retained under tool hold' } else {
+                $result.deletedGuid = $intent.cloudGuid; 'NO hold/NO inactive copy; cloud-created reservations/messages NOT preserved, soft-deleted object retained without purge'
+            }
+            Write-PraResourceJournal -Entry $entry -Step 'ResourceRouted' -Status Done -Detail "Owned contact $($contact.Guid) routes to $route; $protectionText; no calendar merge." -Extra $result
+            Set-PraRowResult -Row $entry.Row -Status Success -Field ExchangeOnline -Value MailContact -Detail "native resource routes to $route via owned contact; $protectionText. On-premises objects untouched; cloud calendars are not merged."
+        } catch { Stop-PraRecoverEntry -Entry $entry -Step 'RecoverResource' -Message ($_.Exception.Message + ' Resolve the finding and resume the same Recover batch. No automatic purge or hold removal. Unprotected deletion does NOT preserve cloud reservations/messages.') }
+    }
+    $context.CurrentIdentity = ''
+}
+
 function Invoke-PraRecover {
     $config = $context.Config
     if (-not $Batch) { throw '-Batch is required: the ID of the Convert batch to roll back (printed at the end of Convert).' }
-    if (-not $config.Retention.HoldPolicy) { throw 'Retention.HoldPolicy is empty: Recover puts the converted mailboxes on that eDiscovery case hold.' }
     $context.Journal = Open-Pra2Store -Path $config.Store.JournalPath -Root $context.Root -Kind Journal
     $convert = Get-Pra2Batch $context.Journal -Id $Batch
     if (-not $convert -or $convert.action -ne 'Convert') { throw "Convert batch $Batch not found in $($config.Store.JournalPath)." }
@@ -1363,7 +1917,7 @@ function Invoke-PraRecover {
     if (-not $resume -and $finished) { throw "Convert batch $($convert.id) was already rolled back by Recover batch $($finished.id) (complete): nothing to do. Check shows the current state of the objects." }
     $data = Read-PraSnapshotData -Id ([long]$convert.snapshot_id) -Verb 'roll back' -All -NoCount
     $byGuid = @{}; foreach ($record in $data.Records) { $byGuid[[string]$record.object_guid] = $record }
-    $convertItems = @(Get-Pra2BatchItem $context.Journal $convert.id | Where-Object { $_.status -ne 'Skipped' -and $_.entra_id -and $_.step })
+    $convertItems = @(Get-Pra2BatchItem $context.Journal $convert.id | Where-Object { $_.status -ne 'Skipped' -and $_.step -and ($_.entra_id -or (Get-Pra2ResourceIntent -Item $_)) })
     $done = @{}; $previous = @{}
     if ($resume) { foreach ($item in @(Get-Pra2BatchItem $context.Journal $resume.id)) { $previous[[string]$item.object_guid] = $item; if ($item.status -eq 'Done') { $done[[string]$item.object_guid] = $true } } }
     $targets = @($convertItems | Where-Object { -not $done.ContainsKey([string]$_.object_guid) })
@@ -1373,19 +1927,28 @@ function Invoke-PraRecover {
                 @([string]$t.identity, [string]$t.object_guid) + $(if ($r) { @([string]$r.primary_smtp_address, [string]$r.user_principal_name, [string]$r.sam_account_name) } else { @() }) })
     }
     if ($Scope -eq 'UsersOnly') { $targets = @($targets | Where-Object { $_.kind -eq 'User' }) } elseif ($Scope -eq 'SharedOnly') { $targets = @($targets | Where-Object { $_.kind -ne 'User' }) }
+    $context.NativeResourceScope = @($targets | Where-Object { Get-Pra2ResourceIntent -Item $_ }).Count -gt 0
+    $requiresHold = @($targets | Where-Object {
+            $intent = Get-Pra2ResourceIntent -Item $_
+            -not $intent -or (Get-Pra2ResourceProtectionMode $intent) -eq 'CaseHold'
+        }).Count -gt 0
+    if ($requiresHold -and -not $config.Retention.HoldPolicy) { throw 'Retention.HoldPolicy is empty: protected/user/shared Recover requires that eDiscovery case hold.' }
     Write-PraItem -Context $context -Status Info -Icon Batch -Text ('Convert batch {0} of {1}: {2} object(s) to roll back{3}' -f $convert.id, $convert.created_utc, $targets.Count, $(if ($resume) { " (resuming Recover $($resume.id))" } else { '' }))
 
     Write-PraStep -Context $context -Title 'Microsoft 365 connection' -Icon Cloud
     $context.CurrentOperation = 'Connect-Cloud'
-    try { $how = Connect-Pra2Cloud -Context $context; Connect-Pra2Compliance -Context $context } catch { $context.CloudConnectFailed = $true; throw }
-    Write-PraItem -Context $context -Status Ok -Text ($how + ', Security & Compliance (case hold)')
+    try { $how = Connect-Pra2Cloud -Context $context; if ($requiresHold) { Connect-Pra2Compliance -Context $context } } catch { $context.CloudConnectFailed = $true; throw }
+    Write-PraItem -Context $context -Status Ok -Text ($how + $(if ($requiresHold) { ', Security & Compliance (case hold)' } else { '; unprotected native lifecycle, no compliance connection' }))
 
     Write-PraStep -Context $context -Title 'Prerequisites' -Icon Key
     $context.CurrentOperation = 'Prerequisites'
+    $holdSet = $null
+    if ($requiresHold) {
     $holdSet = Get-Pra2HoldPolicySet -Policy $config.Retention.HoldPolicy -Limit $config.Retention.HoldPolicyLimit
     Write-PraItem -Context $context -Status Ok -Text ('Case hold: {0} ({1} mailbox(es) held, {2} at most per policy; full policies are followed by {3}-02, -03... in the same case)' -f
         (@($holdSet.Policies | ForEach-Object { '{0} {1}' -f $_.Name, $_.Count }) -join ', '), (@($holdSet.Policies | ForEach-Object { $_.Count }) | Measure-Object -Sum).Sum, $holdSet.Limit, $holdSet.Base)
     Write-PraItem -Context $context -Status Info -Text ("Entra Connect {0} or later, operations by {1}{2}" -f $config.EntraConnect.MinVersion, $config.EntraConnect.Mode, $(if ($config.EntraConnect.Server) { " on $($config.EntraConnect.Server)" } else { '' }))
+    }
     # Each object goes the way its current state allows; a step already done is never undone (a hold is never lifted
     # from an object that is back on-premises).
     #   User          user, or a shared mailbox whose Convert stopped half-way: back to AD like a user
@@ -1393,9 +1956,10 @@ function Invoke-PraRecover {
     #   Shared        SharedMailbox: hold, identity deleted, purged, recreated by Entra Connect
     #   SharedDeleted identity already deleted by an earlier run: purge check, recreated object
     $plan = [System.Collections.Generic.List[object]]::new()
+    $resourceBlocked = [System.Collections.Generic.List[object]]::new()
     if (Test-PraStop) { throw 'Stopped by the operator before reading the state of the objects: nothing was changed.' }
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $exoStates = Get-Pra2ExoStateSet -Id ([string[]]@($targets | ForEach-Object { [string]$_.entra_id })) -TagAttribute $config.Retention.TagAttribute
+    $exoStates = Get-Pra2ExoStateSet -Id ([string[]]@($targets | Where-Object { -not (Get-Pra2ResourceIntent -Item $_) } | ForEach-Object { [string]$_.entra_id })) -TagAttribute $config.Retention.TagAttribute
     if ($targets.Count) { Write-PraItem -Context $context -Status Info -Text ('Exchange Online state of {0} object(s) read in {1}' -f $targets.Count, (Format-PraDuration $clock.Elapsed.TotalSeconds)) }
     foreach ($item in $targets) {
         $guid = [string]$item.object_guid
@@ -1404,6 +1968,48 @@ function Invoke-PraRecover {
         $row.Action = 'Recover'
         [void]$context.Rows.Add($row)
         if (-not $record) { Set-PraRowResult -Row $row -Status Error -Detail "not in snapshot $($convert.snapshot_id)"; continue }
+        $intent = Get-Pra2ResourceIntent -Item $item
+        if ($intent) {
+            try {
+                if ($previous.ContainsKey($guid)) {
+                    $oldIntent = Get-Pra2ResourceIntent -Item $previous[$guid]
+                    if ($oldIntent -and (Get-Pra2ResourceProtectionMode $oldIntent) -cne (Get-Pra2ResourceProtectionMode $intent)) { throw 'Recover protection mode differs from original Convert journal; no downgrade or deletion.' }
+                    if ($oldIntent) {
+                        foreach ($field in @('token','creationName','markerAttribute','cloudId','cloudGuid','cloudType','licensingGroupId')) {
+                            if ([string](Get-PraValue $oldIntent $field '') -cne [string](Get-PraValue $intent $field '')) { throw "Recover ownership $field differs from original Convert journal; no identity is adopted or deleted." }
+                        }
+                    }
+                    if ($oldIntent) { $intent = $oldIntent }
+                }
+                $protected = (Get-Pra2ResourceProtectionMode $intent) -eq 'CaseHold'
+                if (-not $protected) {
+                    $row.Warnings = 'NO hold, NO inactive copy: cloud-created reservations/messages NOT preserved or merged. Export/reconcile before explicitly allowing unprotected deletion.'
+                    Write-PraItem -Context $context -Status Warn -Text "$($row.Identity): $($row.Warnings)"
+                    if ((Get-PraValue $config.Resources 'AllowUnprotectedDeletion' $false) -ne $true) { throw 'Resources.AllowUnprotectedDeletion = $true required after export/reconciliation and explicit acknowledgement of cloud reservations/messages loss (no hold/no inactive copy). No mutation.' }
+                }
+                $route = Get-Pra2ResourceRoute -Config $config -Record $record -RequireReady
+                if (-not $intent.cloudId -or -not $intent.cloudGuid) { throw 'Native resource immutable ownership IDs not persisted: resume Convert first; no deletion.' }
+                $live = Invoke-Pra2Graph -Uri ("v1.0/users/{0}?`$select=id" -f $intent.cloudId) -AllowNotFound
+                if ($live) {
+                    if (-not $protected) { Assert-Pra2UnprotectedDeletionRepeatable -Intent $intent }
+                    $owned = Get-Pra2OwnedResource -Intent $intent -Record $record
+                    if (-not $owned -or $owned.User.accountEnabled -ne $false) { throw 'Native resource cloud-only/disabled ownership verification failed.' }
+                    $null = Get-Pra2ResourceRoute -Config $config -Record $record -RequireReady
+                    if (-not $protected) {
+                        Assert-Pra2UnprotectedResource -Owned $owned -CheckOrganization
+                    }
+                }
+                $nativeEntry = [pscustomobject]@{ Item = $item; Record = $record; Row = $row; EntraId = [string]$intent.cloudId; Exo = $null
+                    Path = 'CloudResource'; CloudGuid = [string]$intent.cloudGuid; Original = @(); Intent = $intent }
+                [void]$plan.Add($nativeEntry)
+                $protectionText = if ($protected) { 'legacy hold/enterprise licence verification and exact inactive copy' } else { 'NO hold, NO inactive copy, cloud reservations/messages NOT preserved; verify deletion/soft-deleted state and address release without purge' }
+                Write-PraItem -Context $context -Status Info -Text "Native resource: $protectionText; delete only owned $($intent.cloudId)/$($intent.cloudGuid), contact to $route; addresses: $((Get-Pra2ResourceAddresses $record) -join ', '). No sync/SOA, no calendar merge."
+            } catch {
+                Set-PraRowResult -Row $row -Status Error -Detail $_.Exception.Message
+                $resourceBlocked.Add([pscustomobject]@{ Item = $item; Record = $record; Row = $row; Intent = $intent })
+            }
+            continue
+        }
         $entry = [pscustomobject]@{ Item = $item; Record = $record; Row = $row; EntraId = [string]$item.entra_id; Exo = $null; Path = ''; CloudGuid = ''; Original = @(Get-PraOriginalLicence $item) }
         $exo = $exoStates[$entry.EntraId]
         if (-not $exo) { $exo = Get-Pra2ExoState -Identity $entry.EntraId -TagAttribute $config.Retention.TagAttribute }
@@ -1426,6 +2032,7 @@ function Invoke-PraRecover {
     $planUsers = @($plan | Where-Object { $_.Path -eq 'User' })
     $planBack = @($plan | Where-Object { $_.Path -eq 'Back' })
     $planShared = @($plan | Where-Object { $_.Path -in @('Shared', 'SharedDeleted') })
+    $planResources = @($plan | Where-Object { $_.Path -eq 'CloudResource' })
     $partial = @($planUsers | Where-Object { $_.Item.kind -ne 'User' })
     Write-PraItem -Context $context -Status Info -Icon Target -Text ('{0} user(s) and {1} shared mailbox(es) to roll back{2}{3}' -f @($planUsers + $planBack | Where-Object { $_.Item.kind -eq 'User' }).Count, ($planShared.Count + $partial.Count + @($planBack | Where-Object { $_.Item.kind -ne 'User' }).Count),
         $(if ($planBack.Count) { "; $($planBack.Count) already back on-premises (case hold only)" } else { '' }), $(if ($partial.Count) { "; $($partial.Count) shared mailbox(es) not fully converted, rolled back like users" } else { '' }))
@@ -1442,13 +2049,23 @@ function Invoke-PraRecover {
         return
     }
     if (-not $plan.Count) { throw 'Nothing to roll back (see above).' }
-    Confirm-PraApply ('Roll back {0} object(s) of Convert batch {1}?' -f $plan.Count, $convert.id)
+    $lossWarning = if (@($planResources | Where-Object { (Get-Pra2ResourceProtectionMode $_.Intent) -eq 'None' }).Count) { ' UNPROTECTED native resources: NO hold, NO inactive copy; cloud-created reservations/messages are NOT preserved or merged. Deletion may destroy them. Acknowledge after export/reconciliation.' } else { '' }
+    Confirm-PraApply (('Roll back {0} object(s) of Convert batch {1}?' -f $plan.Count, $convert.id) + $lossWarning)
     if ($resume) { $context.BatchId = [string]$resume.id }
     else {
         $context.BatchId = New-Pra2Batch $context.Journal Recover @{ ConvertBatch = $convert.id; SnapshotId = [long]$convert.snapshot_id; Environment = $config.Environment
             Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name; ToolVersion = $toolVersion; ScopeJson = (@{ Identity = $Identity; IdentityPath = $IdentityPath; Identities = @(Get-PraIdentityList).Count; Scope = $Scope } | ConvertTo-Json -Compress) }
     }
-    foreach ($entry in $plan) { Set-Pra2BatchItem $context.Journal $context.BatchId ([string]$entry.Item.object_guid) @{ kind = [string]$entry.Item.kind; identity = $entry.Row.Identity; entra_id = $entry.EntraId; status = 'Running' } }
+    foreach ($entry in $plan) {
+        $values = @{ kind = [string]$entry.Item.kind; identity = $entry.Row.Identity; entra_id = $entry.EntraId; status = 'Running' }
+        if ($entry.Path -eq 'CloudResource') { $values.original_json = ($entry.Intent | ConvertTo-Json -Depth 15 -Compress) }
+        Set-Pra2BatchItem $context.Journal $context.BatchId ([string]$entry.Item.object_guid) $values
+    }
+    foreach ($entry in $resourceBlocked) {
+        Write-PraJournal -ObjectGuid ([string]$entry.Item.object_guid) -Step 'ResourcePreconditionFailed' -Outcome Fail -Detail $entry.Row.Detail -Item @{
+            kind = [string]$entry.Item.kind; identity = $entry.Row.Identity; entra_id = [string]$entry.Intent.cloudId; status = 'Failed'; step = 'ResourcePreconditionFailed'
+            original_json = ($entry.Intent | ConvertTo-Json -Depth 15 -Compress); message = $entry.Row.Detail }
+    }
     Write-PraItem -Context $context -Status Ok -Icon Batch -Text ("Recover batch {0} in {1}" -f $context.BatchId, $config.Store.JournalPath)
     $stopped = $false
     # Waves: every phase of a wave runs for all its objects (one wait per phase); the operator's stop is honoured
@@ -1475,12 +2092,15 @@ function Invoke-PraRecover {
     # The Entra Connect scheduler is paused only while the identities of one wave are deleted.
     . $runWaves -Entries $planShared -Size $config.Licensing.Shared.Parallel -Label 'Shared mailboxes' -Run { param($wave) Invoke-PraRecoverSharedWave -Entries $wave -HoldSet $holdSet }
     if (-not $planShared.Count) { Write-PraItem -Context $context -Status Skip -Text 'No shared mailbox in this batch.' }
+    . $runWaves -Entries $planResources -Size ([Math]::Max(1, [int](Get-PraValue (Get-PraValue $config 'Resources' @{}) 'Parallel' 100))) -Label 'Native resources' -Run { param($wave) Invoke-PraRecoverResourceWave -Entries $wave -HoldSet $holdSet }
     $context.CurrentIdentity = ''
     Write-PraStep -Context $context -Title 'Licence group' -Icon Key
     $context.CurrentOperation = 'Licence-Group'
     # The group serves every Convert batch of this journal: it goes back to AD only when no converted user is left,
     # whichever batch switched it (later waves record nothing, the group was already in the cloud).
-    $changes = @(Invoke-Pra2Sql $context.Journal "SELECT * FROM tenant_change WHERE kind = 'GroupSoa' AND restored = 0" -As Rows)
+    $changes = @(if (@($targets | Where-Object { -not (Get-Pra2ResourceIntent -Item $_) }).Count) {
+            Invoke-Pra2Sql $context.Journal "SELECT * FROM tenant_change WHERE kind = 'GroupSoa' AND restored = 0" -As Rows
+        })
     if (-not $changes.Count) { Write-PraItem -Context $context -Status Skip -Text 'No licence group switched to the cloud by this tool.' }
     else {
         $pending = @(Invoke-Pra2Sql $context.Journal @"
@@ -1505,6 +2125,11 @@ WHERE cb.action = 'Convert' AND ci.kind = 'User' AND ci.step IS NOT NULL
     $complete = $counts.done -eq @($convertItems).Count
     Set-Pra2Batch $context.Journal $context.BatchId $(if ($complete) { 'Complete' } else { 'Partial' }) $counts
     $context.NextSteps = @($(if (-not $complete) { "pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Recover -Mode Apply -Batch $($convert.id)   # resume the objects not finished" })) | Where-Object { $_ }
+    $createdLists = @(Get-Pra2TenantChange $context.Journal $convert.id | Where-Object kind -eq 'NativeRoomList' |
+        ForEach-Object { [string]$_.original_json | ConvertFrom-Json -ErrorAction Stop } | Where-Object { $_.operation -eq 'Create' -and $_.creationAttempted })
+    if ($createdLists.Count) {
+        Write-PraItem -Context $context -Status Info -Text "$($createdLists.Count) journaled cloud room list(s) retained: Recover never deletes groups or inserts routing contacts into RoomLists; review room discovery separately."
+    }
 }
 # =================================================================================================
 # Main
@@ -1563,3 +2188,180 @@ finally {
     if ($PassThru) { $result }
     exit $result.ExitCode
 }
+
+# SIG # Begin signature block
+# MIIghQYJKoZIhvcNAQcCoIIgdjCCIHICAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAAqi3LAvSkKrAe
+# iWN1n+XPozUfrRf7wBlE4vXkAvs3J6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
+# EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
+# A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
+# Fw0xNjA2MjQyMDQ0MzBaFw0zMTA2MjQyMDQ0MzBaMHgxCzAJBgNVBAYTAlVTMQ4w
+# DAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENv
+# cnAxNDAyBgNVBAMMK1NTTC5jb20gQ29kZSBTaWduaW5nIEludGVybWVkaWF0ZSBD
+# QSBSU0EgUjEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCfgxNzqrDG
+# bSHL24t6h3TQcdyOl3Ka5LuINLTdgAPGL0WkdJq/Hg9Q6p5tePOf+lEmqT2d0bKU
+# Vz77OYkbkStW72fL5gvjDjmMxjX0jD3dJekBrBdCfVgWQNz51ShEHZVkMGE6ZPKX
+# 13NMfXsjAm3zdetVPW+qLcSvvnSsXf5qtvzqXHnpD0OctVIFD+8+sbGP0EmtpuNC
+# GVQ/8y8Ooct8/hP5IznaJRy4PgBKOm8yMDdkHseudQfYVdIYyQ6KvKNc8HwKp4WB
+# wg6vj5lc02AlvINaaRwlE81y9eucgJvcLGfE3ckJmNVz68Qho+Uyjj4vUpjGYDdk
+# jLJvSlRyGMwnh/rNdaJjIUy1PWT9K6abVa8mTGC0uVz+q0O9rdATZlAfC9KJpv/X
+# gAbxwxECMzNhF/dWH44vO2jnFfF3VkopngPawismYTJboFblSSmNNqf1x1KiVgMg
+# Lzh4gL32Bq5BNMuURb2bx4kYHwu6/6muakCZE93vUN8BuvIE1tAx3zQ4XldbyDge
+# VtSsSKbt//m4wTvtwiS+RGCnd83VPZhZtEPqqmB9zcLlL/Hr9dQg1Zc0bl0EawUR
+# 0tOSjAknRO1PNTFGfnQZBWLsiePqI3CY5NEv1IoTGEaTZeVYc9NMPSd6Ij/D+KNV
+# t/nmh4LsRR7Fbjp8sU65q2j3m2PVkUG8qQIDAQABo4H7MIH4MA8GA1UdEwEB/wQF
+# MAMBAf8wHwYDVR0jBBgwFoAU3QQJB6L1en1SUxKSle44gCUNplkwMAYIKwYBBQUH
+# AQEEJDAiMCAGCCsGAQUFBzABhhRodHRwOi8vb2NzcHMuc3NsLmNvbTARBgNVHSAE
+# CjAIMAYGBFUdIAAwEwYDVR0lBAwwCgYIKwYBBQUHAwMwOwYDVR0fBDQwMjAwoC6g
+# LIYqaHR0cDovL2NybHMuc3NsLmNvbS9zc2wuY29tLXJzYS1Sb290Q0EuY3JsMB0G
+# A1UdDgQWBBRUwv4QlQCTzWr158DX2bJLuI8M4zAOBgNVHQ8BAf8EBAMCAYYwDQYJ
+# KoZIhvcNAQELBQADggIBAPUPJodwr5miyvXWyfCNZj05gtOII9iCv49UhCe204MH
+# 154niU2EjlTRIO5gQ9tXQjzHsJX2vszqoz2OTwbGK1mGf+tzG8rlQCbgPW/M9r1x
+# xs19DiBAOdYF0q+UCL9/wlG3K7V7gyHwY9rlnOFpLnUdTsthHvWlM98CnRXZ7WmT
+# V7pGRS6AvGW+5xI+3kf/kJwQrfZWsqTU+tb8LryXIbN2g9KR+gZQ0bGAKID+260P
+# Z+34fdzZcFt6umi1s0pmF4/n8OdX3Wn+vF7h1YyfE7uVmhX7eSuF1W0+Z0duGwdc
+# +1RFDxYRLhHDsLy1bhwzV5Qe/kI0Ro4xUE7bM1eV+jjk5hLbq1guRbfZIsr0WkdJ
+# LCjoT4xCPGRo6eZDrBmRqccTgl/8cQo3t51Qezxd96JSgjXktefTCm9r/o35pNfV
+# HUvnfWII+NnXrJlJ27WEQRQu9i5gl1NLmv7xiHp0up516eDap8nMLDt7TAp4z5T3
+# NmC2gzyKVMtODWgqlBF1JhTqIDfM63kXdlV4cW3iSTgzN9vkbFnHI2LmvM4uVEv9
+# XgMqyN0eS3FE0HU+MWJliymm7STheh2ENH+kF3y0rH0/NVjLw78a3Z9UVm1F5VPz
+# iIorMaPKPlDRADTsJwjDZ8Zc6Gi/zy4WZbg8Zv87spWrmo2dzJTw7XhQf+xkR6Od
+# MIIG9TCCBN2gAwIBAgIQBof4ljXihJpmCqqt2mhAWzANBgkqhkiG9w0BAQsFADB4
+# MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24x
+# ETAPBgNVBAoMCFNTTCBDb3JwMTQwMgYDVQQDDCtTU0wuY29tIENvZGUgU2lnbmlu
+# ZyBJbnRlcm1lZGlhdGUgQ0EgUlNBIFIxMB4XDTI2MTAxMzAyNDgwMloXDTI3MTAx
+# MzAyNDgwMlowXDELMAkGA1UEBhMCRlIxGzAZBgNVBAcMEkNoYW50ZWxvdXAtRW4t
+# QnJpZTEXMBUGA1UECgwOTmljb2xhcyBGYWJlcnQxFzAVBgNVBAMMDk5pY29sYXMg
+# RmFiZXJ0MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAsg6CT0mFQ4jB
+# V2plIS4uWFSoVqRHd82Y7XYZ4CUTe/7nPBRUlXXdKTZMMHzGgiG8dEXNE8K1Xe90
+# Dgl/FnorzAFlrNWSwf6t27UAUw9xkqtRDVVpVgpixpWkAwjcQeLG+YMqBkGbFi35
+# TGvS23lPFWvLp4DxARrv15MtZ/NjNTCAAGUlMP2hFVBknEmrnYjEGyeJ93sl20RS
+# WXQQLNqlenBdkGCrQW4XjHtRjJAEqAC68hN6nWevopSQ8CLUV7A1RFfHFarDrzrL
+# zr0/NjIdSyIfM9hShln31NDrktB6Ups2XIyrtPDNB7fjkW4jpLlOqQGfYKsU9ErE
+# 4SnFsh0yOOjitegyh1RvZ9wH++3DF4CmJfTli5l/gEIm8xCCryxI+K5EogW3wu1y
+# u8NT2hcvHjdh7OpRyPyFAuLZ8MfX7kPAJpnuCeOuktzY/20eVD8bDglj+4zgqzsn
+# cR/t6T/7w1/HxpRyrVoKvEyRx+mphYh5jMdEa0BjxOL0vAJpdGZSfXGmPm/yPqRn
+# 5STTkMtzkVQXPbcvgKM0luzFcQKPHk3qdHLEXa8gf93ktYDbLE5Wd2UHrXz3SZxN
+# URHPdIXCr1qgrqQve7041kMpzrkDI5DnG2lvRG4108gp02bHG0muKyZlDdCOra7h
+# Zonu2nO79sFallruzzNi0o994PoWksUCAwEAAaOCAZUwggGRMAwGA1UdEwEB/wQC
+# MAAwHwYDVR0jBBgwFoAUVML+EJUAk81q9efA19myS7iPDOMwegYIKwYBBQUHAQEE
+# bjBsMEgGCCsGAQUFBzAChjxodHRwOi8vY2VydC5zc2wuY29tL1NTTGNvbS1TdWJD
+# QS1Db2RlU2lnbmluZy1SU0EtNDA5Ni1SMS5jZXIwIAYIKwYBBQUHMAGGFGh0dHA6
+# Ly9vY3Nwcy5zc2wuY29tMFEGA1UdIARKMEgwCAYGZ4EMAQQBMDwGDCsGAQQBgqkw
+# AQMDATAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3JlcG9zaXRv
+# cnkwEwYDVR0lBAwwCgYIKwYBBQUHAwMwTQYDVR0fBEYwRDBCoECgPoY8aHR0cDov
+# L2NybHMuc3NsLmNvbS9TU0xjb20tU3ViQ0EtQ29kZVNpZ25pbmctUlNBLTQwOTYt
+# UjEuY3JsMB0GA1UdDgQWBBRoUx3630l9wA1fUpkKkw2GUIxl/jAOBgNVHQ8BAf8E
+# BAMCB4AwDQYJKoZIhvcNAQELBQADggIBAE3oj6cNuwlDToi1BwjgsA5djfRN4DIi
+# BYDFZIRYaIRe/rEdnItz3aqQQdFuwXnJA/MQEmi2WAGek8GeZF+R41s8FbcDxBUE
+# BoSt98TuBE+0xgxQWDiPhhXaX1Aw9V0GF4ZnlfCSw1eu2KiASaKn7Bo0PLbEAXff
+# vftRXof/kyqtw8iID6I4Rhrf5DI3WVZQodakUUmWnbnziWvEZOWbNOfzwP+7BwEt
+# 7jQANfbmEfb4p75rfy5dQVwniTDSvdo6xkrbe1Cr93GS7cJta18IG5CoIVUmdK+s
+# W38B1sLuy8Mi0MstMXV3004yaRuzLdNaAM0f9WAFerxemiQC0kdmA44/lWV3lVkM
+# WJSwkHBkkSg8Eh0hxcGzTH2xmtDhLJHNNLRwkI9u2Ur+HbLCt50oBgSV8BcCs/1i
+# qi884iC/yuX+HIv9YgTUNZ8c4lLaq4VuliJpXLu2buHIsTkO0v0+5oCM91zjTVZm
+# ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
+# eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
+# Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
+# wZislcdCZuS6MYISbDCCEmgCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
+# A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
+# MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
+# AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDnzrNNUWKl
+# aCMIMuZ/l92yGK2zxFMRACkjw7MHcejBNTANBgkqhkiG9w0BAQEFAASCAgA8xenb
+# wzpPscVjtIYj+Xs43JEPF0jvHgodU5Hr7Msl6aEKTRxlvRW8JM9Pe1yLQ0BqiSh/
+# sDFDsju0Ca9zLcfl8/CV+8zqWbq4MJF4i44VtcNn7oVirbmw4qmP0xYKrN1oEs1X
+# pQdRaGDmSYpZWa9zPaZk6ldwnCc3kfJ06oki/qk8/yJo7VpY+o7/6+FaWjcCIrdu
+# +7ZfqRBLmO4fxpwD0dRv9s22/Pud4eG1V44YglTUPltjH3+4aLrwIFagkdsv3ubv
+# +sU4l7cny/UcuKDCIyylGrcCWRAlV8Cdq1KlKXJgYgAnB8kIApV3t3H6KP2JLWhV
+# vOTvnLhnWlobZNyAVmD8tDabjuJG1ZMsmVdKVpJlL6PqKec4sn3W6i3VOdea3Y0m
+# B14lGRGS5UXkLMHQVAZq/THflM7pjC9Qda6HmmfRyh5hO5FbcXfG9bK2SnRSeY/y
+# qgB6MTsGQI2rCXdo56oHxcR+yq9fTkKSbtka28Wm0lLmSO5uWdASC3jJHgkne+KJ
+# I9g/gjp72xcbYBSWqKfLcQb+86Fzqo01A+eA2cMILgYNpcce5Jlq8TFbjca51YZv
+# zRVHYF0KLhzNpgiI6W4COG+dcnHNg2MCT5136uPdHLZ+uowoN+Fe72TEkq57X1IG
+# jnpSnG0xRrwkGNcwNYclcCZve2nI8dI93fKOI6GCDykwgg8lBgorBgEEAYI3AwMB
+# MYIPFTCCDxEGCSqGSIb3DQEHAqCCDwIwgg7+AgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
+# BAIBBQAEIKJwrFWe5cP5PTqEDfOUKNnFyOSOalYY+J5Nx2PKqpIzAghR0r3c9B1d
+# dxgPMjAyNjEwMTQxNTIzMzVaMAMCAQECEH3nmINPa8j7AHu0NaKH8X2gggwAMIIE
+# /DCCAuSgAwIBAgIQH2sWYtIuG2xd8cDBoGAOODANBgkqhkiG9w0BAQsFADBzMQsw
+# CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
+# BgNVBAoMCFNTTCBDb3JwMS8wLQYDVQQDDCZTU0wuY29tIFRpbWVzdGFtcGluZyBJ
+# c3N1aW5nIFJTQSBDQSBSMTAeFw0yNTAyMTgxNjMyMDJaFw0zNDExMTIxODUwMDVa
+# MG4xCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3Rv
+# bjERMA8GA1UECgwIU1NMIENvcnAxKjAoBgNVBAMMIVNTTC5jb20gVGltZXN0YW1w
+# aW5nIFVuaXQgMjAyNSBFMTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABBv7UVHH
+# b+ZVluxPXlfE3M6tg0Xnq8dic+O3vPOCRpalUM1vO9A+GRzSVVjyygHhYrBw62XL
+# Fh1kv7e+yRd/aTajggFaMIIBVjAfBgNVHSMEGDAWgBQMnRAljpqnG5mHQ88IfuG9
+# gZD0zzBRBggrBgEFBQcBAQRFMEMwQQYIKwYBBQUHMAKGNWh0dHA6Ly9jZXJ0LnNz
+# bC5jb20vU1NMLmNvbS10aW1lU3RhbXBpbmctSS1SU0EtUjEuY2VyMFEGA1UdIARK
+# MEgwPAYMKwYBBAGCqTABAwYBMCwwKgYIKwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNz
+# bC5jb20vcmVwb3NpdG9yeTAIBgZngQwBBAIwFgYDVR0lAQH/BAwwCgYIKwYBBQUH
+# AwgwRgYDVR0fBD8wPTA7oDmgN4Y1aHR0cDovL2NybHMuc3NsLmNvbS9TU0wuY29t
+# LXRpbWVTdGFtcGluZy1JLVJTQS1SMS5jcmwwHQYDVR0OBBYEFM582cAEgMUkEGoJ
+# 6hyrJT0R/ajSMA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAgHN1
+# JIW9ZlNip07FfY9r1LJwLKTl1h/y9r1BjDgHMEz7U7J7mAy32JxA1KLyjCCJqNku
+# RfhDHGFEfZtjTOru7AQMDSDiUDvCCc3jaz5py9jGvwIe5npkLbXqXhA+SqCzG719
+# USigwhHkYr7v8NiXoaY0Xu03p0BiZZreZlpngmGB9+86N94FqIFx2I5Z5iuu7d4j
+# 7aAOZBNxfU9jFDIIGDtWfWeCpF0Q8rLE/3DHDlzJKs5Il3i/VoOl7rTU938oSrxM
+# www6GDBlKX8rGHxvkjgIb9MXkVglJSDHsNAZDeCS/inaxKHA+ChuB8K4OxIxa6k1
+# e+eHBypakAY3wuN7w7PlPmhN6k5IdqZn3HZHs2VjoR841Z9wmVPFdGDdkBZ7XOmb
+# 5OZUaKufsvtER0VbY2DkzaqAaItt1kc+I+FUz7PiVz2PUzpegkftRRxvrPyIL08b
+# lJTnbMQ0XrqDN0rEfuTLv4XhhnKyJaXhxCUdjO/cRumMzZ35QTUMItBWy1xGp0iy
+# oFVnAya2pPsVMuAI+sy1zxlOS9l5iSxvKJ8gpnpOgjqYTa7u1eyZo+4JlcGoiiR1
+# 7LthMTrF1q62tO5xOpI8txUZ6gtKGtkJV6wdj+vZLcwKZ2M93GqVpOo6UBlGjx1s
+# KsVZ7AIUzJZli4NJ0M2KYcrfNnlebkYKpDnSqWwwggb8MIIE5KADAgECAhBtUhhw
+# h+gjTYVgANCAj5NWMA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYD
+# VQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBv
+# cmF0aW9uMTEwLwYDVQQDDChTU0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRo
+# b3JpdHkgUlNBMB4XDTE5MTExMzE4NTAwNVoXDTM0MTExMjE4NTAwNVowczELMAkG
+# A1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYD
+# VQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNz
+# dWluZyBSU0EgQ0EgUjEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCu
+# URAT0vk8IKAghd7JUBxkyeH9xek0/wp/MUjoclrFXqhh/fGH91Fc+7fm0MHCE7A+
+# wmOiqBj9ODrJAYGq3rm33jCnHSsCBNWAQYyoauLq8IjqsS1JlXL29qDNMMdwZ8UN
+# zQS7vWZMDJ40JSGNphMGTIA2qn2bohGtgRc4p1395ESypUOaGvJ3t0FNL3BuKmb6
+# YctMcQUF2sqooMzd89h0E6ujdvBDo6ZwNnWoxj7YmfWjSXg33A5GuY9ym4QZM5OE
+# Vgo8ebz/B+gyhyCLNNhh4Mb/4xvCTCMVmNYrBviGgdPZYrym8Zb84TQCmSuX0JlL
+# La6WK1aO6qlwISbb9bVGh866ekKblC/XRP20gAu1CjvcYciUgNTrGFg8f8AJgQPO
+# Cc1/CCdaJSYwhJpSdheKOnQgESgNmYZPhFOC6IKaMAUXk5U1tjTcFCgFvvArXtK4
+# azAWUOO1Y3fdldIBL6LjkzLUCYJNkFXqhsBVcPMuB0nUDWvLJfPimstjJ8lF4S6E
+# CxWnlWi7OElVwTnt1GtRqeY9ydvvGLntU+FecK7DbqHDUd366UreMkSBtzevAc9a
+# qoZPnjVMjvFqV1pYOjzmTiVHZtAc80bAfFe5LLfJzPI6DntNyqobpwTevQpHqPDN
+# 9qqNO83r3kaw8A9j+HZiSw2AX5cGdQP0kG0vhzfgBwIDAQABo4IBgTCCAX0wEgYD
+# VR0TAQH/BAgwBgEB/wIBADAfBgNVHSMEGDAWgBTdBAkHovV6fVJTEpKV7jiAJQ2m
+# WTCBgwYIKwYBBQUHAQEEdzB1MFEGCCsGAQUFBzAChkVodHRwOi8vd3d3LnNzbC5j
+# b20vcmVwb3NpdG9yeS9TU0xjb21Sb290Q2VydGlmaWNhdGlvbkF1dGhvcml0eVJT
+# QS5jcnQwIAYIKwYBBQUHMAGGFGh0dHA6Ly9vY3Nwcy5zc2wuY29tMD8GA1UdIAQ4
+# MDYwNAYEVR0gADAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3Jl
+# cG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYBBQUHAwgwOwYDVR0fBDQwMjAwoC6gLIYq
+# aHR0cDovL2NybHMuc3NsLmNvbS9zc2wuY29tLXJzYS1Sb290Q0EuY3JsMB0GA1Ud
+# DgQWBBQMnRAljpqnG5mHQ88IfuG9gZD0zzAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZI
+# hvcNAQELBQADggIBAJIZdQ2mWkLPGQfZ8vyU+sCb8BXpRJZaL3Ez3VDlE3uZk3cP
+# xPtybVfLuqaci0W6SB22JTMttCiQMnIVOsXWnIuAbD/aFTcUkTLBI3xys+wEajzX
+# aXJYWACDS47BRjDtYlDW14gLJxf8W6DQoH3jHDGGy8kGJFOlDKG7/YrK7UGfHtBA
+# EDVe6lyZ+FtCsrk7dD/IiL/+Q3Q6SFASJLQ2XI89ihFugdYL77CiDNXrI2MFspQG
+# swXEAGpHuaQDTHUp/LdR3TyrIsLlnzoLskUGswF/KF8+kpWUiKJNC4rPWtNrxlbX
+# YRGgdEdx8SMjUTDClldcrknlFxbqHsVmr9xkT2QtFmG+dEq1v5fsIK0vHaHrWjMM
+# maJ9i+4qGJSD0stYfQ6v0PddT7EpGxGd867Ada6FZyHwbuQSadMb0K0P0OC2r7rw
+# qBUe0BaMqTa6LWzWItgBjGcObXeMxmbQqlEz2YtAcErkZvh0WABDDE4U8GyV/32F
+# daAvJgTfe9MiL2nSBioYe/g5mHUSWAay/Ip1RQmQCvmF9sNfqlhJwkjy/1U1ibUk
+# TIUBX3HgymyQvqQTZLLys6pL2tCdWcjI9YuLw30rgZm8+K387L7ycUvqrmQ3ZJlu
+# jHl3r1hgV76s3WwMPgKk1bAEFMj+rRXimSC+Ev30hXZdqyMdl/il5Ksd0vhGMYIC
+# WDCCAlQCAQEwgYcwczELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYD
+# VQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNv
+# bSBUaW1lc3RhbXBpbmcgSXNzdWluZyBSU0EgQ0EgUjECEB9rFmLSLhtsXfHAwaBg
+# DjgwCwYJYIZIAWUDBAIBoIIBYTAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQw
+# HAYJKoZIhvcNAQkFMQ8XDTI2MTAxNDE1MjMzNVowKAYJKoZIhvcNAQk0MRswGTAL
+# BglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEINddWB9HniDd
+# evXuue0vSyvYMS+a63Dc9P4RRHqOTHdPMIHJBgsqhkiG9w0BCRACLzGBuTCBtjCB
+# szCBsAQgVCr5oWqNci5mEUl4iumUwYqaruWmXLNEolSa+Wx5x4swgYswd6R1MHMx
+# CzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjER
+# MA8GA1UECgwIU1NMIENvcnAxLzAtBgNVBAMMJlNTTC5jb20gVGltZXN0YW1waW5n
+# IElzc3VpbmcgUlNBIENBIFIxAhAfaxZi0i4bbF3xwMGgYA44MAoGCCqGSM49BAMC
+# BEcwRQIhAM/+aSJeEoSaGN27jaX9fouFfU5tWNLHdpIOi7mRZAEPAiAnHqO8F8gc
+# b//s6T79RiYbnMAzXwyGAgfqGTby9yg40w==
+# SIG # End signature block

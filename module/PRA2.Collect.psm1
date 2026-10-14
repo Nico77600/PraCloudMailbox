@@ -17,7 +17,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.2.0
+    Version : 1.3.0
 #>
 #Requires -Version 5.1
 Set-StrictMode -Version Latest
@@ -25,7 +25,8 @@ $ErrorActionPreference = 'Stop'
 
 # Exchange cmdlets used by Collect (imported from the remote session in Remote mode).
 $script:ExchangeCommands = @('Get-Mailbox','Get-MailboxStatistics','Get-MailboxPermission','Get-ADPermission','Get-Recipient','Get-User',
-    'Get-Group','Get-MailContact','Get-DistributionGroup','Get-DistributionGroupMember','Get-DynamicDistributionGroup','Get-ExchangeServer','Set-ADServerSettings')
+    'Get-Group','Get-MailContact','Get-DistributionGroup','Get-DistributionGroupMember','Get-DynamicDistributionGroup','Get-ExchangeServer','Set-ADServerSettings',
+    'Get-CalendarProcessing','Get-MailboxCalendarConfiguration')
 # Trustees never reproduced: system and Exchange/AD administration accounts (on top of Collect.ExcludeTrustees).
 $script:BuiltInTrusteePatterns = @('^NT AUTHORITY\\', '^AUTORITE NT\\', '^S-1-5-', '^Everyone$', '^Tout le monde$',
     '\\(Organization Management|Exchange Servers|Exchange Trusted Subsystem|Exchange Windows Permissions|Exchange Domain Servers|Exchange Enterprise Servers|Delegated Setup|Domain Admins|Enterprise Admins|Admins du domaine|Administrateurs de l.entreprise|Public Folder Management|Managed Availability Servers|Discovery Management|Exchange Install Domain Servers)$')
@@ -213,7 +214,7 @@ function ConvertTo-Pra2MailboxRecord {
         Exchange mailbox (+ statistics) -> row of the mailbox table.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][object]$Mailbox, [AllowNull()][object]$Statistics)
+    param([Parameter(Mandatory)][object]$Mailbox, [AllowNull()][object]$Statistics, [AllowNull()][hashtable]$ResourceSettings)
     $attributes = [ordered]@{}
     for ($i = 1; $i -le 15; $i++) {
         $name = "CustomAttribute$i"
@@ -221,7 +222,7 @@ function ConvertTo-Pra2MailboxRecord {
         if ($value) { $attributes[$name] = $value }
     }
     $addresses = @($Mailbox.EmailAddresses | ForEach-Object { [string]$_ } | Where-Object { $_ })
-    $onBehalf = @($Mailbox.GrantSendOnBehalfTo | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    $onBehalf = @(if (-not $ResourceSettings) { $Mailbox.GrantSendOnBehalfTo | ForEach-Object { [string]$_ } | Where-Object { $_ } })
     $type = [string]$Mailbox.RecipientTypeDetails
     $kind = $script:KindByType[$type]
     if (-not $kind) { throw "Unsupported mailbox type $type for $($Mailbox.Identity)." }
@@ -239,6 +240,143 @@ function ConvertTo-Pra2MailboxRecord {
         custom_attributes_json = ($attributes | ConvertTo-Json -Compress); grant_send_on_behalf_json = (ConvertTo-Json -InputObject @($onBehalf) -Compress)
         item_count = $(if ($Statistics) { [long]$Statistics.ItemCount } else { $null })
         total_item_size_bytes = $(if ($Statistics) { ConvertTo-Pra2SizeBytes $Statistics.TotalItemSize } else { $null })
+        resource_settings_json = $(if ($ResourceSettings) { ConvertTo-Json -InputObject $ResourceSettings -Depth 6 -Compress } else { $null })
+    }
+}
+
+function Get-Pra2ResourceSettings {
+    <# A portable booking snapshot: recipient references are SMTP addresses, not AD DNs. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][object]$Mailbox)
+    if ([string]$Mailbox.RecipientTypeDetails -notin @('RoomMailbox','EquipmentMailbox')) { throw 'Resource settings require a room or equipment mailbox.' }
+    $identity = [string]$Mailbox.DistinguishedName
+    $dc = Get-Pra2DcParameter $Context
+    $processing = Get-CalendarProcessing -Identity $identity @dc -ErrorAction Stop
+    $work = Get-MailboxCalendarConfiguration -Identity $identity @dc -ErrorAction Stop
+    if (-not $processing -or -not $work) { throw "Resource settings of $($Mailbox.PrimarySmtpAddress) could not be read: no calendar configuration returned." }
+    $user = Get-User -Identity $identity @dc -ErrorAction Stop
+    if (-not $user) { throw "Resource descriptive properties of $($Mailbox.PrimarySmtpAddress) could not be read." }
+    $directory = [ordered]@{}
+    foreach ($name in @('Office','StreetAddress','City','StateOrProvince','PostalCode','CountryOrRegion','Phone','Notes')) {
+        if (-not $user.PSObject.Properties[$name]) { throw "Resource descriptive property $name is not exposed on $($Mailbox.PrimarySmtpAddress); no incomplete snapshot is written." }
+        $directory[$name] = [string]$user.$name
+    }
+    foreach ($property in @('ResourceCapacity','ResourceCustom')) {
+        if (-not $Mailbox.PSObject.Properties[$property]) { throw "Resource settings: $property missing on $($Mailbox.PrimarySmtpAddress)." }
+    }
+    $delivery = Get-Pra2DeliverySettings -Context $Context -Recipient $Mailbox
+    $calendar = [ordered]@{}
+    $required = @('AutomateProcessing','AllBookInPolicy','AllRequestInPolicy','AllRequestOutOfPolicy',
+        'ResourceDelegates','BookInPolicy','RequestInPolicy','RequestOutOfPolicy','ScheduleOnlyDuringWorkHours')
+    $scalars = @('AutomateProcessing','AllowConflicts','BookingWindowInDays','MaximumDurationInMinutes','AllowRecurringMeetings',
+        'EnforceSchedulingHorizon','ScheduleOnlyDuringWorkHours','ConflictPercentageAllowed','MaximumConflictInstances',
+        'ForwardRequestsToDelegates','DeleteAttachments','DeleteComments','RemovePrivateProperty','DeleteSubject',
+        'AddOrganizerToSubject','DeleteNonCalendarItems','TentativePendingApproval','EnableResponseDetails','OrganizerInfo',
+        'AllBookInPolicy','AllRequestInPolicy','AllRequestOutOfPolicy','AddAdditionalResponse','AdditionalResponse',
+        'ProcessExternalMeetingMessages','RemoveOldMeetingMessages')
+    foreach ($name in $required) {
+        if (-not $processing.PSObject.Properties[$name]) { throw "Resource settings: $name missing on $($Mailbox.PrimarySmtpAddress); booking policies cannot be safely reproduced." }
+    }
+    foreach ($name in $scalars) {
+        if ($processing.PSObject.Properties[$name]) {
+            $value = $processing.$name
+            $calendar[$name] = if ($name -in @('AutomateProcessing','AdditionalResponse')) { [string]$value } else { $value }
+        }
+    }
+    foreach ($name in @('ResourceDelegates','BookInPolicy','RequestInPolicy','RequestOutOfPolicy')) {
+        $recipients = [System.Collections.Generic.List[string]]::new()
+        foreach ($reference in @($processing.$name)) {
+            if (-not $reference) { continue }
+            $trustee = Resolve-Pra2Trustee -Context $Context -Trustee ([string]$reference)
+            if (-not $trustee.Resolved -or -not $trustee.Smtp) {
+                throw "Resource settings: $name trustee '$reference' on $($Mailbox.PrimarySmtpAddress) has no resolved SMTP address. Correct it before Collect."
+            }
+            if (-not $recipients.Contains([string]$trustee.Smtp)) { $recipients.Add([string]$trustee.Smtp) }
+        }
+        $calendar[$name] = $recipients.ToArray()
+    }
+    $hours = [ordered]@{}
+    foreach ($name in @('WorkingHoursStartTime','WorkingHoursEndTime','WorkingHoursDays','WorkingHoursTimeZone')) {
+        # WorkDays is the service property; WorkingHoursDays remains the portable snapshot key.
+        $readName = if ($name -eq 'WorkingHoursDays') { 'WorkDays' } else { $name }
+        if (-not $work.PSObject.Properties[$readName]) { throw "Resource settings: $readName missing on $($Mailbox.PrimarySmtpAddress)." }
+        $value = $work.$readName
+        if ($null -eq $value) { throw "Resource settings: $readName unreadable on $($Mailbox.PrimarySmtpAddress)." }
+        switch ($name) {
+            'WorkingHoursDays' {
+                $days = [string[]]@($value | ForEach-Object { ([string]$_ -split ',') | ForEach-Object { $_.Trim() } })
+                if (-not $days.Count -or @($days | Where-Object { $_ -notin @('Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday','Weekdays','WeekendDays','AllDays') }).Count) {
+                    throw "Resource settings: WorkDays invalid on $($Mailbox.PrimarySmtpAddress); no incomplete working-hours snapshot is written."
+                }
+                $hours[$name] = $days
+            }
+            'WorkingHoursTimeZone' {
+                $hours[$name] = if ($value.PSObject.Properties['Id']) { [string]$value.Id } else { [string]$value }
+                if (-not $hours[$name]) { throw "Resource settings: empty working-hours time zone on $($Mailbox.PrimarySmtpAddress)." }
+            }
+            default { $hours[$name] = ([timespan]::Parse([string]$value, [Globalization.CultureInfo]::InvariantCulture)).ToString('c') }
+        }
+    }
+    $roomLists = @(if ([string]$Mailbox.RecipientTypeDetails -eq 'RoomMailbox') { Get-Pra2ResourceRoomLists -Context $Context -Mailbox $Mailbox })
+    return @{ SchemaVersion = 2; Capacity = [int]$Mailbox.ResourceCapacity
+        ResourceCustom = [string[]]@($Mailbox.ResourceCustom | ForEach-Object { [string]$_ }); Calendar = $calendar; CalendarConfiguration = $hours
+        Directory = $directory; RoomLists = $roomLists; Delivery = $delivery }
+}
+
+function Get-Pra2DeliverySettings {
+    param([hashtable]$Context, [object]$Recipient)
+    $delivery = [ordered]@{}
+    foreach ($name in @('RequireSenderAuthenticationEnabled','ModerationEnabled','SendModerationNotifications')) {
+        if (-not $Recipient.PSObject.Properties[$name]) { throw "Resource delivery restriction $name is not exposed on $($Recipient.PrimarySmtpAddress)." }
+        $delivery[$name] = if ($name -eq 'SendModerationNotifications') { [string]$Recipient.$name } else { $Recipient.$name }
+        if ($name -ne 'SendModerationNotifications' -and $delivery[$name] -isnot [bool]) { throw "Resource delivery restriction $name is not a boolean on $($Recipient.PrimarySmtpAddress)." }
+    }
+    foreach ($name in @('AcceptMessagesOnlyFromSendersOrMembers','RejectMessagesFromSendersOrMembers','ModeratedBy','BypassModerationFromSendersOrMembers')) {
+        if (-not $Recipient.PSObject.Properties[$name]) { throw "Resource delivery restriction $name is not exposed on $($Recipient.PrimarySmtpAddress)." }
+        $values = @(foreach ($reference in @($Recipient.$name)) {
+                if ($null -eq $reference) { continue }
+                $trustee = Resolve-Pra2Trustee -Context $Context -Trustee ([string]$reference)
+                if (-not $trustee.Resolved -or -not $trustee.Smtp) { throw "Resource delivery restriction $name has an unresolved recipient '$reference' on $($Recipient.PrimarySmtpAddress)." }
+                [string]$trustee.Smtp
+            })
+        $delivery[$name] = @($values | Select-Object -Unique)
+    }
+    if ($delivery.SendModerationNotifications -notin @('Never','Internal','Always') -or ($delivery.ModerationEnabled -and -not $delivery.ModeratedBy.Count)) {
+        throw "Resource delivery restriction moderation is incomplete on $($Recipient.PrimarySmtpAddress)."
+    }
+    return $delivery
+}
+
+function Get-Pra2ResourceRoomLists {
+    param([hashtable]$Context, [object]$Mailbox)
+    if (-not $Context.ContainsKey('ResourceRoomListInventory')) {
+        $dc = Get-Pra2DcParameter $Context
+        $inventory = @(foreach ($group in @(Get-DistributionGroup -Filter "RecipientTypeDetails -eq 'RoomList'" -ResultSize Unlimited @dc -ErrorAction Stop)) {
+                foreach ($name in @('Guid','Name','DisplayName','Alias','PrimarySmtpAddress','HiddenFromAddressListsEnabled',
+                        'EmailAddresses','LegacyExchangeDN','MemberJoinRestriction','MemberDepartRestriction')) {
+                    if (-not $group.PSObject.Properties[$name]) { throw "Room list metadata $name is not exposed; no incomplete resource snapshot is written." }
+                }
+                if ([string]$group.PrimarySmtpAddress -notmatch '^[^@\s]+@[^@\s]+$' -or -not [string]$group.Guid -or
+                    -not [string]$group.Name -or -not [string]$group.DisplayName -or -not [string]$group.Alias -or
+                    $group.HiddenFromAddressListsEnabled -isnot [bool]) { throw 'Room list identity/SMTP/visibility is missing; no incomplete resource snapshot is written.' }
+                if ([string]$group.MemberJoinRestriction -notin @('Closed','Open','ApprovalRequired') -or
+                    [string]$group.MemberDepartRestriction -notin @('Closed','Open')) { throw "Room list $($group.PrimarySmtpAddress) has unreadable membership controls." }
+                $members = @(Get-DistributionGroupMember -Identity ([string]$group.Guid) -ResultSize Unlimited @dc -ErrorAction Stop)
+                foreach ($member in $members) {
+                    if (-not $member.PSObject.Properties['Guid'] -or -not [string]$member.Guid) { throw "Room list $($group.PrimarySmtpAddress) has an unreadable member identity." }
+                }
+                [pscustomobject]@{ MemberGuids = @($members | ForEach-Object { [string]$_.Guid })
+                    Metadata = [ordered]@{ SchemaVersion = 1; SourceGuid = [string]$group.Guid; Name = [string]$group.Name; DisplayName = [string]$group.DisplayName
+                        Alias = [string]$group.Alias; PrimarySmtpAddress = [string]$group.PrimarySmtpAddress
+                        HiddenFromAddressListsEnabled = [bool]$group.HiddenFromAddressListsEnabled
+                        EmailAddresses = @($group.EmailAddresses | ForEach-Object { [string]$_ }); LegacyExchangeDN = [string]$group.LegacyExchangeDN
+                        MemberJoinRestriction = [string]$group.MemberJoinRestriction; MemberDepartRestriction = [string]$group.MemberDepartRestriction
+                        Delivery = (Get-Pra2DeliverySettings -Context $Context -Recipient $group) } }
+            })
+        $Context['ResourceRoomListInventory'] = $inventory
+    }
+    foreach ($entry in $Context.ResourceRoomListInventory) {
+        if ([string]$Mailbox.Guid -in $entry.MemberGuids) { $entry.Metadata }
     }
 }
 #endregion
@@ -473,4 +611,181 @@ function Get-Pra2DistributionGroup {
 
 Export-ModuleMember -Function Connect-Pra2Exchange, Disconnect-Pra2Exchange, Get-Pra2RecipientType, Get-Pra2ScopeMailbox, Get-Pra2GroupMemberDn,
     ConvertTo-Pra2ImmutableId, ConvertTo-Pra2SizeBytes, ConvertTo-Pra2MailboxRecord, Test-Pra2ExcludedTrustee, Resolve-Pra2Trustee,
-    Get-Pra2DelegateListLink, Get-Pra2SharedPermission, Get-Pra2Contact, Get-Pra2DistributionGroup
+    Get-Pra2DelegateListLink, Get-Pra2SharedPermission, Get-Pra2Contact, Get-Pra2DistributionGroup, Get-Pra2ResourceSettings
+
+# SIG # Begin signature block
+# MIIghQYJKoZIhvcNAQcCoIIgdjCCIHICAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDUudzc/dR61kEm
+# ka08IBCTb6XTILQiOIYutoel3eVJYKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
+# EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
+# A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
+# Fw0xNjA2MjQyMDQ0MzBaFw0zMTA2MjQyMDQ0MzBaMHgxCzAJBgNVBAYTAlVTMQ4w
+# DAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENv
+# cnAxNDAyBgNVBAMMK1NTTC5jb20gQ29kZSBTaWduaW5nIEludGVybWVkaWF0ZSBD
+# QSBSU0EgUjEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCfgxNzqrDG
+# bSHL24t6h3TQcdyOl3Ka5LuINLTdgAPGL0WkdJq/Hg9Q6p5tePOf+lEmqT2d0bKU
+# Vz77OYkbkStW72fL5gvjDjmMxjX0jD3dJekBrBdCfVgWQNz51ShEHZVkMGE6ZPKX
+# 13NMfXsjAm3zdetVPW+qLcSvvnSsXf5qtvzqXHnpD0OctVIFD+8+sbGP0EmtpuNC
+# GVQ/8y8Ooct8/hP5IznaJRy4PgBKOm8yMDdkHseudQfYVdIYyQ6KvKNc8HwKp4WB
+# wg6vj5lc02AlvINaaRwlE81y9eucgJvcLGfE3ckJmNVz68Qho+Uyjj4vUpjGYDdk
+# jLJvSlRyGMwnh/rNdaJjIUy1PWT9K6abVa8mTGC0uVz+q0O9rdATZlAfC9KJpv/X
+# gAbxwxECMzNhF/dWH44vO2jnFfF3VkopngPawismYTJboFblSSmNNqf1x1KiVgMg
+# Lzh4gL32Bq5BNMuURb2bx4kYHwu6/6muakCZE93vUN8BuvIE1tAx3zQ4XldbyDge
+# VtSsSKbt//m4wTvtwiS+RGCnd83VPZhZtEPqqmB9zcLlL/Hr9dQg1Zc0bl0EawUR
+# 0tOSjAknRO1PNTFGfnQZBWLsiePqI3CY5NEv1IoTGEaTZeVYc9NMPSd6Ij/D+KNV
+# t/nmh4LsRR7Fbjp8sU65q2j3m2PVkUG8qQIDAQABo4H7MIH4MA8GA1UdEwEB/wQF
+# MAMBAf8wHwYDVR0jBBgwFoAU3QQJB6L1en1SUxKSle44gCUNplkwMAYIKwYBBQUH
+# AQEEJDAiMCAGCCsGAQUFBzABhhRodHRwOi8vb2NzcHMuc3NsLmNvbTARBgNVHSAE
+# CjAIMAYGBFUdIAAwEwYDVR0lBAwwCgYIKwYBBQUHAwMwOwYDVR0fBDQwMjAwoC6g
+# LIYqaHR0cDovL2NybHMuc3NsLmNvbS9zc2wuY29tLXJzYS1Sb290Q0EuY3JsMB0G
+# A1UdDgQWBBRUwv4QlQCTzWr158DX2bJLuI8M4zAOBgNVHQ8BAf8EBAMCAYYwDQYJ
+# KoZIhvcNAQELBQADggIBAPUPJodwr5miyvXWyfCNZj05gtOII9iCv49UhCe204MH
+# 154niU2EjlTRIO5gQ9tXQjzHsJX2vszqoz2OTwbGK1mGf+tzG8rlQCbgPW/M9r1x
+# xs19DiBAOdYF0q+UCL9/wlG3K7V7gyHwY9rlnOFpLnUdTsthHvWlM98CnRXZ7WmT
+# V7pGRS6AvGW+5xI+3kf/kJwQrfZWsqTU+tb8LryXIbN2g9KR+gZQ0bGAKID+260P
+# Z+34fdzZcFt6umi1s0pmF4/n8OdX3Wn+vF7h1YyfE7uVmhX7eSuF1W0+Z0duGwdc
+# +1RFDxYRLhHDsLy1bhwzV5Qe/kI0Ro4xUE7bM1eV+jjk5hLbq1guRbfZIsr0WkdJ
+# LCjoT4xCPGRo6eZDrBmRqccTgl/8cQo3t51Qezxd96JSgjXktefTCm9r/o35pNfV
+# HUvnfWII+NnXrJlJ27WEQRQu9i5gl1NLmv7xiHp0up516eDap8nMLDt7TAp4z5T3
+# NmC2gzyKVMtODWgqlBF1JhTqIDfM63kXdlV4cW3iSTgzN9vkbFnHI2LmvM4uVEv9
+# XgMqyN0eS3FE0HU+MWJliymm7STheh2ENH+kF3y0rH0/NVjLw78a3Z9UVm1F5VPz
+# iIorMaPKPlDRADTsJwjDZ8Zc6Gi/zy4WZbg8Zv87spWrmo2dzJTw7XhQf+xkR6Od
+# MIIG9TCCBN2gAwIBAgIQBof4ljXihJpmCqqt2mhAWzANBgkqhkiG9w0BAQsFADB4
+# MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24x
+# ETAPBgNVBAoMCFNTTCBDb3JwMTQwMgYDVQQDDCtTU0wuY29tIENvZGUgU2lnbmlu
+# ZyBJbnRlcm1lZGlhdGUgQ0EgUlNBIFIxMB4XDTI2MTAxMzAyNDgwMloXDTI3MTAx
+# MzAyNDgwMlowXDELMAkGA1UEBhMCRlIxGzAZBgNVBAcMEkNoYW50ZWxvdXAtRW4t
+# QnJpZTEXMBUGA1UECgwOTmljb2xhcyBGYWJlcnQxFzAVBgNVBAMMDk5pY29sYXMg
+# RmFiZXJ0MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAsg6CT0mFQ4jB
+# V2plIS4uWFSoVqRHd82Y7XYZ4CUTe/7nPBRUlXXdKTZMMHzGgiG8dEXNE8K1Xe90
+# Dgl/FnorzAFlrNWSwf6t27UAUw9xkqtRDVVpVgpixpWkAwjcQeLG+YMqBkGbFi35
+# TGvS23lPFWvLp4DxARrv15MtZ/NjNTCAAGUlMP2hFVBknEmrnYjEGyeJ93sl20RS
+# WXQQLNqlenBdkGCrQW4XjHtRjJAEqAC68hN6nWevopSQ8CLUV7A1RFfHFarDrzrL
+# zr0/NjIdSyIfM9hShln31NDrktB6Ups2XIyrtPDNB7fjkW4jpLlOqQGfYKsU9ErE
+# 4SnFsh0yOOjitegyh1RvZ9wH++3DF4CmJfTli5l/gEIm8xCCryxI+K5EogW3wu1y
+# u8NT2hcvHjdh7OpRyPyFAuLZ8MfX7kPAJpnuCeOuktzY/20eVD8bDglj+4zgqzsn
+# cR/t6T/7w1/HxpRyrVoKvEyRx+mphYh5jMdEa0BjxOL0vAJpdGZSfXGmPm/yPqRn
+# 5STTkMtzkVQXPbcvgKM0luzFcQKPHk3qdHLEXa8gf93ktYDbLE5Wd2UHrXz3SZxN
+# URHPdIXCr1qgrqQve7041kMpzrkDI5DnG2lvRG4108gp02bHG0muKyZlDdCOra7h
+# Zonu2nO79sFallruzzNi0o994PoWksUCAwEAAaOCAZUwggGRMAwGA1UdEwEB/wQC
+# MAAwHwYDVR0jBBgwFoAUVML+EJUAk81q9efA19myS7iPDOMwegYIKwYBBQUHAQEE
+# bjBsMEgGCCsGAQUFBzAChjxodHRwOi8vY2VydC5zc2wuY29tL1NTTGNvbS1TdWJD
+# QS1Db2RlU2lnbmluZy1SU0EtNDA5Ni1SMS5jZXIwIAYIKwYBBQUHMAGGFGh0dHA6
+# Ly9vY3Nwcy5zc2wuY29tMFEGA1UdIARKMEgwCAYGZ4EMAQQBMDwGDCsGAQQBgqkw
+# AQMDATAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3JlcG9zaXRv
+# cnkwEwYDVR0lBAwwCgYIKwYBBQUHAwMwTQYDVR0fBEYwRDBCoECgPoY8aHR0cDov
+# L2NybHMuc3NsLmNvbS9TU0xjb20tU3ViQ0EtQ29kZVNpZ25pbmctUlNBLTQwOTYt
+# UjEuY3JsMB0GA1UdDgQWBBRoUx3630l9wA1fUpkKkw2GUIxl/jAOBgNVHQ8BAf8E
+# BAMCB4AwDQYJKoZIhvcNAQELBQADggIBAE3oj6cNuwlDToi1BwjgsA5djfRN4DIi
+# BYDFZIRYaIRe/rEdnItz3aqQQdFuwXnJA/MQEmi2WAGek8GeZF+R41s8FbcDxBUE
+# BoSt98TuBE+0xgxQWDiPhhXaX1Aw9V0GF4ZnlfCSw1eu2KiASaKn7Bo0PLbEAXff
+# vftRXof/kyqtw8iID6I4Rhrf5DI3WVZQodakUUmWnbnziWvEZOWbNOfzwP+7BwEt
+# 7jQANfbmEfb4p75rfy5dQVwniTDSvdo6xkrbe1Cr93GS7cJta18IG5CoIVUmdK+s
+# W38B1sLuy8Mi0MstMXV3004yaRuzLdNaAM0f9WAFerxemiQC0kdmA44/lWV3lVkM
+# WJSwkHBkkSg8Eh0hxcGzTH2xmtDhLJHNNLRwkI9u2Ur+HbLCt50oBgSV8BcCs/1i
+# qi884iC/yuX+HIv9YgTUNZ8c4lLaq4VuliJpXLu2buHIsTkO0v0+5oCM91zjTVZm
+# ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
+# eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
+# Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
+# wZislcdCZuS6MYISbDCCEmgCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
+# A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
+# MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
+# AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCA9dmNvG7Wj
+# Pz3l9AqGZVCNe1h8xh2sddm4/mgSjbsaBjANBgkqhkiG9w0BAQEFAASCAgCxyMyr
+# 5qL0IANKmJBHzR8SLDE04uxTqnStWGOhtrHfL8psXKfVYRacDUNwcIZJEiM+00av
+# Ehf+ije2uW8xha/efKP2YGI/vA9Pj8OBRWqAM/MwowvoNsGnWUR8GKAelvvcgmR0
+# 2YI+im0HsYXE+Lf/699MWh5jHm5+iQ7uFGG8k7bmmM5xSlNObTE79hiKnggSkhFC
+# fU5VDbIHNmO/f7obbjF4DKUSW/oW2Tjxpiiw8miApdiLlp5x8qECNEqMdPt6BW/X
+# BGzzJEkyS65+7Rs+Cvbv/Obb2G4+GxhZ6Coflnx0E0s+J1ZkHWx5YG3sUR70qbsH
+# rC9NEz6mf9VFZR4ictxPXjhuZq1DS1ySqlO55CpZ3pzbVCYa57Yxw4EHdmSsJejX
+# fmBmqyZUBqMROTsn284gHVaQreAEIKqVJr7xjqxqRIsLNbQ/JCmtGKphI0jcPMwF
+# kY48qE35l9YKdAfiblFlQayt3r/oDfZr6Vc/hc3S3Lvbb8QxLJVJarclNoK1VA9y
+# 2gWZ5oksVdb0pBeEGm5p8Bu/HrhVzVLHYcRcem5gaTs6xVpTSiY/0dDQEIOtkDnC
+# M89OzbNTUR9CtkatRKwDX2mSh8Mx8nE4do9I1pluXxI9jkCFoZzaXNdrve4/F9Ai
+# vjfUK5eCrLZHxwuXGUtTc0PVUpJre37dc7HqUKGCDykwgg8lBgorBgEEAYI3AwMB
+# MYIPFTCCDxEGCSqGSIb3DQEHAqCCDwIwgg7+AgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
+# BAIBBQAEIG1k6TQOJl3Rtw6foXGc4AWojkGfcdTNAkYjp9Xj4CF4Aggks1c43qwG
+# YhgPMjAyNjEwMTQxNTIzNDZaMAMCAQECEEO0tu9Q6EirurxhCK9kviygggwAMIIE
+# /DCCAuSgAwIBAgIQH2sWYtIuG2xd8cDBoGAOODANBgkqhkiG9w0BAQsFADBzMQsw
+# CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
+# BgNVBAoMCFNTTCBDb3JwMS8wLQYDVQQDDCZTU0wuY29tIFRpbWVzdGFtcGluZyBJ
+# c3N1aW5nIFJTQSBDQSBSMTAeFw0yNTAyMTgxNjMyMDJaFw0zNDExMTIxODUwMDVa
+# MG4xCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3Rv
+# bjERMA8GA1UECgwIU1NMIENvcnAxKjAoBgNVBAMMIVNTTC5jb20gVGltZXN0YW1w
+# aW5nIFVuaXQgMjAyNSBFMTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABBv7UVHH
+# b+ZVluxPXlfE3M6tg0Xnq8dic+O3vPOCRpalUM1vO9A+GRzSVVjyygHhYrBw62XL
+# Fh1kv7e+yRd/aTajggFaMIIBVjAfBgNVHSMEGDAWgBQMnRAljpqnG5mHQ88IfuG9
+# gZD0zzBRBggrBgEFBQcBAQRFMEMwQQYIKwYBBQUHMAKGNWh0dHA6Ly9jZXJ0LnNz
+# bC5jb20vU1NMLmNvbS10aW1lU3RhbXBpbmctSS1SU0EtUjEuY2VyMFEGA1UdIARK
+# MEgwPAYMKwYBBAGCqTABAwYBMCwwKgYIKwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNz
+# bC5jb20vcmVwb3NpdG9yeTAIBgZngQwBBAIwFgYDVR0lAQH/BAwwCgYIKwYBBQUH
+# AwgwRgYDVR0fBD8wPTA7oDmgN4Y1aHR0cDovL2NybHMuc3NsLmNvbS9TU0wuY29t
+# LXRpbWVTdGFtcGluZy1JLVJTQS1SMS5jcmwwHQYDVR0OBBYEFM582cAEgMUkEGoJ
+# 6hyrJT0R/ajSMA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAgHN1
+# JIW9ZlNip07FfY9r1LJwLKTl1h/y9r1BjDgHMEz7U7J7mAy32JxA1KLyjCCJqNku
+# RfhDHGFEfZtjTOru7AQMDSDiUDvCCc3jaz5py9jGvwIe5npkLbXqXhA+SqCzG719
+# USigwhHkYr7v8NiXoaY0Xu03p0BiZZreZlpngmGB9+86N94FqIFx2I5Z5iuu7d4j
+# 7aAOZBNxfU9jFDIIGDtWfWeCpF0Q8rLE/3DHDlzJKs5Il3i/VoOl7rTU938oSrxM
+# www6GDBlKX8rGHxvkjgIb9MXkVglJSDHsNAZDeCS/inaxKHA+ChuB8K4OxIxa6k1
+# e+eHBypakAY3wuN7w7PlPmhN6k5IdqZn3HZHs2VjoR841Z9wmVPFdGDdkBZ7XOmb
+# 5OZUaKufsvtER0VbY2DkzaqAaItt1kc+I+FUz7PiVz2PUzpegkftRRxvrPyIL08b
+# lJTnbMQ0XrqDN0rEfuTLv4XhhnKyJaXhxCUdjO/cRumMzZ35QTUMItBWy1xGp0iy
+# oFVnAya2pPsVMuAI+sy1zxlOS9l5iSxvKJ8gpnpOgjqYTa7u1eyZo+4JlcGoiiR1
+# 7LthMTrF1q62tO5xOpI8txUZ6gtKGtkJV6wdj+vZLcwKZ2M93GqVpOo6UBlGjx1s
+# KsVZ7AIUzJZli4NJ0M2KYcrfNnlebkYKpDnSqWwwggb8MIIE5KADAgECAhBtUhhw
+# h+gjTYVgANCAj5NWMA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYD
+# VQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBv
+# cmF0aW9uMTEwLwYDVQQDDChTU0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRo
+# b3JpdHkgUlNBMB4XDTE5MTExMzE4NTAwNVoXDTM0MTExMjE4NTAwNVowczELMAkG
+# A1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYD
+# VQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNz
+# dWluZyBSU0EgQ0EgUjEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCu
+# URAT0vk8IKAghd7JUBxkyeH9xek0/wp/MUjoclrFXqhh/fGH91Fc+7fm0MHCE7A+
+# wmOiqBj9ODrJAYGq3rm33jCnHSsCBNWAQYyoauLq8IjqsS1JlXL29qDNMMdwZ8UN
+# zQS7vWZMDJ40JSGNphMGTIA2qn2bohGtgRc4p1395ESypUOaGvJ3t0FNL3BuKmb6
+# YctMcQUF2sqooMzd89h0E6ujdvBDo6ZwNnWoxj7YmfWjSXg33A5GuY9ym4QZM5OE
+# Vgo8ebz/B+gyhyCLNNhh4Mb/4xvCTCMVmNYrBviGgdPZYrym8Zb84TQCmSuX0JlL
+# La6WK1aO6qlwISbb9bVGh866ekKblC/XRP20gAu1CjvcYciUgNTrGFg8f8AJgQPO
+# Cc1/CCdaJSYwhJpSdheKOnQgESgNmYZPhFOC6IKaMAUXk5U1tjTcFCgFvvArXtK4
+# azAWUOO1Y3fdldIBL6LjkzLUCYJNkFXqhsBVcPMuB0nUDWvLJfPimstjJ8lF4S6E
+# CxWnlWi7OElVwTnt1GtRqeY9ydvvGLntU+FecK7DbqHDUd366UreMkSBtzevAc9a
+# qoZPnjVMjvFqV1pYOjzmTiVHZtAc80bAfFe5LLfJzPI6DntNyqobpwTevQpHqPDN
+# 9qqNO83r3kaw8A9j+HZiSw2AX5cGdQP0kG0vhzfgBwIDAQABo4IBgTCCAX0wEgYD
+# VR0TAQH/BAgwBgEB/wIBADAfBgNVHSMEGDAWgBTdBAkHovV6fVJTEpKV7jiAJQ2m
+# WTCBgwYIKwYBBQUHAQEEdzB1MFEGCCsGAQUFBzAChkVodHRwOi8vd3d3LnNzbC5j
+# b20vcmVwb3NpdG9yeS9TU0xjb21Sb290Q2VydGlmaWNhdGlvbkF1dGhvcml0eVJT
+# QS5jcnQwIAYIKwYBBQUHMAGGFGh0dHA6Ly9vY3Nwcy5zc2wuY29tMD8GA1UdIAQ4
+# MDYwNAYEVR0gADAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3Jl
+# cG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYBBQUHAwgwOwYDVR0fBDQwMjAwoC6gLIYq
+# aHR0cDovL2NybHMuc3NsLmNvbS9zc2wuY29tLXJzYS1Sb290Q0EuY3JsMB0GA1Ud
+# DgQWBBQMnRAljpqnG5mHQ88IfuG9gZD0zzAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZI
+# hvcNAQELBQADggIBAJIZdQ2mWkLPGQfZ8vyU+sCb8BXpRJZaL3Ez3VDlE3uZk3cP
+# xPtybVfLuqaci0W6SB22JTMttCiQMnIVOsXWnIuAbD/aFTcUkTLBI3xys+wEajzX
+# aXJYWACDS47BRjDtYlDW14gLJxf8W6DQoH3jHDGGy8kGJFOlDKG7/YrK7UGfHtBA
+# EDVe6lyZ+FtCsrk7dD/IiL/+Q3Q6SFASJLQ2XI89ihFugdYL77CiDNXrI2MFspQG
+# swXEAGpHuaQDTHUp/LdR3TyrIsLlnzoLskUGswF/KF8+kpWUiKJNC4rPWtNrxlbX
+# YRGgdEdx8SMjUTDClldcrknlFxbqHsVmr9xkT2QtFmG+dEq1v5fsIK0vHaHrWjMM
+# maJ9i+4qGJSD0stYfQ6v0PddT7EpGxGd867Ada6FZyHwbuQSadMb0K0P0OC2r7rw
+# qBUe0BaMqTa6LWzWItgBjGcObXeMxmbQqlEz2YtAcErkZvh0WABDDE4U8GyV/32F
+# daAvJgTfe9MiL2nSBioYe/g5mHUSWAay/Ip1RQmQCvmF9sNfqlhJwkjy/1U1ibUk
+# TIUBX3HgymyQvqQTZLLys6pL2tCdWcjI9YuLw30rgZm8+K387L7ycUvqrmQ3ZJlu
+# jHl3r1hgV76s3WwMPgKk1bAEFMj+rRXimSC+Ev30hXZdqyMdl/il5Ksd0vhGMYIC
+# WDCCAlQCAQEwgYcwczELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYD
+# VQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNv
+# bSBUaW1lc3RhbXBpbmcgSXNzdWluZyBSU0EgQ0EgUjECEB9rFmLSLhtsXfHAwaBg
+# DjgwCwYJYIZIAWUDBAIBoIIBYTAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQw
+# HAYJKoZIhvcNAQkFMQ8XDTI2MTAxNDE1MjM0NlowKAYJKoZIhvcNAQk0MRswGTAL
+# BglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIGclbQ7nM5XL
+# 2/N3wnnc3Ib2wupqZgNuRqRhhkrgDjVZMIHJBgsqhkiG9w0BCRACLzGBuTCBtjCB
+# szCBsAQgVCr5oWqNci5mEUl4iumUwYqaruWmXLNEolSa+Wx5x4swgYswd6R1MHMx
+# CzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjER
+# MA8GA1UECgwIU1NMIENvcnAxLzAtBgNVBAMMJlNTTC5jb20gVGltZXN0YW1waW5n
+# IElzc3VpbmcgUlNBIENBIFIxAhAfaxZi0i4bbF3xwMGgYA44MAoGCCqGSM49BAMC
+# BEcwRQIhAOP9wBYer4kRfLhfGhcDIfo0clcldGXX5hpz9v1+hTDbAiASyqn+jRWD
+# RQqHx3/hjpHlzx1KxAD526MSugcNFSWnZw==
+# SIG # End signature block
