@@ -101,11 +101,23 @@ Describe 'Graph transport lifecycle (offline context model)' {
 # Optional installed-SDK qualification: the normal offline gate does not install Graph or sign in.
 Describe 'Installed Graph SDK transport (in-memory HTTP, no authentication)' -Skip:($PSVersionTable.PSEdition -ne 'Core' -or -not (Get-Module -ListAvailable Microsoft.Graph.Authentication)) {
     BeforeAll {
-        Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-        Import-Module (Join-Path $PSScriptRoot '..\module\PRA2.Cloud.psm1') -Force
-        $sdkSession = [Microsoft.Graph.PowerShell.Authentication.GraphSession]::Instance
-        if ($sdkSession.AuthContext) { throw 'Offline SDK qualification refuses an authenticated process.' }
-        $savedRetry = (Get-MgRequestContext).MaxRetry
+        $sdkSession = $null
+        $savedRetry = $null
+        try {
+            Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+            Import-Module (Join-Path $PSScriptRoot '..\module\PRA2.Cloud.psm1') -Force
+            # SDK 2.41 isolates Core in its own load context; resolve the session through
+            # the imported cmdlet's metadata rather than PowerShell's default type lookup.
+            $sdkAssembly = (Get-Command Get-MgRequestContext).ImplementingType.Assembly
+            $initializer = $sdkAssembly.GetType('Microsoft.Graph.PowerShell.Authentication.Common.GraphSessionInitializer', $true)
+            $sdkCore = $initializer.GetMethod('CreateInstance', [Reflection.BindingFlags]'Static,Public,NonPublic').ReturnType.Assembly
+            $sdkSession = $sdkCore.GetType('Microsoft.Graph.PowerShell.Authentication.GraphSession', $true).GetProperty('Instance').GetValue($null)
+            if ($sdkSession.AuthContext) { throw 'Offline SDK qualification refuses an authenticated process.' }
+            $savedRetry = (Get-MgRequestContext).MaxRetry
+        } catch {
+            Write-Host ('Offline SDK fixture setup failed: {0}' -f $_.Exception.Message)
+            throw
+        }
         if (-not ('PraGraphOfflineHandler' -as [type])) {
             Add-Type -TypeDefinition @'
 using System;
@@ -122,6 +134,7 @@ public sealed class PraGraphOfflineHandler : HttpMessageHandler {
     public PraGraphOfflineHandler(int[] statuses) { Statuses = statuses; }
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) {
         if (request.RequestUri.Host != "graph.microsoft.com") throw new InvalidOperationException("Unexpected fixture host.");
+        if (Count >= 20) throw new InvalidOperationException("Offline fixture request limit exceeded.");
         Methods.Add(request.Method.Method);
         int status = Statuses[Math.Min(Count++, Statuses.Length - 1)];
         var response = new HttpResponseMessage((HttpStatusCode)status) { RequestMessage = request };
@@ -136,8 +149,39 @@ public sealed class PraGraphOfflineHandler : HttpMessageHandler {
             param([int[]]$Statuses)
             # Test-only reflection keeps the SDK's own complete builder/middleware; ONLY the final
             # network handler is replaced, before use. A null auth provider cannot obtain a token.
-            $builder = [Microsoft.Graph.PowerShell.Authentication.Helpers.HttpHelpers].GetMethod('GetGraphHttpClient', [Reflection.BindingFlags]'Static,NonPublic')
-            $client = $builder.Invoke($null, [object[]]@($null, (Get-MgRequestContext).PSObject.BaseObject))
+            $requestContext = (Get-MgRequestContext).PSObject.BaseObject
+            $builder = $sdkAssembly.GetType('Microsoft.Graph.PowerShell.Authentication.Helpers.HttpHelpers', $true).GetMethod('GetGraphHttpClient', [Reflection.BindingFlags]'Static,NonPublic')
+            if ($builder) {
+                $client = $builder.Invoke($null, [object[]]@($null, $requestContext))
+            } else {
+                # 2.41 removed the null-provider overload. Use its native GraphClientFactory
+                # and the same middleware order/options, without creating token credentials.
+                $loadContext = [System.Runtime.Loader.AssemblyLoadContext]::GetLoadContext($sdkCore)
+                $graphCore = $loadContext.LoadFromAssemblyName([Reflection.AssemblyName]::new('Microsoft.Graph.Core'))
+                $kiota = $loadContext.LoadFromAssemblyName([Reflection.AssemblyName]::new('Microsoft.Kiota.Http.HttpClientLibrary'))
+                $retryOption = [Activator]::CreateInstance($kiota.GetType('Microsoft.Kiota.Http.HttpClientLibrary.Middleware.Options.RetryHandlerOption', $true))
+                $retryOption.Delay = $requestContext.RetryDelay
+                $retryOption.MaxRetry = $requestContext.MaxRetry
+                $retryOption.RetriesTimeLimit = $requestContext.RetriesTimeLimit
+                $handlers = [Collections.Generic.List[Net.Http.DelegatingHandler]]::new()
+                $authType = $sdkCore.GetType('Microsoft.Graph.PowerShell.Authentication.Core.Http.AuthenticationHandler', $true)
+                $authConstructor = @($authType.GetConstructors() | Where-Object { $_.GetParameters().Count -eq 1 })[0]
+                $handlers.Add($authConstructor.Invoke([object[]]@($null)))
+                foreach ($name in 'NationalCloudHandler', 'ODataQueryOptionsHandler', 'HttpVersionHandler') {
+                    $handlers.Add([Activator]::CreateInstance($sdkAssembly.GetType("Microsoft.Graph.PowerShell.Authentication.Handlers.$name", $true)))
+                }
+                $retryType = $kiota.GetType('Microsoft.Kiota.Http.HttpClientLibrary.Middleware.RetryHandler', $true)
+                $handlers.Add($retryType.GetConstructors()[0].Invoke([object[]]@($retryOption)))
+                $redirectType = $kiota.GetType('Microsoft.Kiota.Http.HttpClientLibrary.Middleware.RedirectHandler', $true)
+                $handlers.Add($redirectType.GetConstructors()[0].Invoke([object[]]@([Type]::Missing)))
+                $handlers.Add([Activator]::CreateInstance($sdkAssembly.GetType('Microsoft.Graph.PowerShell.Authentication.Handlers.RequestHeaderHandler', $true)))
+                $factory = @($graphCore.GetType('Microsoft.Graph.GraphClientFactory', $true).GetMethods() | Where-Object {
+                    $_.Name -eq 'Create' -and $_.GetParameters().Count -eq 6 -and
+                    $_.GetParameters()[0].ParameterType -eq [Collections.Generic.IEnumerable[Net.Http.DelegatingHandler]]
+                })[0]
+                $client = $factory.Invoke($null, [object[]]@($handlers, [Type]::Missing, [Type]::Missing, [Type]::Missing, [Type]::Missing, [Type]::Missing))
+                $client.Timeout = $requestContext.ClientTimeout
+            }
             $field = [Net.Http.HttpMessageInvoker].GetField('_handler', [Reflection.BindingFlags]'Instance,NonPublic')
             $handler = $field.GetValue($client)
             while ($handler.InnerHandler -is [Net.Http.DelegatingHandler]) { $handler = $handler.InnerHandler }
@@ -146,7 +190,7 @@ public sealed class PraGraphOfflineHandler : HttpMessageHandler {
             $handler.InnerHandler = $terminal
             $sdkSession.GraphHttpClient = $client
             $sdkSession.Environment = (Get-MgEnvironment -Name Global).PSObject.BaseObject
-            $sdkSession.AuthContext = [Activator]::CreateInstance([Microsoft.Graph.PowerShell.Authentication.Helpers.HttpHelpers].Assembly.GetType('Microsoft.Graph.PowerShell.Authentication.AuthContext'))
+            $sdkSession.AuthContext = [Activator]::CreateInstance($sdkAssembly.GetType('Microsoft.Graph.PowerShell.Authentication.AuthContext', $true))
             [pscustomobject]@{ Client = $client; Terminal = $terminal }
         }
     }
@@ -165,8 +209,10 @@ public sealed class PraGraphOfflineHandler : HttpMessageHandler {
         $sdkSession.GraphHttpClient = $null
     }
     AfterAll {
-        $sdkSession.AuthContext = $null
-        $null = Set-MgRequestContext -MaxRetry $savedRetry
+        if ($null -ne $sdkSession -and $null -ne $savedRetry) {
+            $sdkSession.AuthContext = $null
+            $null = Set-MgRequestContext -MaxRetry $savedRetry
+        }
         Remove-Module Microsoft.Graph.Authentication -ErrorAction SilentlyContinue
     }
     It 'demonstrates default SDK middleware really resends DELETE after HTTP <Status> (not a mocked cmdlet)' -TestCases @(@{ Status = 503 }, @{ Status = 504 }) {
