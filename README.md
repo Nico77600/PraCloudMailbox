@@ -1,14 +1,15 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-banner-dark.png">
-    <img alt="PRA Cloud Mailbox: when Active Directory, Exchange and Entra Connect are lost, gives every user and shared mailbox a mailbox in Exchange Online on its existing identity - the Teams storage becomes the mailbox - and rolls everything back when the infrastructure is rebuilt, without losing a mail" src="docs/images/readme-banner-light.png">
+    <img alt="PRA Cloud Mailbox: scenario 2 disaster recovery from the cloud, with four actions and one journaled batch; user/shared mail is protected, native-resource bookings require export before Recover" src="docs/images/readme-banner-light.png">
   </picture>
 </p>
 
 <p align="center">
-  <a href="#why"><b>Why</b></a> &nbsp;&middot;&nbsp;
   <a href="#how-it-works"><b>How it works</b></a> &nbsp;&middot;&nbsp;
   <a href="#convert-and-recover"><b>Convert and Recover</b></a> &nbsp;&middot;&nbsp;
+  <a href="#shared-mailbox-permissions"><b>Shared mailboxes</b></a> &nbsp;&middot;&nbsp;
+  <a href="#wpf-window"><b>WPF window</b></a> &nbsp;&middot;&nbsp;
   <a href="#reports"><b>Reports</b></a> &nbsp;&middot;&nbsp;
   <a href="#quick-start"><b>Quick start</b></a> &nbsp;&middot;&nbsp;
   <a href="docs/PraCloudMailbox-UserGuide.md"><b>User guide</b></a> &nbsp;&middot;&nbsp;
@@ -32,22 +33,34 @@ In a hybrid organisation, a mailbox hosted on-premises is only a *mail user* for
 
 Done by hand, giving each user a cloud mailbox means changing the source of authority of every identity, licensing it in the right order, recreating the shared mailboxes with their permissions — which can no longer be read on-premises — and, months later, undoing all of it **without deleting the mails received in the cloud**. This tool collects what it needs before the disaster, then does the conversion and the rollback in the order validated in a lab, verified at each step and journaled.
 
+**Author:** Nicolas Fabert · **Version:** 1.3.0 (unreleased; [changelog](CHANGELOG.md)).
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-principles-dark.png">
-  <img alt="Design principles: collected before the disaster, preview first then one confirmation, reversible and journaled, no mail lost" src="docs/images/readme-principles-light.png">
+  <img alt="Design principles: collected before the disaster, preview first, journaled recovery, user/shared mail protected; unprotected native-resource bookings are not preserved" src="docs/images/readme-principles-light.png">
 </picture>
 
 ## How it works
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-how-it-works-dark.png">
-  <img alt="Collect on an Exchange server every day, copy the SQLite file, Check on the cloud admin server, Convert at the disaster with a batch ID, Recover once the infrastructure is rebuilt; four actions: Collect, Check, Convert, Recover" src="docs/images/readme-how-it-works-light.png">
+  <img alt="One configuration and one entry script: Exchange snapshot, cloud operations, journal and reports; four actions: Collect, Check, Convert, Recover" src="docs/images/readme-how-it-works-light.png">
 </picture>
 
 - **Collected before.** `Collect` runs every day on an Exchange server (Windows PowerShell 5.1) and stores the mailboxes, their GUIDs and X500 addresses, and the **permissions of the shared mailboxes** (FullAccess with AutoMapping, SendAs, SendOnBehalf, groups expanded) in one SQLite file.
 - **Same identity, Teams storage promoted.** `Convert` (PowerShell 7, certificate of an app registration) moves the source of authority of each identity to the cloud and gives it an Exchange plan: the **Teams storage of the user becomes his mailbox**, with his chats. Shared mailboxes are converted in waves, one temporary licence unit each (`Licensing.Shared.Parallel`, 100 by default), given back after each wave.
 - **Preview by default, one batch ID.** Without `-Mode Apply` nothing is changed. Apply asks one confirmation, journals the original state of every object, and prints the batch ID with the exact next command.
 - **Back without losing a mail.** `Recover -Batch <ID>` gives the identities back to AD in waves (one scheduler pause and one synchronisation per wave, not per object); the users' cloud data stays under an **eDiscovery case hold** (several policies in the same case once 1,000 mailboxes is reached), the cloud shared mailboxes become **inactive mailboxes**, and every licence is put back exactly as it was.
+
+## WPF window
+
+Open the window with `pwsh -File .\Invoke-PraCloudMailbox.ps1 -Gui` on the cloud admin server, or `powershell.exe -File .\Invoke-PraCloudMailbox.ps1 -Gui` on the Exchange server. PowerShell 7.5+ uses the Fluent theme; Windows PowerShell 5.1 uses compatible WPF controls.
+
+The window starts no operation automatically. Each action runs the existing engine in a separate process: **Windows PowerShell 5.1 for Collect, PowerShell 7 for cloud actions**. Select a snapshot or batch, filter the objects and tick a wave. Preview is mandatory before Apply, which requires typing the action name; changed selections invalidate Preview.
+
+The activity panel shows progress, results, logs/reports and the next command. Copy the snapshot and journal between the two computers; the window does not transfer them. See the [user guide, chapter 7](docs/PraCloudMailbox-UserGuide.md#7-the-window).
+
+![WPF window - the four actions, selection, batches and activity](docs/images/pra-gui-overview.png)
 
 ## Convert and Recover
 
@@ -56,7 +69,13 @@ Done by hand, giving each user a cloud mailbox means changing the source of auth
   <img alt="Users, Convert: GUID cleared, cloud authority, Exchange plan, cloud mailbox. Users, Recover: AD authority, plan removed, on-premises, case hold. Shared mailboxes, Convert: temporary licence, SharedMailbox, tag, permissions. Shared mailboxes, Recover: case hold, identity deleted, inactive mailbox, new object" src="docs/images/readme-flows-light.png">
 </picture>
 
-The states of a mailbox through the cycle:
+| Object | Convert | Recover |
+|---|---|---|
+| User | Cloud authority, Exchange plan, Teams storage promoted on the same identity | AD authority and original licences restored; cloud data under a case hold |
+| Shared mailbox | Temporary licence per parallel object, SharedMailbox type, collected permissions | Held cloud mailbox becomes inactive; Entra Connect recreates the on-premises identity |
+| Native room/equipment (opt-in) | New cloud-only resource, required RoomLists, booking settings; no contents or general ACLs imported | Owned resource deleted without hold; routing contact to the restored on-premises mailbox |
+
+The states of user/shared mailboxes through the cycle:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-states-dark.png">
@@ -64,13 +83,29 @@ The states of a mailbox through the cycle:
 </picture>
 
 > [!CAUTION]
-> Convert and Recover change production objects in Entra ID and Exchange Online. Every behaviour they rely on was measured in a lab (developer guide, appendix B): run the preview, read the plan, and test the whole cycle with your own tenant before relying on it in a real disaster.
+> The on-premises mailbox contents are **not migrated**. User/shared cloud data is protected during Recover. New native resources follow a separate **destructive** lifecycle: no hold, no inactive copy, and cloud-created bookings/messages are **not preserved or merged**. Export/reconcile them before Recover.
 
-## The window
+### Native rooms and equipment
 
-<p align="center"><a href="docs/images/pra-gui-overview.png"><img alt="The window: the next step, the configuration, the last snapshot and Check, the batches, this computer, and the activity of the last run with its batch ID" src="docs/images/pra-gui-overview.png" width="900"></a></p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-resources-dark.png">
+  <img alt="Native resource continuity: collect metadata and room lists, create real cloud resources, export/reconcile cloud bookings, then recover through owned routing contacts without hold or content merge" src="docs/images/readme-resources-light.png">
+</picture>
 
-`.\Invoke-PraCloudMailbox.ps1 -Gui` (Windows PowerShell 5.1 or PowerShell 7) opens the same four actions in a window: the next step at a glance, one table of objects per page (filter, waves of ticked objects), the activity of the run step by step. Each button runs the command line in its own PowerShell, with its log, journal and report; *Convert…* and *Recover…* are enabled only after a preview of the same selection, and ask for a typed confirmation.
+**1.3.0 development addition, not in release 1.2.0.** For rooms/equipment excluded from Entra synchronisation, enable `Scope.ResourceMode = 'CloudResource'` and `Scope.ConvertRooms = $true`, then run a **new Collect**. Convert creates actual RoomMailbox/EquipmentMailbox resources with disabled sign-in and verified booking/delivery controls. Standard resources up to 50 GB require no mailbox licence; unfinished resources remain hidden with booking disabled.
+
+Recover requires **both** verified on-premises routing (`Resources.OnPremisesReady`) and explicit loss acknowledgement (`Resources.AllowUnprotectedDeletion`); both ship as `$false`. Ownership, collisions, unexpected licences or holds block the operation. No purge, proxy removal or automatic second deletion; old protected journals keep their original contract, and RoomLists are retained.
+
+Cloud actions require a **fresh, unconnected PowerShell process** so SDK retries cannot silently repeat an unprotected deletion. Setup, recovery and transport details: [user guide §1.2](docs/PraCloudMailbox-UserGuide.md#12-native-rooms-and-equipment-excluded-from-synchronisation), [developer guide §6.2](docs/PraCloudMailbox-Guide.md#62-unsynchronised-native-resource-lifecycle-development). Lab coverage and remaining client-discovery/delivery limits: [appendix B](docs/PraCloudMailbox-Guide.md#appendix-b---lab-validation). Test the whole cycle in your tenant before production.
+
+## Shared mailbox permissions
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-permissions-dark.png">
+  <img alt="Shared mailbox permissions: collected from Exchange before the disaster, groups expanded to users, saved in SQLite, granted and verified in Exchange Online; FullAccess with AutoMapping, SendAs and SendOnBehalf" src="docs/images/readme-permissions-light.png">
+</picture>
+
+Unlike scenario 1, Active Directory is also unavailable during the disaster: permissions must be **collected beforehand** from Exchange. The snapshot keeps FullAccess with AutoMapping, SendAs and SendOnBehalf, with group trustees expanded to users. Convert grants and reads back the collected permissions in Exchange Online; see the [developer guide, chapter 9](docs/PraCloudMailbox-Guide.md#9-convert). General mailbox and calendar-folder ACLs are **not imported for native resources**.
 
 ## Reports
 
@@ -128,7 +163,11 @@ One command per moment — every day, every week, the disaster, the rollback, th
 | **[User guide](docs/PraCloudMailbox-UserGuide.md)** | For the people who run the tool: **prerequisites** and **one command per moment** — collect every day, check every week, convert at the disaster, recover once the infrastructure is rebuilt, the days after — and how to read the results. |
 | **[Developer guide](docs/PraCloudMailbox-Guide.md)** | Everything else: the scenario, the procedure validated in the lab and the states of a mailbox, the app registration, the case hold and the retention policy, the configuration in detail, each action step by step, the Check codes, the reports, the architecture, the databases, the tests, how to evolve the tool, troubleshooting and the lab results. |
 
-Both guides also exist as a single HTML file with a light and a dark theme (`docs/PraCloudMailbox-UserGuide.html`, `docs/PraCloudMailbox-Guide.html`): download them and open them locally, or use the copies in the release zip.
+Both guides also exist as a single HTML file with a light and a dark theme (`docs/PraCloudMailbox-UserGuide.html`, `docs/PraCloudMailbox-Guide.html`): download them and open them locally, or use the copies in the release zip. `tools\Build-Documentation.ps1` and `tools\New-ReadmeImages.ps1` rebuild the guides and the themed README graphics.
+
+## Security
+
+Obtain the tool from this repository and verify the owner's Authenticode signatures and timestamps on the seven signed PowerShell files. Editable configuration, DLLs and other assets are not covered by those signatures. Release attestations, when present, prove ZIP provenance, not the safety of an operation. Report sensitive findings **privately** as described in [SECURITY.md](SECURITY.md); contribution and publication rules are in [AGENTS.md](AGENTS.md).
 
 ## Tests
 

@@ -1,5 +1,71 @@
 # Changelog
 
+## 1.3.0 - Unreleased
+
+### Added
+- Optional `Scope.ResourceMode = 'CloudResource'` lifecycle for native rooms/equipment excluded from Entra
+  synchronisation: true cloud resource mailboxes instead of shared-mailbox conversion; sign-in disabled.
+- Resource capacity, custom properties, supported booking policies/delegates and working hours captured by
+  Collect; snapshot schema 2 with read-only compatibility and writable migration of schema 1.
+- Native resource metadata now includes Office, postal address, country/region, phone, notes and room-list
+  identity/membership metadata (resource JSON schema 2; a new Collect is required). Convert restores descriptive
+  properties and creates missing true cloud RoomLists before their rooms, then adds the selected owned room
+  members. Lists shared by rooms are deduplicated; creation intent, token and immutable cloud identity are journaled
+  for crash-safe resume. Original aliases/display names, SMTP/X500 addresses, visibility, delivery and membership
+  controls are captured. Earlier room-list metadata needs a new Collect.
+- Compatible existing cloud-only room lists can be reused without replacing settings/members. Conflicting
+  recipients/aliases/proxies, synchronised or replaced groups, inconsistent snapshot metadata and failed readbacks
+  block dependent rooms. No ordinary group is converted and no out-of-scope room is created.
+- Recover retains room lists and never inserts routing MailContacts into them or automatically deletes groups.
+- Native PCA resources no longer collect or replay general FullAccess/SendAs/SendOnBehalf permissions, including
+  permission rows from older snapshots. Directory visibility and booking restrictions/delegates remain preserved;
+  calendar-folder ACLs and old mailbox contents remain excluded. Legacy synced-resource permissions are unchanged.
+- Invitation delivery controls (allowed/rejected senders or groups, authenticated senders and moderation)
+  are captured with portable SMTP references and restored/read back; unresolved controls never become permissive defaults.
+- New native journals persist `protectionMode = 'None'`: standard room/equipment mailboxes up to 50 GB
+  require no assigned licences, licensing group, licensing usageLocation, enterprise capacity or case hold.
+  Native-only Check/Preview/Convert/Recover do not need a Compliance connection or licensing inventory.
+- `Resources.AllowUnprotectedDeletion` defaults to `$false`; Recover preview and the single Apply
+  confirmation warn of no hold/no inactive copy and loss of cloud-created reservations/messages.
+  Explicit consent and verified native routing are required before deleting only the journal-owned identity.
+- Unprotected Recover verifies the exact deleted identity and non-inactive soft-deleted mailbox, then foreign
+  address collisions before contact creation. Pending deletion/address collisions are resumable; no purge shortcuts,
+  automatic hold removal or licence revocation. Unexpected assigned licences/active or organisation holds fail closed.
+- Old native journals lacking protection mode retain the licensed `CaseHold`/exact inactive-copy lifecycle;
+  explicit protected journals are also preserved, including Convert resume. Recover resume rejects changed ownership/mode.
+- Window facts distinguish disabled, legacy synced, unprotected native and old protected journal paths.
+
+### Fixed
+- Unprotected Recover no longer treats retained proxies on its exact freshly verified journal-owned tombstone
+  as an automatic contact blocker. Both immutable IDs, the exact resource type, valid `WhenSoftDeleted` and
+  durable verified deletion are required; foreign/active recipients still block. Exchange contact uniqueness
+  failures remain explicit errors in a Partial journal, never Done, without purge or tombstone changes.
+  A returned contact GUID is persisted before configuration so a failed configuration resumes the same contact.
+- Native readiness and journal protection modes fail closed when missing, unknown or non-scalar; old
+  journals without a mode still explicitly retain the `CaseHold` contract.
+- Unprotected deletion records intent, request-in-flight, returned and verified stages. Ambiguous requests
+  are not retried automatically, including after a crash and restoration of the same immutable identity;
+  definitively rejected requests remain resumable. A final ID read precedes routing contact creation/configuration.
+- Both routing and destructive-recovery consents stay `$false` in packaged configuration.
+- Corrected deletion-progress test-case expansion under Pester 6 strict mode.
+- A native room is added to its lists only after its final ownership/disabled-sign-in/licence checks succeed;
+  each room still completes independently, with no global resource-staging pass.
+- Native descriptive restoration explicitly passes `Set-User -Confirm:$false` for its built-in pause in unattended
+  sessions, without `-Force`; all eight captured fields, including full Notes, still require Exchange readback.
+
+### Lab qualification
+- The native-resource path was exercised on 13-14 October 2026 with two synthetic rooms, one equipment
+  mailbox and one RoomList: real Collect, Check, Convert, descriptive/booking/work-hours readbacks and
+  memberships, five delivered assistant responses (three acceptances and two expected refusals), and Recover.
+- Recover created and verified the three routing contacts while the exact owned soft-deleted mailboxes
+  remained intact, without a licence, hold, purge or proxy removal. Interrupted provisioning and delayed
+  contact visibility resumed the same journaled objects.
+- Individual calendar-item diagnostics, client Room Finder/Places discovery and a new message delivered
+  through the recovery contacts were not qualified. SMTP recipient acceptance and contact routing properties
+  were verified; this is not a substitute for testing the full mail path in the target tenant.
+
+Published 1.2.0 assets and the legacy synced-resource lifecycle are unchanged.
+
 ## 1.2.0 - 2026-10-09
 
 Volume: 15,000 users, 5,000 shared mailboxes.

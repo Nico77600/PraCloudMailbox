@@ -1,9 +1,9 @@
 ---
 title: PRA Cloud Mailbox
 subtitle: Developer guide
-version: 1.2.0
+version: 1.3.0 (unreleased)
 author: Nicolas Fabert
-updated: 2026-10-08
+updated: 2026-10-12
 ---
 
 # PRA Cloud Mailbox — Developer guide
@@ -26,7 +26,7 @@ updated: 2026-10-08
 database | Collected before the disaster | `Collect` reads the mailboxes, their addresses and the **shared mailbox permissions** from Exchange into a SQLite snapshot, every day: after the disaster nothing on-premises can be read.
 check | Preview first, then one confirmation | Without `-Mode Apply` nothing is changed. `Check` is always read-only and says, object by object, whether `Convert` can run.
 refresh | Reversible, journaled | Every change is written to a journal under a **batch ID** with the original state of each object; `Recover -Batch` puts it back and resumes where it stopped.
-shield | No mail lost | The Teams storage becomes the cloud mailbox; at `Recover` it stays under an **eDiscovery case hold**, and the shared mailboxes become **inactive mailboxes** under the hold, then under retention.
+shield | User/shared mail preserved | The Teams storage becomes the cloud mailbox; at `Recover` it stays under an **eDiscovery case hold**, and the shared mailboxes become **inactive mailboxes** under the hold. New unprotected native resources are excluded: their cloud bookings/messages are not preserved.
 ```
 
 ## Quick start
@@ -137,7 +137,7 @@ The mails received in the cloud during the disaster are **never deleted**: those
 - It never deletes a user mailbox, and never runs `Set-User -PermanentlyClearPreviousMailboxInfo` (it empties the mails of the cloud mailbox 3 to 6 hours later).
 - It never deletes a shared mailbox identity before the case hold is stamped on the mailbox (`InPlaceHolds`): otherwise the mailbox would be soft-deleted, not inactive, and purged after 30 days.
 - It never lifts a hold from an object that is already back on-premises.
-- It never converts a room or equipment mailbox unless `Scope.ConvertRooms` is set (`KIND_NOT_SUPPORTED` otherwise): even then, their booking settings (capacity, auto-accept, booking policies) are not collected or recreated — it becomes a plain shared mailbox in the cloud, and the on-premises room or equipment mailbox (with its booking settings) is what comes back unchanged at Recover.
+- It never handles a room or equipment mailbox unless `Scope.ConvertRooms` is set (`KIND_NOT_SUPPORTED` otherwise). The default `SynchronizedShared` path retains the released shared-mailbox behaviour; `CloudResource` is a separate opt-in lifecycle for native resources excluded from synchronisation (chapter 6.2). Neither path automatically merges cloud reservations into the native calendar.
 
 # Part II · Set up
 
@@ -245,13 +245,14 @@ Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.0 -Scope AllUsers -
 |---|---|
 | `Environment` | Label used in the backup file names |
 | `Exchange` | `ConnectionMode` (`Local`, `Remote`), `Server` (Remote), `DomainController` (the same DC for every read of a run) |
-| `Scope` | `Mode` (`Auto`, `OU`, `Group`, `Csv`), `SearchBase`, `GroupDN`, `CsvPath` (column `Identity`: UPN, SMTP, sAMAccountName, DN or GUID), `IncludeUsers`, `IncludeShared`, `IncludeRoom`, `IncludeEquipment`, `ExcludeSamAccountNames`, `ConvertRooms` (converts a room or equipment mailbox like a shared one; default `$false`) |
+| `Scope` | `Mode` (`Auto`, `OU`, `Group`, `Csv`), `SearchBase`, `GroupDN`, `CsvPath` (column `Identity`: UPN, SMTP, sAMAccountName, DN or GUID), `IncludeUsers`, `IncludeShared`, `IncludeRoom`, `IncludeEquipment`, `ExcludeSamAccountNames`, `ConvertRooms` (default `$false`), `ResourceMode` (`SynchronizedShared`, default, or `CloudResource` for unsynchronised native resources) |
 | `Collect` | `SharedPermissions`, `ExpandGroupTrustees` (groups used as trustees: members stored and granted one by one), `ExcludeTrustees` (wildcards), `MailboxStatistics`, `Contacts`, `ContactsSearchBase`, `DistributionGroups`, `DistributionGroupsSearchBase`, `DynamicDistributionGroups` |
 | `Store` | `Path` (snapshots), `KeepSnapshots`, `BackupFolder` (a consistent copy after each Collect), `MaxSnapshotAgeDays` (Check warns beyond), `JournalPath` (journal of Convert and Recover, cloud side) |
 | `Cloud` | `TenantId`, `Organization`, `AppId`, `CertificateThumbprint`, `DefaultUsageLocation` (two letters, for the objects without usageLocation) |
 | `Polling` | `IntervalSeconds`, `MailboxTimeoutMinutes`, `SyncTimeoutMinutes`, `HoldTimeoutMinutes` |
 | `Licensing` | `Users.Mode` (`Group`, `Kiosk`, `Direct`), `Users.GroupId` (object ID of the licence group), `Users.SkuPartNumber` (Direct), `Shared.SkuPartNumber` (temporary licence), `Shared.Parallel` (shared mailboxes converted together, 1 to 1000, default 100) |
 | `Retention` | `TagAttribute`, `TagValue` (written on the shared mailboxes), `HoldPolicy` (case hold policy of Recover), `HoldPolicyLimit` (mailboxes per policy before a sibling is created, 1 to 1000, default 1000) |
+| `Resources` | `LicensingGroupId` (old protected native journals only; unused for new resources), `OnPremisesRoutingDomain` (destination domain of the rebuilt native resources), `OnPremisesReady` (explicit operator assertion, default `$false`), `AllowUnprotectedDeletion` (explicit cloud-bookings/messages loss acknowledgement, default `$false`), `Parallel` (native resource waves, 1 to 1000, default 100) |
 | `EntraConnect` | `Mode` (`Remoting`, `Script`, `Manual`), `Server`, `ScriptPath`, `MinVersion` (chapter 6.1) |
 | `Logging`, `Report` | Folders; `Report.Enabled` |
 
@@ -282,6 +283,60 @@ Recover needs, on the rebuilt Entra Connect server: delta cycles, and the schedu
 # Part III · Use
 
 <!-- icon: database -->
+### 6.2 Unsynchronised native resource lifecycle (development)
+
+This addition is **not shipped in immutable release 1.2.0**, and the synced-resource lab cycle is not evidence for it.
+
+| Phase | Native Exchange | Exchange Online |
+|---|---|---|
+| Collect | Room/Equipment, excluded from Entra sync; identities, addresses, descriptive/location properties, room lists and portable booking/work-hours settings read | No resource recipient required |
+| Convert | Native object untouched, infrastructure unavailable during the disaster | Missing true cloud RoomLists created first, then RoomMailbox/EquipmentMailbox with independent GUID, disabled sign-in, captured properties, visibility and booking restrictions, then selected room-list memberships; no general mailbox rights |
+| Recover | Rebuilt native resource and hybrid routing verified by the operator; cloud bookings/messages exported/reconciled separately | New journals: explicitly acknowledged unprotected deletion, exact deleted/soft-deleted proof and foreign collision checks, then an Exchange-validated routing MailContact attempt; NO hold/NO inactive copy. Old protected journals retain case-hold/inactive verification |
+
+Set `Scope.ResourceMode = 'CloudResource'`, `Scope.ConvertRooms = $true` and include the required resource types. Collect must run again before the disaster: schema-1 databases, snapshots collected in legacy mode and resource JSON schema 1 lack the complete resource metadata. Resource JSON schema 2 stores Office, StreetAddress, City, StateOrProvince, PostalCode, CountryOrRegion, Phone and Notes in `Directory`, and room-list identity/membership metadata in `RoomLists`, alongside capacity/custom properties and booking/work-hours settings. Empty descriptive values are recorded explicitly, not guessed. Collect fails explicitly if descriptive properties, room-list membership, mandatory booking controls, calendar configuration or booking trustees cannot be read/resolved.
+
+SMTP identities replace AD DNs in booking lists. Native PCA resources **do not collect or replay FullAccess, SendAs or SendOnBehalf**, even if earlier snapshot permission rows exist. `HiddenFromAddressListsEnabled` and the supported BookInPolicy/RequestInPolicy/RequestOutOfPolicy restrictions and booking delegates are preserved. This is directory visibility and booking control, not a general permission migration: per-user address-book segmentation and calendar-folder viewing ACLs are not recreated. Existing calendar items and other mailbox contents are not imported.
+
+`Delivery` also preserves invitation delivery restrictions: RequireSenderAuthenticationEnabled, AcceptMessagesOnlyFromSendersOrMembers, RejectMessagesFromSendersOrMembers, ModerationEnabled, ModeratedBy, BypassModerationFromSendersOrMembers and SendModerationNotifications. Recipient/group references are stored as SMTP addresses, resolved before creation and read back after restoration. This avoids accidentally opening a room whose booking restrictions were enforced at message-delivery level; it does not grant mailbox access. Moderation requires explicit resolvable moderators.
+
+Room-list identities/memberships are captured for rooms even when `Collect.DistributionGroups = $false`. Each referenced `RoomLists` entry includes metadata schema 1, source GUID/name, display name, alias, original SMTP/X500 addresses and LegacyExchangeDN, visibility, delivery controls and membership join/depart restrictions. Run a new Collect if earlier snapshots lack these creation properties. Only lists referenced by the **selected native rooms** are in the Convert plan: it does not recreate every group, empty/unreferenced list or unselected room from AD.
+
+**Convert order: lists, rooms, membership.** Missing groups are created as real cloud-only **RoomLists** with `New-DistributionGroup -RoomList`; lists shared by multiple rooms are deduplicated and incompatible snapshot definitions/aliases/addresses are refused before changes. List intent and an unpredictable technical Name/token are recorded before creation. The returned Exchange GUID is pinned immediately, before further reads, the ownership marker (CustomAttribute15) or configuration. Exchange-only RoomLists need no Entra group: `ExternalDirectoryObjectId` is pinned only when Exchange exposes it, but once pinned it must remain present and unchanged. No matching Graph group is guessed or adopted. The user-visible display name, alias, addresses, visibility, delivery and membership controls are restored and read back before dependent rooms start. The original source Name remains in the snapshot; the temporary technical Name is retained as an ownership proof. Lists are created without room members; only successfully provisioned selected rooms are added later and membership is read back.
+
+A compatible existing cloud-only RoomList with the same primary SMTP, alias and visibility may be **reused**, with its Exchange GUID and any exposed directory ID journaled. Its configuration and other members are not overwritten. The tool never converts an ordinary group, modifies a synchronised list, replaces a journal-owned list or adopts a conflicting address/alias. Creation/configuration failures block dependent rooms and leave an explicit partial/resumable batch. Resume uses the same token/name and immutable IDs, avoiding duplicate groups even after an interruption between the Exchange operation and the journal update. If creation was attempted but its exact object cannot be verified, no second create is issued. Equipment is never added to room lists.
+
+**Restrictive initialization before descriptive writes.** New resource mailboxes can start with broad AutoAccept defaults. Immediately after journaling their returned IDs, Convert sets `AutomateProcessing = None`, disables all three all-book/all-request flags, clears booking/request/delegate arrays, disables forwarding/external processing and hides the unfinished mailbox. Configuration is staged under that restriction. Source visibility is restored and verified only after all required metadata/work-hours/delivery readbacks, final identity/sign-in/protection checks, collision inventory and room-list membership succeed. Source booking policy activation/readback is the last cloud write/proof, so no later mandatory metadata failure leaves booking open. Failures attempt verified booking-disable/hidden cleanup and remain Partial, with any cleanup failure explicitly reported for immediate operator review. Already Done resources are excluded from resume; no unowned object is adopted or disabled. This changes no user/shared or legacy protected resource final configuration and grants no new privileges.
+
+Descriptive `Set-User` failures are blockers, not a reason to skip Notes or substitute Graph writes. The strict duplicate Graph identity consistency guard also remains mandatory: default and advanced query indexes can propagate differently, but an inconsistent result must be investigated/retried, never accepted as proof of absence.
+
+Native mailbox creation similarly pins the returned directory ID and independent ExchangeGuid before further reads or sign-in changes. Older interrupted intents without IDs can resume only through their exact journaled technical name/token, compatible type, empty or matching marker and verified cloud-only source identity; the recovered IDs are persisted before mutations. Disabled sign-in is verified by bounded polling using `Polling.MailboxTimeoutMinutes` and `Polling.IntervalSeconds`. Only an explicitly boolean `accountEnabled = true` may wait for propagation; missing/malformed account data, changed identity, synchronisation or an unexpected source anchor fail immediately. Null cloud-only sync/anchor fields are valid, not evidence of an absent directory identity.
+
+`New-DistributionGroup`, `Set-DistributionGroup`, room-list membership cmdlets and `Set-User` must be exposed to the app with appropriate Exchange RBAC (including naming-policy and group-manager bypass parameters). Check and Convert preview remain read-only: a missing non-conflicting list is a planned creation rather than a manual prerequisite; unsupported commands, conflicting groups and unresolved controls remain blocking.
+
+The location fields above are native Exchange `Get-User` properties. Cloud-only Places building/floor hierarchies are not inferred from arbitrary custom attributes. Resource `ResourceCustom` and CustomAttribute1-15 retain their existing treatment; the ownership marker reserves one custom attribute.
+
+**New native journals persist `protectionMode = 'None'`.** Microsoft states that standard resource mailboxes [up to 50 GB require no licence](https://learn.microsoft.com/en-us/office365/servicedescriptions/exchange-online-service-description/exchange-online-limits#mailbox-storage-limits). No licence is assigned, no licensing group is joined, and usageLocation is not set for licensing. Native-only Check/Preview/Convert/Recover skip subscribed-SKU/group/capacity prerequisites and do not connect to Security & Compliance. Mixed scopes retain all user/shared prerequisites. The app still needs `User.ReadWrite.All` for disabled sign-in, cloud/deleted identity inspection and owned account deletion, plus the Exchange resource/directory/RoomList RBAC. Unreadable organisation holds fail closed; active organisation holds block new unprotected provisioning. Larger mailboxes, archives and other licensed features are outside this lifecycle.
+
+**Backward compatibility is journal-based, not configuration-based.** A native journal lacking `protectionMode` is treated as `CaseHold`; explicit `CaseHold` is also preserved on Convert/Recover resume. Such journals continue using their recorded cloud-only enterprise-plan licence group, licensing usageLocation and case hold; capacity remains one unit per active protected resource, not a recycled shared pool. They require Compliance and exact held inactive-copy verification. No journal is automatically downgraded and no licence/hold is removed. Microsoft requires appropriate licensing for that old inactive-mailbox procedure; see [Create and manage inactive mailboxes](https://learn.microsoft.com/en-us/purview/create-and-manage-inactive-mailboxes).
+
+Readiness checks both directory identities and Exchange recipients/addresses, including aliases, proxies and legacy X500. Existing cloud resources are refused, not adopted. Each owned creation and its IDs are journaled so that resume cannot mistake an unrelated mailbox for the temporary resource. Recover follows the journaled lifecycle, not a later configuration-mode change; legacy resource batches keep their original behaviour.
+
+For Recover, configure `Resources.OnPremisesRoutingDomain` and verify each resource accepts mail at `alias@<domain>` through your restored connector. Only then set `Resources.OnPremisesReady = $true`. A domain that loops to the original cloud address is invalid. The flag does not perform an on-premises reachability or reservation reconciliation test.
+
+**Unprotected Recover requires `Resources.AllowUnprotectedDeletion = $true`**, a Boolean acknowledgement of loss after export/reconciliation; the shipped and merged configuration default is `$false`. This is independent of `OnPremisesReady`. Preview and the single Apply confirmation warn of **NO hold, NO inactive copy and cloud-created bookings/messages NOT retained or merged**. `-Force` bypasses only the interactive question, never the deletion guard. The guard and ownership/disabled cloud-only identity checks run before mutation. Assigned licences, active mailbox holds (including delay/compliance-tag holds) or organisation-wide holds are refused, never revoked or cleared.
+
+Deletion intent is journaled before deleting only the exact owned cloud ID. Recover waits for that ID in deletedItems and the exact independent cloud GUID in a non-inactive soft-deleted mailbox, then checks all addresses/aliases, including soft-deleted Exchange recipients, before contact creation. For this unprotected Recover check only, a freshly reverified journal-owned tombstone is excluded when both ExternalDirectoryObjectId and ExchangeGuid match the recorded cloud IDs, RecipientTypeDetails matches the recorded source resource type, and an actual nonempty valid WhenSoftDeleted is exposed. Durable deletion progress must be Verified; missing/legacy protected modes never qualify. A name prefix alone proves nothing. Retained proxies on this exact tombstone alone do not prove a service uniqueness conflict or require waiting for normal retention to expire.
+
+The deleted identity and tombstone proxies remain untouched; no permanent-delete/purge shortcut is used. Foreign active/soft-deleted recipients, mismatched ID/GUID pairs and competing Graph source anchors still block. Missing proof or foreign claims produce `ResourceDeletionPending` / `ResourceAddressReleasePending` and a Pending row; changed proof fails closed. Passing these checks authorises only a contact attempt: actual New-MailContact/Set-MailContact uniqueness errors remain explicit Errors in a Partial batch, never Done. Contact creation intent is saved first and a returned contact GUID is pinned immediately before reads/configuration; a failed configuration resumes that same journal-owned contact. Resolve safely and resume the same Recover batch. A missing active identity alone is not deletion proof, and changed journal ownership/protection mode is refused. If normal retention removes the deleted proof before completion, stop for manual reconciliation rather than guessing ownership.
+
+The durable deletion stages are `Intent` (before the request), `Issuing` (persisted immediately before sending), `Issued` (the DELETE returned) and `Verified` (exact deleted identity/soft-deleted mailbox proven). Unprotected DELETE requests are never automatically retried after network/gateway ambiguity. Only a definite rejection can return to `Intent`. A legacy attempted flag without progress is treated as ambiguous, not authorisation to delete again. If the immutable identity is still or again active after `Issuing`, `Issued` or `Verified`, Recover refuses another DELETE and routing; wait for deletion evidence or investigate a restore. The active ID is rechecked after address inventory before creating/configuring the contact. Packaged configurations always reset both native-resource consents to `$false`.
+
+Old protected native journals still apply and verify the specific tool hold while enterprise licensing is active, then verify the exact inactive mailbox before contact creation. Both paths retain journal-owned routing contacts for crash-safe resume and never use source-of-authority transfer or Entra Connect.
+
+Cloud room lists are **retained on Recover**, including those created by Convert, to avoid deleting groups/members used by other rooms or batches. Routing MailContacts are not inserted into RoomLists (they are not room mailboxes). Review cloud room discovery and any later cleanup/reuse separately with the owner; list provenance remains in the Convert journal under `tenant_change.kind = 'NativeRoomList'`. A retained list is not evidence that the rebuilt native rooms are discoverable through Room Finder.
+
+New resource creation does **not** restore native mailbox contents or historic reservations. New unprotected Recover offers **no inactive archive and no preservation of cloud bookings/messages**; export/reconcile them separately before deletion. Only old protected journals retain their held inactive copy, still without automatic calendar merge. Native booking settings remain authoritative on-premises.
+
 ## 7. Collect
 
 ```powershell
@@ -327,7 +382,10 @@ Steps: snapshot, Microsoft 365 connection, tenant prerequisites, objects. An obj
 | `GUID_CLEARED` / `GUID_MISMATCH` | Warn | ExchangeGuid empty (a Convert started) or different from the snapshot |
 | `ALREADY_CLOUD_MAILBOX` | Error | Already a cloud mailbox |
 | `KIND_NOT_SUPPORTED` | Error | Room or equipment mailbox, `Scope.ConvertRooms` is `$false` (the default) |
-| `ROOM_CONVERT_ENABLED` | Info | Room or equipment mailbox, `Scope.ConvertRooms` is `$true`: converted like a shared mailbox |
+| `ROOM_CONVERT_ENABLED` | Info | Legacy synchronised Room/Equipment, `Scope.ConvertRooms` is `$true`: converted like a shared mailbox |
+| `RESOURCE_COLLECT_REQUIRED` | Error | Native resource metadata/settings are absent, earlier or incomplete: run a new Collect before the disaster |
+| `RESOURCE_CONFIGURATION_REQUIRED` | Error | Native-resource Check/Convert preview cannot verify cmdlet support, room lists, booking/delivery recipients or resource custom schema; no settings are omitted |
+| `RESOURCE_PROTECTION_UNKNOWN` | Error | Native readiness mode is missing, unknown or non-scalar; no lifecycle is assumed and nothing is changed |
 | `TEAMS_STORAGE` / `NO_TEAMS_STORAGE` | Info | The ComponentShared storage will be promoted, or a new empty mailbox created |
 | `COMPONENT_SHARED` | Info | Shared mailbox with a ComponentShared storage: the temporary licence promotes it, with its content |
 | `EXCHANGE_PLAN_PRESENT` | Error | An Exchange Online mailbox plan is already enabled (by plan ID; Foundation does not count): clearing the ExchangeGuid would not create the mailbox while the plan stays. Remove the plan before the disaster or exclude the object |
@@ -440,7 +498,7 @@ Exit codes: `0` done, `1` failed (or an object is not ready for Check), `2` done
 |---|---|
 | `Invoke-PraCloudMailbox.ps1` | entry script: parameters, edition check, the run context, the four actions (`Invoke-PraCollect`, `Invoke-PraCheck`, `Invoke-PraConvert`, `Invoke-PraRecover`) and their helpers (licence need, assessment of the current state, journal) |
 | `module\PRA2.Common.psm1` | console theme, banner, steps, summary card, log, configuration (`Import-PraConfiguration`), audit (log + transcript), results and reports (`Complete-PraRun`) |
-| `module\PRA2.Store.psm1` | SQLite (System.Data.SQLite in `lib\sqlite`): the snapshot database and the journal, schema version 1 |
+| `module\PRA2.Store.psm1` | SQLite (System.Data.SQLite in `lib\sqlite`): snapshot schema 2 (resource settings), journal schema 1; snapshot schema 1 remains readable |
 | `module\PRA2.Collect.psm1` | Collect (Windows PowerShell 5.1): Exchange connection, scope, mailboxes, permissions, groups expanded, contacts and distribution groups |
 | `module\PRA2.Cloud.psm1` | cloud (PowerShell 7): connections, Graph with retries, tenant facts, readiness rules (`Get-Pra2Readiness`, pure functions), source of authority, licences, permissions, case hold, Entra Connect operations |
 | `module\PRA2.Gui.psm1`, `module\PRA2.Gui.xaml` | the window (`-Gui`, both editions): theme, state read from the files, pages, runs in a child process (chapter 13.1) |
@@ -483,7 +541,7 @@ Stop | The window creates the file `PRA_STOP_FILE`; the run checks it before eac
 <!-- icon: database -->
 ## 14. The databases
 
-Two SQLite files, schema version 1, never mixed up: each one records its kind and the tool refuses the other.
+Two SQLite files, never mixed up: each one records its kind and the tool refuses the other. The snapshot uses schema 2 (`mailbox.resource_settings_json`); the journal remains schema 1. Snapshot schema 1 is readable without modification and is upgraded only when Collect opens it writable; old rows do not acquire invented resource settings.
 
 **Snapshots** (`Store.Path`, written by Collect): `snapshot` (one row per Collect: status, dates, server, scope, counters), `mailbox`, `permission`, `group_member` (members of the groups used as trustees), `contact`, `distribution_group`, `dl_member`, `collect_issue`. Every data row carries its `snapshot_id`; deleting a snapshot deletes its rows.
 
@@ -570,6 +628,13 @@ Lab: four Exchange Server SE servers in a DAG, Active Directory, Entra Connect 2
 | Tool, waves and remoting | 8 Oct | Two users converted in two batches through a synchronised licence group: the Recover of the first wave kept the group in the cloud, the second gave it back to AD. `EntraConnect.Mode = Remoting` from a domain server: pause 6 s, resume 3 s, delta waited to the end |
 | Tool, window | 8 Oct | The window in PowerShell 7 ran Check, a Convert wave of one user (list written by the window, `-IdentityPath`: cloud mailbox in 2 min 28) and its Recover. A connection timeout to Graph just after a 7.5-minute delta cycle stopped the first Recover cleanly; running it again resumed the batch without a new delta (3 min 38). Graph calls now retry a connection that failed without an answer |
 | Tool, volume (1.2) | 8 Oct | Lab tenant of 21,700 users and 16,000 mailboxes. Bulk reads: every user page by page in 20 s, Exchange Online by filters of 50 objects in 0.3 to 0.7 s, states identical to the reads one object at a time (8 objects: 25.5 s, now 3.6 s). Three shared mailboxes converted in **one wave** (three temporary E5 units, 10/10 permissions granted after the licence was given back) and recovered; two users converted in one wave (Graph batches, licence group, one wait of 127 s for both) |
+| Tool, native resources (1.3) | 13-14 Oct 2026 | Two unsynchronised rooms, one equipment mailbox and one RoomList: real Collect, Check, Convert, metadata/booking/work-hours readbacks and two memberships; three delivered assistant acceptances and two expected refusals (conflict and restricted sender). Recover created three verified routing contacts while retaining the exact soft-deleted mailboxes, without licences, holds, purge or proxy removal. Source objects and the RoomList were retained; delayed contact visibility resumed the same immutable identity |
+
+Native-resource qualification did **not** establish individual calendar-item diagnostics, client Room Finder/Places
+discovery or delivery of a new message through the recovery contacts. SMTP recipient acceptance and the contacts'
+source addresses, visibility and external routing destinations were verified. Test those remaining integrations in
+the target tenant; do not treat mailbox/list membership or SMTP envelope acceptance as a client or end-to-end
+message-delivery test.
 
 <!-- icon: shield -->
 ## Appendix C - Security and data

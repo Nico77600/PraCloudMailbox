@@ -28,7 +28,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.2.0
+    Version : 1.3.0
 #>
 #Requires -Version 5.1
 Set-StrictMode -Version Latest
@@ -690,6 +690,15 @@ function Get-PraGuiScopeText {
     return '{0} · {1}' -f $base, ($kinds -join ' + ')
 }
 
+function Get-PraGuiResourceText {
+    param([AllowNull()][hashtable]$Config)
+    if (-not $Config -or -not (Get-PraValue $Config.Scope 'ConvertRooms' $false)) { return 'not converted (Scope.ConvertRooms is off)' }
+    if ((Get-PraValue $Config.Scope 'ResourceMode' 'SynchronizedShared') -eq 'CloudResource') {
+        return 'native, unsynchronised: true cloud room/equipment (up to 50 GB); new journals: no licence/hold, Recover does NOT preserve cloud bookings/messages; old protected journals keep their licence/hold'
+    }
+    return 'legacy synchronised path: shared mailbox, no cloud booking settings'
+}
+
 function Get-PraGuiLicenceText {
     <# How the users get their Exchange plan. #>
     param([Parameter(Mandatory)][hashtable]$Config)
@@ -930,6 +939,7 @@ function Update-PraGuiOverview {
     $facts.Add((New-PraGuiFact 'Certificate' $certificate.Text $certificate.Tone))
     $facts.Add((New-PraGuiFact 'Scope' (Get-PraGuiScopeText -Config $config)))
     $facts.Add((New-PraGuiFact 'User licence' (Get-PraGuiLicenceText -Config $config)))
+    $facts.Add((New-PraGuiFact 'Rooms/equipment' (Get-PraGuiResourceText -Config $config)))
     $facts.Add($(if ($config.Licensing.Shared.SkuPartNumber) { New-PraGuiFact 'Shared mailboxes' "temporary $($config.Licensing.Shared.SkuPartNumber)" } else { New-PraGuiFact 'Shared mailboxes' 'temporary licence not set (Licensing.Shared.SkuPartNumber)' 'Caution' }))
     $facts.Add($(if ($config.Retention.HoldPolicy) { New-PraGuiFact 'Case hold' $config.Retention.HoldPolicy } else { New-PraGuiFact 'Case hold' 'not set (Retention.HoldPolicy): Recover needs it' 'Caution' }))
     $facts.Add((New-PraGuiFact 'Entra Connect' (Get-PraGuiEntraConnectText -Config $config -Root $g.Root)))
@@ -948,7 +958,7 @@ function Update-PraGuiOverview {
         $kinds = @($state.Objects | Group-Object -Property kind)
         $count = { param($kind) $group = @($kinds | Where-Object { $_.Name -eq $kind }); if ($group.Count) { $group[0].Count } else { 0 } }
         $other = (& $count 'Room') + (& $count 'Equipment')
-        $snapshot.Add((New-PraGuiFact 'Objects' ('{0} user(s) · {1} shared{2}' -f (& $count 'User'), (& $count 'Shared'), $(if ($other) { " · $other room/equipment (not converted)" } else { '' }))))
+        $snapshot.Add((New-PraGuiFact 'Objects' ('{0} user(s) · {1} shared{2}' -f (& $count 'User'), (& $count 'Shared'), $(if ($other) { " · $other room/equipment" } else { '' }))))
         $snapshot.Add((New-PraGuiFact 'Permissions' ('{0} (shared mailboxes)' -f $state.Permissions)))
         $snapshot.Add((New-PraGuiFact 'Database' (Format-PraGuiPath -Path $config.Store.Path -Root $g.Root)))
     }
@@ -1036,11 +1046,12 @@ function Update-PraGuiConvertPage {
     else {
         $facts.Add((New-PraGuiFact 'Snapshot' ('#{0} · {1}' -f $state.Snapshot.id, (Format-PraGuiTime ([string]$state.Snapshot.finished_utc)))))
         $other = $table.Select("Kind IN ('Room','Equipment')").Count
-        $facts.Add((New-PraGuiFact 'Objects' ('{0} user(s) · {1} shared mailbox(es){2}' -f $table.Select("Kind = 'User'").Count, $table.Select("Kind = 'Shared'").Count, $(if ($other) { " · $other room/equipment (refused by Convert)" } else { '' }))))
+        $facts.Add((New-PraGuiFact 'Objects' ('{0} user(s) · {1} shared mailbox(es){2}' -f $table.Select("Kind = 'User'").Count, $table.Select("Kind = 'Shared'").Count, $(if ($other) { " · $other room/equipment" } else { '' }))))
     }
     if ($config) {
         $facts.Add((New-PraGuiFact 'Users' ('identity to the cloud, Exchange plan by ' + (Get-PraGuiLicenceText -Config $config))))
         $facts.Add((New-PraGuiFact 'Shared mailboxes' $(if ($config.Licensing.Shared.SkuPartNumber) { 'waves of {0}, temporary {1}' -f $config.Licensing.Shared.Parallel, $config.Licensing.Shared.SkuPartNumber } else { 'temporary licence not set' }) $(if ($config.Licensing.Shared.SkuPartNumber) { 'Primary' } else { 'Caution' })))
+        $facts.Add((New-PraGuiFact 'Rooms/equipment' (Get-PraGuiResourceText -Config $config)))
     }
     $inCloud = $table.Select("InCloud = '1'").Count
     $facts.Add((New-PraGuiFact 'In Exchange Online' $(if ($inCloud) { '{0} object(s) converted, not recovered yet' -f $inCloud } else { 'none' })))
@@ -1071,6 +1082,11 @@ function Update-PraGuiRecoverPage {
     if ($config) {
         $facts.Add((New-PraGuiFact 'Entra Connect' (Get-PraGuiEntraConnectText -Config $config -Root $g.Root)))
         $facts.Add($(if ($config.Retention.HoldPolicy) { New-PraGuiFact 'Case hold' $config.Retention.HoldPolicy } else { New-PraGuiFact 'Case hold' 'not set (Retention.HoldPolicy)' 'Critical' }))
+        $resources = Get-PraValue $config 'Resources' @{}
+        $ready = [bool](Get-PraValue $resources 'OnPremisesReady' $false)
+        $domain = [string](Get-PraValue $resources 'OnPremisesRoutingDomain' '')
+        $allowDelete = [bool](Get-PraValue $resources 'AllowUnprotectedDeletion' $false)
+        $facts.Add((New-PraGuiFact 'Native resources' $(if ($ready -and $domain) { "routing contact to $domain; new journals: NO hold/NO inactive copy, cloud bookings/messages NOT preserved; AllowUnprotectedDeletion = $allowDelete. Old protected journals keep their hold/licence." } else { 'Recover blocked until Resources.OnPremisesReady and OnPremisesRoutingDomain are set; unprotected deletion also requires explicit AllowUnprotectedDeletion' }) 'Caution'))
     }
     $waiting = 0
     foreach ($b in $g.Batches) { $waiting += [int]$b.Waiting }
@@ -1172,6 +1188,10 @@ function Set-PraGuiTicks {
     Update-PraGuiTicks -Page $Page -Changed:$Shown
 }
 
+function Get-PraGuiConfigurationKey {
+    return (Get-FileHash -LiteralPath $script:Gui.ConfigPath -Algorithm SHA256 -ErrorAction Stop).Hash
+}
+
 function Get-PraGuiSelection {
     <#
         What Preview and Apply run on a page now: the request (action, batch), the GUIDs of a wave, the key that must
@@ -1179,7 +1199,7 @@ function Get-PraGuiSelection {
     #>
     param([Parameter(Mandatory)][ValidateSet('Convert', 'Recover')][string]$Page)
     $g = $script:Gui; $c = $g.Controls
-    $selection = [pscustomobject]@{ Request = @{ Action = $Page }; Guids = @(); Key = ''; Label = ''; Problem = ''; Resume = $false }
+    $selection = [pscustomobject]@{ Request = @{ Action = $Page }; Guids = @(); Key = ''; ConfigKey = ''; Label = ''; Problem = ''; Resume = $false }
     if ($g.State.ConfigError) { $selection.Problem = 'Fix the configuration first.'; return $selection }
     if ($Page -eq 'Convert') {
         if (-not $g.State.Snapshot) { $selection.Problem = 'No snapshot: Collect first (on an Exchange server), then copy the database here.'; return $selection }
@@ -1193,6 +1213,8 @@ function Get-PraGuiSelection {
         $wave = [bool]$c.RecoverWave.IsChecked
         $all = 'the whole batch {0}' -f $g.SelectedBatch
     }
+    $selection.ConfigKey = Get-PraGuiConfigurationKey
+    $prefix += '|config|' + $selection.ConfigKey
     if ($wave) {
         $guids = [string[]]@(Get-PraGuiTicked $g.Tables[$Page])
         if (-not $guids.Count) { $selection.Problem = 'A wave: tick its objects in the table (or choose {0}).' -f $(if ($Page -eq 'Convert') { 'every object of the snapshot' } else { 'the whole batch' }); return $selection }
@@ -1248,7 +1270,8 @@ function Start-PraGuiPreview {
     if ($Resume) {
         $batch = @($g.Batches | Where-Object { $_.Status -in @('Partial', 'Running') }) | Select-Object -First 1
         if (-not $batch) { throw 'No unfinished Convert batch to resume.' }
-        $selection = [pscustomobject]@{ Request = @{ Action = 'Convert'; Batch = $batch.Id }; Guids = @(); Key = 'Convert|resume|' + $batch.Id
+        $configKey = Get-PraGuiConfigurationKey
+        $selection = [pscustomobject]@{ Request = @{ Action = 'Convert'; Batch = $batch.Id }; Guids = @(); Key = 'Convert|resume|' + $batch.Id + '|config|' + $configKey; ConfigKey = $configKey
             Label = 'the resume of batch ' + $batch.Id; Problem = ''; Resume = $true }
     } else {
         $selection = Get-PraGuiSelection -Page $Page
@@ -1276,6 +1299,12 @@ function Start-PraGuiApply {
     if (-not (Show-PraGuiConfirm -Word $Page.ToUpperInvariant() -Title $title -Text $pending.Confirm -Command $command.Display)) {
         Add-PraGuiLine -Status Info -Text 'Cancelled: nothing was run.'
         Show-PraGuiLastLine
+        return
+    }
+    if ($pending.Selection.ConfigKey -ne (Get-PraGuiConfigurationKey)) {
+        $g.Pending[$Page] = $null
+        Update-PraGuiApplyState
+        Set-PraGuiHint -Page $Page -Text 'The configuration changed: run a new preview before Apply.' -Tone 'Caution'
         return
     }
     Start-PraGuiRun -Request $request -Page $Page -Selection $pending.Selection
@@ -1486,14 +1515,16 @@ function Show-PraGuiRunResult {
 function Get-PraGuiPlanCount {
     <# The objects of a preview, from its CSV report: Planned (Users, Shared) and Blocked (not ready, left as they are). #>
     param([AllowEmptyString()][string]$Path)
-    $count = [pscustomobject]@{ Planned = 0; Users = 0; Shared = 0; Blocked = 0 }
+    $count = [pscustomobject]@{ Planned = 0; Users = 0; Shared = 0; Resources = 0; Blocked = 0 }
     if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $count }
     $rows = @(Import-Csv -LiteralPath $Path -Delimiter ';' -Encoding UTF8)
     if (-not $rows.Count -or -not $rows[0].PSObject.Properties['FinalStatus']) { return $count }
     foreach ($row in $rows) {
         if ($row.FinalStatus -eq 'Planned') {
             $count.Planned++
-            if ($row.Kind -eq 'User') { $count.Users++ } else { $count.Shared++ }
+            if ($row.Kind -eq 'User') { $count.Users++ }
+            elseif ($row.Kind -in @('Room','Equipment')) { $count.Resources++ }
+            else { $count.Shared++ }
         } elseif ($row.FinalStatus -eq 'Error' -and $row.ObjectGuid) { $count.Blocked++ }
     }
     return $count
@@ -1510,6 +1541,11 @@ function Complete-PraGuiAction {
     $mode = [string]$Run.Request['Mode']
     if ($action -in @('Convert', 'Recover') -and $mode -eq 'Preview') {
         $selection = $Run.Selection
+        if ($selection.ConfigKey -ne (Get-PraGuiConfigurationKey)) {
+            $g.Pending[$action] = $null
+            Set-PraGuiHint -Page $action -Text 'The configuration changed during Preview: run a new preview before Apply.' -Tone 'Caution'
+            return
+        }
         $count = Get-PraGuiPlanCount -Path $(if ($Result) { [string](Get-PraValue $Result 'csvReport' '') } else { '' })
         if ($Result -and $count.Planned -eq 0) { $count.Planned = [int](Get-PraValue $Result 'planned' 0) }
         $blocked = if ($count.Blocked) { ' · {0} not ready (left as they are)' -f $count.Blocked } else { '' }
@@ -1519,10 +1555,14 @@ function Complete-PraGuiAction {
             return
         }
         $split = '{0} user(s), {1} shared' -f $count.Users, $count.Shared
+        if ($count.Resources) { $split += ', {0} room/equipment' -f $count.Resources }
         $confirm = if ($action -eq 'Convert') {
             if ($selection.Resume) { 'Resume of batch {0}: {1} object(s) not finished ({2}) are taken again.{3}' -f $Run.Request.Batch, $count.Planned, $split, $blocked }
             else { '{0} object(s) are converted: {1} user(s) - identity managed in the cloud, Exchange plan, their Teams storage becomes their mailbox - then {2} shared mailbox(es), in waves, with the permissions of the snapshot.{3}' -f $count.Planned, $count.Users, $count.Shared, $blocked }
-        } else { '{0} object(s) of batch {1} go back on-premises ({2}): users to Active Directory and their on-premises mailbox, their cloud data under the case hold; shared mailboxes become inactive mailboxes under the hold. Nothing is deleted from a mailbox.{3}' -f $count.Planned, $Run.Request.Batch, $split, $blocked }
+        } else { '{0} object(s) of batch {1} go back on-premises ({2}): users to Active Directory and their on-premises mailbox, their cloud data under the case hold; shared mailboxes become inactive mailboxes under the hold.{3}' -f $count.Planned, $Run.Request.Batch, $split, $blocked }
+        if ($count.Resources) {
+            $confirm += ' Rooms/equipment follow their journaled lifecycle: new native resources have NO hold, NO inactive copy; Recover deletion does NOT preserve cloud-created reservations/messages and may destroy them. Export/reconcile first and explicitly set Resources.AllowUnprotectedDeletion = $true to acknowledge loss. Old protected native journals retain licence/hold/inactive verification; legacy synchronised resources follow the shared path. No automatic calendar import/merge.'
+        }
         $confirm += ' Every change is journaled; the run can be stopped after the current object and resumed.'
         $guard = if ($selection.Resume) { (Get-PraGuiSelection -Page $action).Key } else { $selection.Key }
         $g.Pending[$action] = @{ Key = $selection.Key; Guard = $guard; Resume = [bool]$selection.Resume; Batch = [string]$Run.Request['Batch']; Request = $Run.Request.Clone(); Selection = $selection
@@ -1730,3 +1770,180 @@ function Show-PraGui {
 Export-ModuleMember -Function Show-PraGui, New-PraGuiWindow, Get-PraGuiEngine, Get-PraGuiCommand, Read-PraGuiEvents, Read-PraGuiLastCheck, Read-PraGuiState,
     Get-PraGuiBatchSummary, Get-PraGuiNextStep, Format-PraGuiTime, ConvertTo-PraGuiCheckTable, ConvertTo-PraGuiConvertTable, ConvertTo-PraGuiRecoverTable,
     Get-PraGuiRowFilter, Get-PraGuiTicked, Write-PraGuiWave, Get-PraGuiSelectionKey, Get-PraGuiPlanCount
+
+# SIG # Begin signature block
+# MIIghgYJKoZIhvcNAQcCoIIgdzCCIHMCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBnmBdFbj6WphTX
+# mZQjCuMI/Du/95ELAaLnL9gUEnnAdKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
+# EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
+# A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
+# Fw0xNjA2MjQyMDQ0MzBaFw0zMTA2MjQyMDQ0MzBaMHgxCzAJBgNVBAYTAlVTMQ4w
+# DAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENv
+# cnAxNDAyBgNVBAMMK1NTTC5jb20gQ29kZSBTaWduaW5nIEludGVybWVkaWF0ZSBD
+# QSBSU0EgUjEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCfgxNzqrDG
+# bSHL24t6h3TQcdyOl3Ka5LuINLTdgAPGL0WkdJq/Hg9Q6p5tePOf+lEmqT2d0bKU
+# Vz77OYkbkStW72fL5gvjDjmMxjX0jD3dJekBrBdCfVgWQNz51ShEHZVkMGE6ZPKX
+# 13NMfXsjAm3zdetVPW+qLcSvvnSsXf5qtvzqXHnpD0OctVIFD+8+sbGP0EmtpuNC
+# GVQ/8y8Ooct8/hP5IznaJRy4PgBKOm8yMDdkHseudQfYVdIYyQ6KvKNc8HwKp4WB
+# wg6vj5lc02AlvINaaRwlE81y9eucgJvcLGfE3ckJmNVz68Qho+Uyjj4vUpjGYDdk
+# jLJvSlRyGMwnh/rNdaJjIUy1PWT9K6abVa8mTGC0uVz+q0O9rdATZlAfC9KJpv/X
+# gAbxwxECMzNhF/dWH44vO2jnFfF3VkopngPawismYTJboFblSSmNNqf1x1KiVgMg
+# Lzh4gL32Bq5BNMuURb2bx4kYHwu6/6muakCZE93vUN8BuvIE1tAx3zQ4XldbyDge
+# VtSsSKbt//m4wTvtwiS+RGCnd83VPZhZtEPqqmB9zcLlL/Hr9dQg1Zc0bl0EawUR
+# 0tOSjAknRO1PNTFGfnQZBWLsiePqI3CY5NEv1IoTGEaTZeVYc9NMPSd6Ij/D+KNV
+# t/nmh4LsRR7Fbjp8sU65q2j3m2PVkUG8qQIDAQABo4H7MIH4MA8GA1UdEwEB/wQF
+# MAMBAf8wHwYDVR0jBBgwFoAU3QQJB6L1en1SUxKSle44gCUNplkwMAYIKwYBBQUH
+# AQEEJDAiMCAGCCsGAQUFBzABhhRodHRwOi8vb2NzcHMuc3NsLmNvbTARBgNVHSAE
+# CjAIMAYGBFUdIAAwEwYDVR0lBAwwCgYIKwYBBQUHAwMwOwYDVR0fBDQwMjAwoC6g
+# LIYqaHR0cDovL2NybHMuc3NsLmNvbS9zc2wuY29tLXJzYS1Sb290Q0EuY3JsMB0G
+# A1UdDgQWBBRUwv4QlQCTzWr158DX2bJLuI8M4zAOBgNVHQ8BAf8EBAMCAYYwDQYJ
+# KoZIhvcNAQELBQADggIBAPUPJodwr5miyvXWyfCNZj05gtOII9iCv49UhCe204MH
+# 154niU2EjlTRIO5gQ9tXQjzHsJX2vszqoz2OTwbGK1mGf+tzG8rlQCbgPW/M9r1x
+# xs19DiBAOdYF0q+UCL9/wlG3K7V7gyHwY9rlnOFpLnUdTsthHvWlM98CnRXZ7WmT
+# V7pGRS6AvGW+5xI+3kf/kJwQrfZWsqTU+tb8LryXIbN2g9KR+gZQ0bGAKID+260P
+# Z+34fdzZcFt6umi1s0pmF4/n8OdX3Wn+vF7h1YyfE7uVmhX7eSuF1W0+Z0duGwdc
+# +1RFDxYRLhHDsLy1bhwzV5Qe/kI0Ro4xUE7bM1eV+jjk5hLbq1guRbfZIsr0WkdJ
+# LCjoT4xCPGRo6eZDrBmRqccTgl/8cQo3t51Qezxd96JSgjXktefTCm9r/o35pNfV
+# HUvnfWII+NnXrJlJ27WEQRQu9i5gl1NLmv7xiHp0up516eDap8nMLDt7TAp4z5T3
+# NmC2gzyKVMtODWgqlBF1JhTqIDfM63kXdlV4cW3iSTgzN9vkbFnHI2LmvM4uVEv9
+# XgMqyN0eS3FE0HU+MWJliymm7STheh2ENH+kF3y0rH0/NVjLw78a3Z9UVm1F5VPz
+# iIorMaPKPlDRADTsJwjDZ8Zc6Gi/zy4WZbg8Zv87spWrmo2dzJTw7XhQf+xkR6Od
+# MIIG9TCCBN2gAwIBAgIQBof4ljXihJpmCqqt2mhAWzANBgkqhkiG9w0BAQsFADB4
+# MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24x
+# ETAPBgNVBAoMCFNTTCBDb3JwMTQwMgYDVQQDDCtTU0wuY29tIENvZGUgU2lnbmlu
+# ZyBJbnRlcm1lZGlhdGUgQ0EgUlNBIFIxMB4XDTI2MTAxMzAyNDgwMloXDTI3MTAx
+# MzAyNDgwMlowXDELMAkGA1UEBhMCRlIxGzAZBgNVBAcMEkNoYW50ZWxvdXAtRW4t
+# QnJpZTEXMBUGA1UECgwOTmljb2xhcyBGYWJlcnQxFzAVBgNVBAMMDk5pY29sYXMg
+# RmFiZXJ0MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAsg6CT0mFQ4jB
+# V2plIS4uWFSoVqRHd82Y7XYZ4CUTe/7nPBRUlXXdKTZMMHzGgiG8dEXNE8K1Xe90
+# Dgl/FnorzAFlrNWSwf6t27UAUw9xkqtRDVVpVgpixpWkAwjcQeLG+YMqBkGbFi35
+# TGvS23lPFWvLp4DxARrv15MtZ/NjNTCAAGUlMP2hFVBknEmrnYjEGyeJ93sl20RS
+# WXQQLNqlenBdkGCrQW4XjHtRjJAEqAC68hN6nWevopSQ8CLUV7A1RFfHFarDrzrL
+# zr0/NjIdSyIfM9hShln31NDrktB6Ups2XIyrtPDNB7fjkW4jpLlOqQGfYKsU9ErE
+# 4SnFsh0yOOjitegyh1RvZ9wH++3DF4CmJfTli5l/gEIm8xCCryxI+K5EogW3wu1y
+# u8NT2hcvHjdh7OpRyPyFAuLZ8MfX7kPAJpnuCeOuktzY/20eVD8bDglj+4zgqzsn
+# cR/t6T/7w1/HxpRyrVoKvEyRx+mphYh5jMdEa0BjxOL0vAJpdGZSfXGmPm/yPqRn
+# 5STTkMtzkVQXPbcvgKM0luzFcQKPHk3qdHLEXa8gf93ktYDbLE5Wd2UHrXz3SZxN
+# URHPdIXCr1qgrqQve7041kMpzrkDI5DnG2lvRG4108gp02bHG0muKyZlDdCOra7h
+# Zonu2nO79sFallruzzNi0o994PoWksUCAwEAAaOCAZUwggGRMAwGA1UdEwEB/wQC
+# MAAwHwYDVR0jBBgwFoAUVML+EJUAk81q9efA19myS7iPDOMwegYIKwYBBQUHAQEE
+# bjBsMEgGCCsGAQUFBzAChjxodHRwOi8vY2VydC5zc2wuY29tL1NTTGNvbS1TdWJD
+# QS1Db2RlU2lnbmluZy1SU0EtNDA5Ni1SMS5jZXIwIAYIKwYBBQUHMAGGFGh0dHA6
+# Ly9vY3Nwcy5zc2wuY29tMFEGA1UdIARKMEgwCAYGZ4EMAQQBMDwGDCsGAQQBgqkw
+# AQMDATAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3JlcG9zaXRv
+# cnkwEwYDVR0lBAwwCgYIKwYBBQUHAwMwTQYDVR0fBEYwRDBCoECgPoY8aHR0cDov
+# L2NybHMuc3NsLmNvbS9TU0xjb20tU3ViQ0EtQ29kZVNpZ25pbmctUlNBLTQwOTYt
+# UjEuY3JsMB0GA1UdDgQWBBRoUx3630l9wA1fUpkKkw2GUIxl/jAOBgNVHQ8BAf8E
+# BAMCB4AwDQYJKoZIhvcNAQELBQADggIBAE3oj6cNuwlDToi1BwjgsA5djfRN4DIi
+# BYDFZIRYaIRe/rEdnItz3aqQQdFuwXnJA/MQEmi2WAGek8GeZF+R41s8FbcDxBUE
+# BoSt98TuBE+0xgxQWDiPhhXaX1Aw9V0GF4ZnlfCSw1eu2KiASaKn7Bo0PLbEAXff
+# vftRXof/kyqtw8iID6I4Rhrf5DI3WVZQodakUUmWnbnziWvEZOWbNOfzwP+7BwEt
+# 7jQANfbmEfb4p75rfy5dQVwniTDSvdo6xkrbe1Cr93GS7cJta18IG5CoIVUmdK+s
+# W38B1sLuy8Mi0MstMXV3004yaRuzLdNaAM0f9WAFerxemiQC0kdmA44/lWV3lVkM
+# WJSwkHBkkSg8Eh0hxcGzTH2xmtDhLJHNNLRwkI9u2Ur+HbLCt50oBgSV8BcCs/1i
+# qi884iC/yuX+HIv9YgTUNZ8c4lLaq4VuliJpXLu2buHIsTkO0v0+5oCM91zjTVZm
+# ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
+# eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
+# Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
+# wZislcdCZuS6MYISbTCCEmkCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
+# A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
+# MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
+# AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAAjdhUqNiX
+# owUIjdoGlo29myn0/E7osPKebM4HLyAjOTANBgkqhkiG9w0BAQEFAASCAgCwsVq9
+# k5KHq4fsX5S3eSP7XzO7/aW9TsKQPxmeNUs6goV7235ePP9s73ZCCsYzIjMeNyA6
+# liPd28Lcx0x9Ok+B7qfkL1P2jdGIW0sGJzV58s7KNsYI72OZfGnoaSWeQE1sdJJk
+# lCGFvoDzuTvrL7OPthwkrP4DrKXerTrIRdOMl6hKt2fLQXC+adq2jv4lXk4Ql4wN
+# 29UJHlzDLGkzG8aRTb3FxpyXzbQ4WDR9QjpiFThUMw1C4JzSJuSLy/TR9hceP/MO
+# QtkYBQVYls+RrWy9S33d0ghNaV+e/sCNd5TSlnJFKWdCMa9EcQLbITeT/dgf/FYE
+# okjGC5Hxo8uH5nCc4kgJLHIBmKZu37BwexMnimOBz8BPh6d18zRQ4qzdXSCocUpW
+# /AcyY2/hf+OoWOzTIXqt4pHWZZt61tVdlz6IabZx75MXlHRQPWQFnA+WWuNAelqi
+# WvyKy8rkS4tcx5yq+TOOqSfalnYjOV2YA0aji3zm5uF3NTLLDvbp1DhB7ipD8MBK
+# /pto9jUIeKakwyceuhodLhtxrkLno1lFPSUkhCbumxD1Q7G2wH0Y20QDdUy1x9TR
+# XlfZK0zBwJ63kipq2zLNTqTQ4X7z4CtsxpRryxY8VTvtYFT5L7qXCVbKZ8cQf6ci
+# y+ubEjCu4KL6h8XVeggonHGVYSzqy4mLzpgcYaGCDyowgg8mBgorBgEEAYI3AwMB
+# MYIPFjCCDxIGCSqGSIb3DQEHAqCCDwMwgg7/AgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
+# BAIBBQAEIDc0XoabZmCuOSJ0/jqxO+Y+PnGHQNXAaarOMoZu6f87AghdEnjRvive
+# ohgPMjAyNjEwMTQxNTIzNTJaMAMCAQECEGHKBU+RkaBRRkwjuVnCmRCgggwAMIIE
+# /DCCAuSgAwIBAgIQH2sWYtIuG2xd8cDBoGAOODANBgkqhkiG9w0BAQsFADBzMQsw
+# CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
+# BgNVBAoMCFNTTCBDb3JwMS8wLQYDVQQDDCZTU0wuY29tIFRpbWVzdGFtcGluZyBJ
+# c3N1aW5nIFJTQSBDQSBSMTAeFw0yNTAyMTgxNjMyMDJaFw0zNDExMTIxODUwMDVa
+# MG4xCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3Rv
+# bjERMA8GA1UECgwIU1NMIENvcnAxKjAoBgNVBAMMIVNTTC5jb20gVGltZXN0YW1w
+# aW5nIFVuaXQgMjAyNSBFMTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABBv7UVHH
+# b+ZVluxPXlfE3M6tg0Xnq8dic+O3vPOCRpalUM1vO9A+GRzSVVjyygHhYrBw62XL
+# Fh1kv7e+yRd/aTajggFaMIIBVjAfBgNVHSMEGDAWgBQMnRAljpqnG5mHQ88IfuG9
+# gZD0zzBRBggrBgEFBQcBAQRFMEMwQQYIKwYBBQUHMAKGNWh0dHA6Ly9jZXJ0LnNz
+# bC5jb20vU1NMLmNvbS10aW1lU3RhbXBpbmctSS1SU0EtUjEuY2VyMFEGA1UdIARK
+# MEgwPAYMKwYBBAGCqTABAwYBMCwwKgYIKwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNz
+# bC5jb20vcmVwb3NpdG9yeTAIBgZngQwBBAIwFgYDVR0lAQH/BAwwCgYIKwYBBQUH
+# AwgwRgYDVR0fBD8wPTA7oDmgN4Y1aHR0cDovL2NybHMuc3NsLmNvbS9TU0wuY29t
+# LXRpbWVTdGFtcGluZy1JLVJTQS1SMS5jcmwwHQYDVR0OBBYEFM582cAEgMUkEGoJ
+# 6hyrJT0R/ajSMA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAgHN1
+# JIW9ZlNip07FfY9r1LJwLKTl1h/y9r1BjDgHMEz7U7J7mAy32JxA1KLyjCCJqNku
+# RfhDHGFEfZtjTOru7AQMDSDiUDvCCc3jaz5py9jGvwIe5npkLbXqXhA+SqCzG719
+# USigwhHkYr7v8NiXoaY0Xu03p0BiZZreZlpngmGB9+86N94FqIFx2I5Z5iuu7d4j
+# 7aAOZBNxfU9jFDIIGDtWfWeCpF0Q8rLE/3DHDlzJKs5Il3i/VoOl7rTU938oSrxM
+# www6GDBlKX8rGHxvkjgIb9MXkVglJSDHsNAZDeCS/inaxKHA+ChuB8K4OxIxa6k1
+# e+eHBypakAY3wuN7w7PlPmhN6k5IdqZn3HZHs2VjoR841Z9wmVPFdGDdkBZ7XOmb
+# 5OZUaKufsvtER0VbY2DkzaqAaItt1kc+I+FUz7PiVz2PUzpegkftRRxvrPyIL08b
+# lJTnbMQ0XrqDN0rEfuTLv4XhhnKyJaXhxCUdjO/cRumMzZ35QTUMItBWy1xGp0iy
+# oFVnAya2pPsVMuAI+sy1zxlOS9l5iSxvKJ8gpnpOgjqYTa7u1eyZo+4JlcGoiiR1
+# 7LthMTrF1q62tO5xOpI8txUZ6gtKGtkJV6wdj+vZLcwKZ2M93GqVpOo6UBlGjx1s
+# KsVZ7AIUzJZli4NJ0M2KYcrfNnlebkYKpDnSqWwwggb8MIIE5KADAgECAhBtUhhw
+# h+gjTYVgANCAj5NWMA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYD
+# VQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBv
+# cmF0aW9uMTEwLwYDVQQDDChTU0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRo
+# b3JpdHkgUlNBMB4XDTE5MTExMzE4NTAwNVoXDTM0MTExMjE4NTAwNVowczELMAkG
+# A1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYD
+# VQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNz
+# dWluZyBSU0EgQ0EgUjEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCu
+# URAT0vk8IKAghd7JUBxkyeH9xek0/wp/MUjoclrFXqhh/fGH91Fc+7fm0MHCE7A+
+# wmOiqBj9ODrJAYGq3rm33jCnHSsCBNWAQYyoauLq8IjqsS1JlXL29qDNMMdwZ8UN
+# zQS7vWZMDJ40JSGNphMGTIA2qn2bohGtgRc4p1395ESypUOaGvJ3t0FNL3BuKmb6
+# YctMcQUF2sqooMzd89h0E6ujdvBDo6ZwNnWoxj7YmfWjSXg33A5GuY9ym4QZM5OE
+# Vgo8ebz/B+gyhyCLNNhh4Mb/4xvCTCMVmNYrBviGgdPZYrym8Zb84TQCmSuX0JlL
+# La6WK1aO6qlwISbb9bVGh866ekKblC/XRP20gAu1CjvcYciUgNTrGFg8f8AJgQPO
+# Cc1/CCdaJSYwhJpSdheKOnQgESgNmYZPhFOC6IKaMAUXk5U1tjTcFCgFvvArXtK4
+# azAWUOO1Y3fdldIBL6LjkzLUCYJNkFXqhsBVcPMuB0nUDWvLJfPimstjJ8lF4S6E
+# CxWnlWi7OElVwTnt1GtRqeY9ydvvGLntU+FecK7DbqHDUd366UreMkSBtzevAc9a
+# qoZPnjVMjvFqV1pYOjzmTiVHZtAc80bAfFe5LLfJzPI6DntNyqobpwTevQpHqPDN
+# 9qqNO83r3kaw8A9j+HZiSw2AX5cGdQP0kG0vhzfgBwIDAQABo4IBgTCCAX0wEgYD
+# VR0TAQH/BAgwBgEB/wIBADAfBgNVHSMEGDAWgBTdBAkHovV6fVJTEpKV7jiAJQ2m
+# WTCBgwYIKwYBBQUHAQEEdzB1MFEGCCsGAQUFBzAChkVodHRwOi8vd3d3LnNzbC5j
+# b20vcmVwb3NpdG9yeS9TU0xjb21Sb290Q2VydGlmaWNhdGlvbkF1dGhvcml0eVJT
+# QS5jcnQwIAYIKwYBBQUHMAGGFGh0dHA6Ly9vY3Nwcy5zc2wuY29tMD8GA1UdIAQ4
+# MDYwNAYEVR0gADAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3Jl
+# cG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYBBQUHAwgwOwYDVR0fBDQwMjAwoC6gLIYq
+# aHR0cDovL2NybHMuc3NsLmNvbS9zc2wuY29tLXJzYS1Sb290Q0EuY3JsMB0GA1Ud
+# DgQWBBQMnRAljpqnG5mHQ88IfuG9gZD0zzAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZI
+# hvcNAQELBQADggIBAJIZdQ2mWkLPGQfZ8vyU+sCb8BXpRJZaL3Ez3VDlE3uZk3cP
+# xPtybVfLuqaci0W6SB22JTMttCiQMnIVOsXWnIuAbD/aFTcUkTLBI3xys+wEajzX
+# aXJYWACDS47BRjDtYlDW14gLJxf8W6DQoH3jHDGGy8kGJFOlDKG7/YrK7UGfHtBA
+# EDVe6lyZ+FtCsrk7dD/IiL/+Q3Q6SFASJLQ2XI89ihFugdYL77CiDNXrI2MFspQG
+# swXEAGpHuaQDTHUp/LdR3TyrIsLlnzoLskUGswF/KF8+kpWUiKJNC4rPWtNrxlbX
+# YRGgdEdx8SMjUTDClldcrknlFxbqHsVmr9xkT2QtFmG+dEq1v5fsIK0vHaHrWjMM
+# maJ9i+4qGJSD0stYfQ6v0PddT7EpGxGd867Ada6FZyHwbuQSadMb0K0P0OC2r7rw
+# qBUe0BaMqTa6LWzWItgBjGcObXeMxmbQqlEz2YtAcErkZvh0WABDDE4U8GyV/32F
+# daAvJgTfe9MiL2nSBioYe/g5mHUSWAay/Ip1RQmQCvmF9sNfqlhJwkjy/1U1ibUk
+# TIUBX3HgymyQvqQTZLLys6pL2tCdWcjI9YuLw30rgZm8+K387L7ycUvqrmQ3ZJlu
+# jHl3r1hgV76s3WwMPgKk1bAEFMj+rRXimSC+Ev30hXZdqyMdl/il5Ksd0vhGMYIC
+# WTCCAlUCAQEwgYcwczELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYD
+# VQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNv
+# bSBUaW1lc3RhbXBpbmcgSXNzdWluZyBSU0EgQ0EgUjECEB9rFmLSLhtsXfHAwaBg
+# DjgwCwYJYIZIAWUDBAIBoIIBYTAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQw
+# HAYJKoZIhvcNAQkFMQ8XDTI2MTAxNDE1MjM1MlowKAYJKoZIhvcNAQk0MRswGTAL
+# BglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEINeqmzAfXbP1
+# uM2bQ1yee76rKgjJvBVwYZzsPbzDuVSyMIHJBgsqhkiG9w0BCRACLzGBuTCBtjCB
+# szCBsAQgVCr5oWqNci5mEUl4iumUwYqaruWmXLNEolSa+Wx5x4swgYswd6R1MHMx
+# CzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjER
+# MA8GA1UECgwIU1NMIENvcnAxLzAtBgNVBAMMJlNTTC5jb20gVGltZXN0YW1waW5n
+# IElzc3VpbmcgUlNBIENBIFIxAhAfaxZi0i4bbF3xwMGgYA44MAoGCCqGSM49BAMC
+# BEgwRgIhAN/jYKYVjvLxLNKrGQlBrlNXNIlWyHZ+RRf2cyh4HJmGAiEAmo3uIq9d
+# H4LaqrG6QEm6FykkRPj9XbT/vV8M2djDevk=
+# SIG # End signature block

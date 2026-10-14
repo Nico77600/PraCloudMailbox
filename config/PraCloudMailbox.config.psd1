@@ -2,7 +2,7 @@
 #  PRA Cloud Mailbox - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 1.2.0
+#  Version : 1.3.0
 #
 #  This file is read by Invoke-PraCloudMailbox.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
@@ -44,17 +44,18 @@
         CsvPath                = ''             # e.g. '.\config\Targets.csv'
         IncludeUsers           = $true
         IncludeShared          = $true
-        IncludeRoom            = $false        # rooms and equipment are collected when true; Convert still refuses
-        IncludeEquipment       = $false        # them unless ConvertRooms is also true (booking settings are lost)
+        IncludeRoom            = $false        # rooms and equipment are collected when true
+        IncludeEquipment       = $false        # Convert still requires ConvertRooms
         ExcludeSamAccountNames = @()
-        ConvertRooms           = $false        # $true: Convert/Recover a room or equipment mailbox like a shared one
+        ConvertRooms           = $false        # resource handling is optional, disabled by default
+        ResourceMode           = 'SynchronizedShared' # legacy synced path; 'CloudResource' for native resources EXCLUDED from sync
     }
 
     # ---------------------------------------------------------------------
     # What Collect reads on top of the mailboxes.
     # ---------------------------------------------------------------------
     Collect = @{
-        SharedPermissions            = $true    # FullAccess (+ AutoMapping), SendAs, SendOnBehalf of shared/room/equipment mailboxes
+        SharedPermissions            = $true    # FullAccess (+ AutoMapping), SendAs, SendOnBehalf of shared/legacy synced resources; never native CloudResource
         ExpandGroupTrustees          = $true    # groups used as trustees: members stored (recursive), granted one by one at Convert
         ExcludeTrustees              = @('Administrator')   # sAMAccountName, DOMAIN\sam or wildcard; system accounts are always excluded
         MailboxStatistics            = $false   # item count and size (slower; useful to size Kiosk mailboxes, 2 GB)
@@ -110,6 +111,19 @@
     Licensing = @{
         Users  = @{ Mode = 'Group'; GroupId = ''; SkuPartNumber = '' }     # GroupId: object ID of the licence group
         Shared = @{ SkuPartNumber = ''; Parallel = 100 }     # e.g. 'SPE_E3' or 'EXCHANGESTANDARD'
+    }
+
+    # Native rooms/equipment EXCLUDED from Entra sync (Scope.ResourceMode = 'CloudResource').
+    # Collect captures their booking settings; Convert creates actual room/equipment mailboxes.
+    # Standard resources up to 50 GB need no licence or hold. LicensingGroupId is ONLY for old protected journals.
+    # Recover routes via a MailContact to alias@OnPremisesRoutingDomain; verify that address and connector
+    # reach the rebuilt resource BEFORE explicitly setting OnPremisesReady = $true.
+    Resources = @{
+        LicensingGroupId       = ''           # backwards compatibility only; new native resources never use this group
+        OnPremisesRoutingDomain = ''          # e.g. 'resources.contoso.com'; must not loop back to the cloud resource
+        OnPremisesReady        = $false       # operator assertion: native resources and hybrid mail routing restored
+        AllowUnprotectedDeletion = $false     # explicit data-loss consent, reset in packages: no hold/inactive copy or cloud content preservation
+        Parallel               = 100
     }
 
     # ---------------------------------------------------------------------

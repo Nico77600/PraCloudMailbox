@@ -44,6 +44,18 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Reset-PraPackageConsent {
+    <# Data-loss/routing consents are operator assertions: the packaged configuration never carries them as true. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    foreach ($key in 'OnPremisesReady', 'AllowUnprotectedDeletion') {
+        # Line start, '{' or ';' only (never a comment); any value other than the literal $false is reset, also inline.
+        $pattern = "((?:^|[;{])[ \t]*)($key)([ \t]*=[ \t]*)(?!\`$false(?![\w]))[^\s;}#]+"
+        $Text = [regex]::Replace($Text, $pattern, '$1$2$3$$false', [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::Multiline)
+    }
+    return $Text
+}
+
 $root = Split-Path $PSScriptRoot -Parent
 $entry = Join-Path $root 'Invoke-PraCloudMailbox.ps1'
 $version = ([regex]::Match([IO.File]::ReadAllText($entry), "(?m)^\`$toolVersion = '([0-9.]+)'")).Groups[1].Value
@@ -92,7 +104,8 @@ $configRelative = 'config\PraCloudMailbox.config.psd1'
 $config = [IO.File]::ReadAllText((Join-Path $root $configRelative), [Text.Encoding]::UTF8)
 $emptied = [Collections.Generic.List[string]]::new()
 $keys = 'DomainController', 'Server', 'SearchBase', 'GroupDN', 'CsvPath', 'ContactsSearchBase', 'DistributionGroupsSearchBase', 'TenantId', 'Organization',
-    'AppId', 'CertificateThumbprint', 'DefaultUsageLocation', 'GroupId', 'SkuPartNumber', 'HoldPolicy', 'ScriptPath'
+    'AppId', 'CertificateThumbprint', 'DefaultUsageLocation', 'GroupId', 'SkuPartNumber', 'HoldPolicy', 'ScriptPath',
+    'LicensingGroupId', 'OnPremisesRoutingDomain'
 foreach ($key in $keys) {
     # Every occurrence, also inside an inline hashtable (Users = @{ Mode = 'Group'; GroupId = '...' }).
     $pattern = "(?<![\w.])($key\s*=\s*)'([^']*)'"
@@ -104,6 +117,7 @@ foreach ($key in $keys) {
 $config = [regex]::Replace($config, "(?m)^(\s*Environment\s*=\s*)'[^']*'", '$1''PROD''')
 # Entra Connect without its server or script: the operator mode, valid until the administrator chooses.
 $config = [regex]::Replace($config, "(?m)^(\s*Mode\s*=\s*)'(Script|Remoting)'", '$1''Manual''')
+$config = Reset-PraPackageConsent -Text $config
 $configTarget = Join-Path $Destination $configRelative
 [IO.File]::WriteAllText($configTarget, $config, [Text.UTF8Encoding]::new($true))
 $files.Add($configRelative)
@@ -124,6 +138,7 @@ foreach ($value in ($emptied | Where-Object { $_.Length -ge 4 } | Select-Object 
 }
 $check = Import-PowerShellDataFile -LiteralPath $configTarget
 if ($check.Cloud.TenantId -or $check.Cloud.AppId -or $check.Cloud.CertificateThumbprint -or $check.Licensing.Users.GroupId -or $check.Retention.HoldPolicy) { $problems.Add('Tenant values are still in the packaged configuration.') }
+if ($check.Resources.OnPremisesReady -ne $false -or $check.Resources.AllowUnprotectedDeletion -ne $false) { $problems.Add('Resources.OnPremisesReady and Resources.AllowUnprotectedDeletion must both be $false in the packaged configuration.') }
 foreach ($file in Get-ChildItem -LiteralPath $Destination -Recurse -File -Include '*.ps1', '*.psm1', '*.psd1') {
     $errors = $null
     $null = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors)

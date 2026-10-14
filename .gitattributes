@@ -1,0 +1,8 @@
+# Preserve the exact Authenticode bytes, including CRLF, on these signed scripts.
+Invoke-PraCloudMailbox.ps1 -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+module/PRA2.Common.psm1 -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+module/PRA2.Store.psm1 -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+module/PRA2.Collect.psm1 -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+module/PRA2.Cloud.psm1 -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+module/PRA2.Gui.psm1 -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+config/EntraConnect.sample.ps1 -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

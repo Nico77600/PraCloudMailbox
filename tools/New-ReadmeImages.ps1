@@ -3,7 +3,7 @@
 <#
 .SYNOPSIS
     Renders the graphics of the GitHub README from the PRA Cloud Mailbox developer guide, in a light and a
-    dark version: banner, principles, how it works, Convert and Recover, states of a mailbox.
+    dark version: banner, principles, how it works, Convert and Recover, states, resources and permissions.
 
 .DESCRIPTION
     GitHub renders Markdown only: the custom blocks of the guide (cards, flow) and its theme are lost. This
@@ -68,7 +68,7 @@ function Get-ReadmeAssets {
     [pscustomobject]@{
         Icons   = & ([scriptblock]::Create($assign.Right.Extent.Text))
         Css     = [regex]::Match([IO.File]::ReadAllText($guideHtml), '(?s)<style>(.*?)</style>').Groups[1].Value
-        Version = [regex]::Match($md, '(?m)^version:\s*(\S+)').Groups[1].Value
+        Version = [regex]::Match($md, '(?m)^version:\s*(.+)$').Groups[1].Value.Trim()
         Flows   = @($blocks | Where-Object Kind -eq 'flow')
         Cards   = @($blocks | Where-Object Kind -eq 'cards')
     }
@@ -137,12 +137,12 @@ body { display: block; margin: 0; padding: 0; }
 .rb-legend { display: flex; gap: 18px; font-size: 12px; color: var(--cp-text-muted); margin: 0 0 4px 4px; } .rb-legend i { display: inline-block; width: 12px; height: 12px; border-radius: 4px; margin-right: 6px; vertical-align: -1px; }
 /* Banner */
 .rb-hero { margin: 0; padding: 32px 36px 30px; }
-.rb-hero-grid { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 240px; gap: 34px; align-items: center; }
+.rb-hero-grid { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 250px; gap: 34px; align-items: center; }
 .rb-hero h1 { font-size: 35px; }
 .rb-hero .lead { margin: 18px 0 0; font-size: 17px; max-width: none; }
 .rb-hero .badges { margin: 20px 0 0; }
 .rb-stats { position: relative; display: grid; gap: 10px; }
-.rb-stat { display: flex; align-items: center; gap: 14px; padding: 12px 16px; border-radius: 14px; background: var(--cp-panel-strong); border: 1px solid var(--cp-border); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08); }
+.rb-stat { display: flex; align-items: center; gap: 14px; padding: 12px 16px; border-radius: 14px; background: var(--cp-surface); border: 1px solid var(--cp-border); }
 .rb-stat b { font-size: 30px; line-height: 1; color: var(--cp-accent); font-weight: 750; min-width: 40px; text-align: center; }
 .rb-stat span { font-size: 13px; color: var(--cp-text-muted); line-height: 1.35; }
 .rb-stat strong { display: block; color: var(--cp-text); font-size: 14px; }
@@ -157,9 +157,9 @@ body { display: block; margin: 0; padding: 0; }
 .rb-flow .flow-sub { max-width: 84px; }
 .rb-space { height: 18px; }
 /* How it works: vertical pipeline and the three modes */
-.rb-hiw { display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(0, 1fr); gap: 16px; align-items: stretch; }
+.rb-hiw { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: stretch; }
 .rb-col { display: flex; flex-direction: column; }
-.rb-vflow { flex: 1; flex-direction: column; flex-wrap: nowrap; align-items: stretch; justify-content: center; gap: 0; margin: 0; padding: 16px 18px; }
+.rb-vflow { flex: 1; flex-direction: column; flex-wrap: nowrap; align-items: stretch; justify-content: space-between; gap: 0; margin: 0; padding: 16px 18px; }
 .rb-vnode { display: flex; align-items: center; gap: 14px; padding: 11px 16px; border-radius: 12px; background: var(--cp-surface); border: 1px solid var(--cp-border); }
 .rb-vnode .flow-icon { margin: 0; flex-shrink: 0; }
 .rb-vnode .flow-text { margin-top: 1px; }
@@ -171,13 +171,17 @@ body { display: block; margin: 0; padding: 0; }
 .rb-modes .card-title { display: flex; align-items: center; gap: 8px; }
 .rb-chip { font-size: 11px; font-weight: 600; padding: 0 8px; border-radius: 999px; border: 1px solid var(--cp-border); color: var(--cp-text-muted); }
 .rb-chip.hot { color: var(--cp-accent-fg); background: var(--cp-accent); border-color: var(--cp-accent); }
+.rb-details { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+.rb-note { padding: 12px 14px; border: 1px solid var(--cp-border); border-radius: 14px; background: var(--cp-surface); color: var(--cp-text-muted); font-size: 12.5px; line-height: 1.45; }
+.rb-note strong { color: var(--cp-text); }
+.rb-note code { white-space: normal; overflow-wrap: anywhere; }
 '@
 #endregion
 
 #region Rendering (Microsoft Edge, headless) -------------------------------------------------------
 function Save-Screenshot([string]$Html, [string]$Png, [int]$Width, [int]$Height, [int]$Scale = 1) {
     $url = 'file:///' + ($Html -replace '\\', '/')
-    $profilePath = Join-Path $work 'edge-profile'
+    $profilePath = Join-Path $work ('edge-' + [guid]::NewGuid().ToString('N'))
     if (Test-Path $Png) { Remove-Item $Png -Force }
     # Start-Process, not &: an Edge helper process can keep the output pipe open after the capture.
     $edgeArgs = @('--headless=new', '--disable-gpu', '--hide-scrollbars', '--no-first-run', "--user-data-dir=`"$profilePath`"", "--window-size=$Width,$Height", "--force-device-scale-factor=$Scale", "--screenshot=`"$Png`"", "`"$url`"")
@@ -192,7 +196,8 @@ function Get-PageHeight([string]$Html, [int]$Width) {
     # Height of the .canvas element: the page writes it in body[data-h], read with --dump-dom.
     $url = 'file:///' + ($Html -replace '\\', '/')
     $dom = Join-Path $work ('dom-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.html')
-    $edgeArgs = @('--headless=new', '--disable-gpu', '--hide-scrollbars', '--no-first-run', "--user-data-dir=`"$(Join-Path $work 'edge-profile')`"", "--window-size=$Width,2000", '--dump-dom', "`"$url`"")
+    $profilePath = Join-Path $work ('edge-' + [guid]::NewGuid().ToString('N'))
+    $edgeArgs = @('--headless=new', '--disable-gpu', '--hide-scrollbars', '--no-first-run', "--user-data-dir=`"$profilePath`"", "--window-size=$Width,2000", '--dump-dom', "`"$url`"")
     $proc = Start-Process -FilePath $edge -ArgumentList $edgeArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $dom
     if (-not $proc.WaitForExit(45000)) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
     # Edge helper processes inherit the output handle: read in shared mode, retry until written.
@@ -251,44 +256,45 @@ try {
     $badges = @(
         "<span class=""badge badge-accent"">Version $($assets.Version)</span>"
         "<span class=""badge"">$(Get-ReadmeIcon 'terminal' 'icon-sm')PowerShell 5.1 &middot; 7.4+</span>"
-        "<span class=""badge"">$(Get-ReadmeIcon 'server' 'icon-sm')Exchange 2019 &middot; SE &middot; Online</span>"
-        "<span class=""badge"">$(Get-ReadmeIcon 'refresh' 'icon-sm')Entra Connect 2.5.76+</span>"
+        "<span class=""badge"">$(Get-ReadmeIcon 'shield' 'icon-sm')Journal before each change</span>"
         "<span class=""badge"">$(Get-ReadmeIcon 'tag' 'icon-sm')MIT license</span>"
     ) -join ''
     $banner = "<header class=""hero rb-hero""><div class=""rb-hero-grid""><div>" +
-        "<div class=""hero-top""><div class=""hero-logo"">$(Get-ReadmeIcon 'lifebuoy')</div><div><div class=""eyebrow"">Exchange disaster recovery $mid scenario 2 $mid Exchange Online</div><h1>PRA Cloud Mailbox</h1></div></div>" +
-        "<p class=""lead"">When <strong>Active Directory, Exchange and Entra Connect</strong> are lost, gives every user and shared mailbox a mailbox in <strong>Exchange Online on its existing identity</strong> &mdash; the Teams storage becomes the mailbox &mdash; and <strong>rolls everything back</strong> when the infrastructure is rebuilt, without losing a mail.</p>" +
+        "<div class=""hero-top""><div class=""hero-logo"">$(Get-ReadmeIcon 'lifebuoy')</div><div><div class=""eyebrow"">Hybrid Exchange $mid disaster recovery $mid scenario 2</div><h1>PRA Cloud Mailbox</h1></div></div>" +
+        "<p class=""lead"">When <strong>AD, Exchange and Entra Connect are lost</strong>, restores mail service in <strong>Exchange Online</strong> on the existing user/shared identities, with shared mailbox permissions. <strong>Recover</strong> returns them on-premises with their cloud data protected. Native resources use a separate, destructive recovery path.</p>" +
         "<div class=""badges"">$badges</div></div>" +
         "<div class=""rb-stats"">" +
         "<div class=""rb-stat""><b>4</b><span><strong>actions</strong>Collect, Check, Convert, Recover</span></div>" +
-        "<div class=""rb-stat""><b>1</b><span><strong>licence unit</strong>for all the shared mailboxes</span></div>" +
-        "<div class=""rb-stat""><b>0</b><span><strong>mail lost</strong>case hold, inactive mailboxes</span></div>" +
+        "<div class=""rb-stat""><b>1</b><span><strong>batch ID</strong>links every change and its recovery</span></div>" +
+        "<div class=""rb-stat""><b>0</b><span><strong>tenant writes in Preview</strong>review the plan before Apply</span></div>" +
         "</div></div></header>"
-    New-ReadmeGraphic -Name 'banner' -Body $banner -Width 1080
+    New-ReadmeGraphic -Name 'banner' -Body $banner -Width 1000
 
     # Principles: the cards block of the introduction of the guide.
-    New-ReadmeGraphic -Name 'principles' -Body (ConvertTo-ReadmeCards $assets.Cards[0].Lines 'rb-cards2') -Width 1080
+    New-ReadmeGraphic -Name 'principles' -Body (ConvertTo-ReadmeCards $assets.Cards[0].Lines 'rb-cards2') -Width 1000
 
-    # How it works: the life of the tool as a vertical pipeline, and the four actions.
+    # Same construction as scenario 1: entry pipeline on the left, four action cards on the right.
     $stages = @(
-        'database | Collect | Exchange server, every day: mailboxes, addresses, shared mailbox permissions'
-        'arrow | copy | one SQLite file to the cloud admin server'
-        'check | Check | is every object ready? Entra ID, Exchange Online, licences, app'
-        'arrow | disaster | AD, Exchange and Entra Connect lost'
-        'cloud | Convert | identities managed in the cloud, Teams storage = mailbox, shared mailboxes'
-        'arrow | batch ID | journal: original state of every object'
-        'refresh | Recover | infrastructure rebuilt: back to AD, nothing lost'
+        'settings | Configuration | scope, tenant, app certificate, licences, holds, Entra Connect'
+        'arrow | read by | one entry script, command line or WPF window'
+        'terminal | Invoke-PraCloudMailbox.ps1 | -Action, -Mode, -Batch; Preview before Apply'
+        'arrow | collects before the disaster | copy the SQLite snapshot to the cloud admin server'
+        'database | Exchange snapshot | mailboxes, addresses, shared permissions and native-resource metadata'
+        'arrow | checks, then converts or recovers | verified cloud writes; native resources are opt-in'
+        'cloud | Entra ID and Exchange Online | source of authority, licences, mailboxes and permissions'
+        'arrow | journals each change | original state and immutable identities for resume'
+        'chart | Batch and reports | SQLite journal, log, transcript, CSV and HTML report'
     )
     $actions = @(
-        [pscustomobject]@{ Icon = 'database'; Name = 'Collect'; Chip = '<span class="rb-chip">Windows PowerShell 5.1</span>'; Text = 'On an Exchange server, every day: <strong>mailboxes, GUIDs, X500 addresses and shared mailbox permissions</strong> into a SQLite snapshot.'; Pills = (Get-ReadmePill 'Reads only' 'success') + (Get-ReadmePill 'Scheduled task' 'teal') }
-        [pscustomobject]@{ Icon = 'check'; Name = 'Check'; Chip = '<span class="rb-chip hot">read-only</span>'; Text = 'On the cloud admin server: <strong>is every object ready?</strong> Entra ID object, Exchange Online recipient, licences, permissions of the app.'; Pills = (Get-ReadmePill 'Error = refused' 'warning') + (Get-ReadmePill 'Every week' 'teal') }
-        [pscustomobject]@{ Icon = 'cloud'; Name = 'Convert'; Chip = '<span class="rb-chip">-Mode Apply</span>'; Text = 'Users first &mdash; <strong>the Teams storage becomes the mailbox</strong> &mdash; then the shared mailboxes in waves, with their permissions.'; Pills = (Get-ReadmePill 'Batch ID' 'violet') + (Get-ReadmePill 'Resumable' 'success') }
-        [pscustomobject]@{ Icon = 'refresh'; Name = 'Recover'; Chip = '<span class="rb-chip">-Batch</span>'; Text = 'Users back on-premises, their cloud data <strong>under a case hold</strong>; shared mailboxes <strong>inactive</strong>, recreated by Entra Connect.'; Pills = (Get-ReadmePill 'Licences as before' 'success') + (Get-ReadmePill 'Waves' 'teal') }
+        [pscustomobject]@{ Icon = 'database'; Name = 'Collect'; Chip = '<span class="rb-chip hot">snapshot</span>'; Text = 'Before the disaster, read <strong>mailboxes, addresses and permissions</strong> from Exchange into SQLite. Windows PowerShell 5.1; no tenant change.'; Pills = (Get-ReadmePill 'Preview first' 'info') + (Get-ReadmePill 'Scheduled task' 'success') }
+        [pscustomobject]@{ Icon = 'search'; Name = 'Check'; Chip = '<span class="rb-chip">read only</span>'; Text = 'On the cloud admin server: <strong>is every object ready?</strong> Check identity, recipient, app permissions, protection and required capacity.'; Pills = (Get-ReadmePill 'Ready' 'success') + (Get-ReadmePill 'Blocked' 'warning') }
+        [pscustomobject]@{ Icon = 'target'; Name = 'Convert'; Chip = '<span class="rb-chip hot">changes</span>'; Text = 'Promote user Teams storage; create shared mailboxes in waves with their permissions. <strong>Opt-in native rooms/equipment</strong> get new cloud resources.'; Pills = (Get-ReadmePill 'Journaled' 'info') + (Get-ReadmePill 'Resumable' 'success') }
+        [pscustomobject]@{ Icon = 'refresh'; Name = 'Recover'; Chip = '<span class="rb-chip hot">changes</span>'; Text = 'Users return under a case hold; shared cloud mailboxes become inactive. <strong>Native bookings must be exported</strong> before destructive recovery.'; Pills = (Get-ReadmePill 'User/shared data protected' 'success') + (Get-ReadmePill 'Native: no hold' 'warning') }
     )
     $actionHtml = ($actions | ForEach-Object { "<div class=""card-item""><div class=""card-icon"">$(Get-ReadmeIcon $_.Icon)</div><div><div class=""card-title"">$($_.Name) $($_.Chip)</div><div class=""card-text"">$($_.Text)</div><div>$($_.Pills)</div></div></div>" }) -join ''
-    $howItWorks = "<div class=""rb-hiw""><div class=""rb-col""><div class=""rb-caption"">The life of the tool <span>$mid before, during and after the disaster</span></div>$(ConvertTo-ReadmeFlow $stages -Vertical)</div>" +
-        "<div class=""rb-col""><div class=""rb-caption"">Four actions <span>$mid preview first, one confirmation</span></div><div class=""rb-modes"">$actionHtml</div></div></div>"
-    New-ReadmeGraphic -Name 'how-it-works' -Body $howItWorks -Width 1080
+    $howItWorks = "<div class=""rb-hiw""><div class=""rb-col""><div class=""rb-caption"">One entry point <span>$mid from configuration to reports</span></div>$(ConvertTo-ReadmeFlow $stages -Vertical)</div>" +
+        "<div class=""rb-col""><div class=""rb-caption"">Four actions <span>$mid Preview by default, Apply on demand</span></div><div class=""rb-modes"">$actionHtml</div></div></div>"
+    New-ReadmeGraphic -Name 'how-it-works' -Body $howItWorks -Width 1000
 
     # Convert and Recover, users and shared mailboxes: the validated order of the steps.
     $flows = [ordered]@{
@@ -299,14 +305,14 @@ try {
             'refresh | AD authority | one delta cycle', 'arrow | | ', 'key | Plan removed | licences exactly as before', 'arrow | | '
             'server | On-premises | MailUser, on-premises GUID', 'arrow | | ', 'shield | Case hold | disaster mails kept')
         'Shared mailboxes &middot; Convert <span>&middot; in waves</span>' = @(
-            'key | Temporary licence | one unit for all', 'arrow | | ', 'people | SharedMailbox | then the licence goes back', 'arrow | | '
+            'key | Temporary licence | one unit per parallel object', 'arrow | | ', 'people | SharedMailbox | then the licence goes back', 'arrow | | '
             'tag | Tag | CustomAttribute1 = Converted', 'arrow | | ', 'check | Permissions | FullAccess, SendAs, SendOnBehalf')
         'Shared mailboxes &middot; Recover <span>&middot; one scheduler pause, one delta cycle</span>' = @(
             'shield | Case hold | stamped before anything', 'arrow | | ', 'warning | Identity deleted | scheduler paused, purged', 'arrow | | '
             'folder | Inactive mailbox | content, hold and tag kept', 'arrow | | ', 'refresh | New object | Entra Connect, on-premises GUID')
     }
     $flowHtml = ($flows.Keys | ForEach-Object { "<div><div class=""rb-caption"">$_</div>$(ConvertTo-ReadmeFlow ([string[]]$flows[$_]))</div>" }) -join ''
-    New-ReadmeGraphic -Name 'flows' -Body "<div class=""rb-flows"">$flowHtml</div>" -Width 1080
+    New-ReadmeGraphic -Name 'flows' -Body "<div class=""rb-flows"">$flowHtml</div>" -Width 1000
 
     # States of a mailbox: before the disaster, after Convert, after Recover.
     $onPrem = Get-ReadmePill 'Mail on-premises' 'info'; $online = Get-ReadmePill 'Mail in Exchange Online' 'violet'
@@ -322,7 +328,38 @@ try {
         (& $cell 'Cloud shared mailbox' 'Managed in the cloud, tagged, the permissions of the snapshot granted' $online) +
         (& $cell 'Shared mailbox on-premises again' 'New object created by Entra Connect; the cloud mailbox is <strong>inactive</strong>, under the hold, then under retention' $onPrem) +
         "</div>"
-    New-ReadmeGraphic -Name 'states' -Body $states -Width 1080
+    New-ReadmeGraphic -Name 'states' -Body $states -Width 1000
+
+    $permissionSteps = @(
+        'server | Read Exchange | before the disaster, while it is available'
+        'arrow | expand | group trustees to users'
+        'database | Snapshot | permissions and AutoMapping saved in SQLite'
+        'arrow | Convert | cloud holders checked'
+        'cloud | Grant and verify | Exchange Online, rights read back'
+    )
+    $permissions = "<div class=""rb-caption"">Shared mailbox permissions <span>$mid collected before, granted in Exchange Online</span></div>" +
+        (ConvertTo-ReadmeFlow $permissionSteps) +
+        "<div class=""rb-details"">" +
+        "<div class=""rb-note""><strong>FullAccess</strong><br>Collected AutoMapping preserved<br><code>Add-MailboxPermission</code></div>" +
+        "<div class=""rb-note""><strong>SendAs</strong><br>Send-as trustees from the snapshot<br><code>Add-RecipientPermission</code></div>" +
+        "<div class=""rb-note""><strong>SendOnBehalf</strong><br>Delegates from the snapshot<br><code>Set-Mailbox</code></div></div>" +
+        "<div class=""rb-note"" style=""margin-top:10px""><strong>Native resources are different:</strong> booking and invitation controls are preserved; FullAccess, SendAs, SendOnBehalf and calendar-folder ACLs are not imported.</div>"
+    New-ReadmeGraphic -Name 'permissions' -Body $permissions -Width 1000
+
+    $resourceSteps = @(
+        'database | Collect | new metadata snapshot, booking controls, RoomLists'
+        'arrow | Convert | ownership and collisions checked'
+        'calendar | Cloud resources | real rooms/equipment; disabled sign-in; no contents imported'
+        'arrow | before Recover | export/reconcile cloud bookings'
+        'refresh | Routing contact | owned deletion, restored on-premises mail route'
+    )
+    $resources = "<div class=""rb-caption"">Native rooms and equipment <span>$mid opt-in continuity, not content migration</span></div>" +
+        (ConvertTo-ReadmeFlow $resourceSteps) +
+        "<div class=""rb-details"">" +
+        "<div class=""rb-note""><strong>Convert fails closed</strong><br>Unfinished resources hidden; booking disabled until settings and memberships are verified.</div>" +
+        "<div class=""rb-note""><strong>Recover is destructive</strong><br>No hold or inactive copy. Cloud bookings/messages are not preserved or merged.</div>" +
+        "<div class=""rb-note""><strong>Two explicit consents</strong><br>Verified on-premises routing and acknowledged loss. No purge or automatic second DELETE.</div></div>"
+    New-ReadmeGraphic -Name 'resources' -Body $resources -Width 1000
 
     Get-ChildItem $OutputFolder -Filter 'readme-*.png' | Select-Object Name, @{ n = 'KB'; e = { [math]::Round($_.Length / 1KB) } } | Format-Table -AutoSize | Out-String | Write-Host
 } finally {

@@ -19,8 +19,19 @@
     Author  : Nicolas Fabert
 #>
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'GraphRequestContext.Fake.ps1')
+if (-not ('Microsoft.Exchange.Configuration.Tasks.ManagementObjectNotFoundException' -as [type])) {
+    Add-Type -TypeDefinition @'
+namespace Microsoft.Exchange.Configuration.Tasks {
+    public class ManagementObjectNotFoundException : System.Exception {
+        public ManagementObjectNotFoundException(string message) : base(message) {}
+    }
+}
+'@
+}
 
 function global:New-PraFakeTenant {
+    Reset-PraFakeGraphTransport
     $global:PraFake = @{
         Tick = 0
         Skus = [ordered]@{
@@ -36,6 +47,8 @@ function global:New-PraFakeTenant {
         Group = @{ Id = '11111111-1111-1111-1111-111111111111'; Name = 'LIC-EXO'; Synced = $false; CloudManaged = $false
             Licences = @(@{ skuId = 'sku-e5'; disabledPlans = @('plan-teams') }); Members = [System.Collections.Generic.List[string]]::new() }
         Users = [ordered]@{}
+        Contacts = [ordered]@{}
+        RoomLists = [ordered]@{}
         Recycle = [ordered]@{}
         Ad = [System.Collections.Generic.List[hashtable]]::new()
         Inactive = [System.Collections.Generic.List[hashtable]]::new()
@@ -44,10 +57,25 @@ function global:New-PraFakeTenant {
         CasePolicy = $null
         CaseRules = [System.Collections.Generic.List[string]]::new()
         Scheduler = $true
-        Faults = @{ LicenceAssign400 = 0; NeverMailbox = @(); NoHoldStamp = $false; DeleteFails = $false; NoRecreate = $false; SendAsFails = $false; CaseHoldDeployError = $false; CaseHoldFails = $false; StopAfter = $null; BatchThrottle = 0; ExoFilterFails = $false }
+        Faults = @{ LicenceAssign400 = 0; NeverMailbox = @(); NoHoldStamp = $false; DeleteFails = $false; DeleteRejectedStatus = 0; DeleteAmbiguousStatus = 0; NoRecreate = $false; SendAsFails = $false; CaseHoldDeployError = $false; CaseHoldFails = $false; StopAfter = $null; BatchThrottle = 0; ExoFilterFails = $false
+            NewMailboxFails = $false; CrashAfterNewMailbox = $false; CrashAfterDelete = $false; CrashAfterContact = $false; NoEnterprise = $false
+            RecipientReadFails = $false; RecipientQueryFailsAt = 0; RecipientIdentityError = $null; RecipientIdentityEmpty = $false; RejectUnfilteredRecipientInventory = $false; GraphReadFails = $false
+            RejectUnfilteredGraphInventory = $false; GraphQueryFailsAt = 0; GraphQueryUnsupported = $false; GraphAdvancedStatus = 0; GraphAdvancedFailsAt = 0; SignInDisableFails = $false; ContactFails = $false; ContactSoftDeletedAliasBlocks = $false; ContactSoftDeletedProxyBlocks = $false; NoInactive = $false; WrongInactiveHold = $false; WorkDaysAliasRead = $false; WorkTimeZoneObjectRead = $false
+            DirectoryWriteFails = $false; DirectoryReadMismatch = $false; DirectoryNotesReadMismatch = $false; DirectoryNotesReadMissing = $false
+            RoomListReadFails = $false; RoomListAddFails = $false; RoomListNoMembership = $false; CrashAfterRoomListAdd = $false
+            CalendarEnableFails = $false; CalendarEnabledReadMismatch = $false; BookingDisableFails = $false; HiddenFinalFails = $false
+            NewRoomListFails = $false; CrashAfterNewRoomList = $false; RoomListConfigFails = $false; CrashAfterRoomListConfig = $false; RoomListConfigMismatch = $false
+            RoomListExchangeOnly = $false; RoomListReadAfterCreateFails = $false; ResourceReadAfterCreateFails = $false; ContactReadAfterCreateFails = $false
+            SignInPropagationReads = 0; SignInReadFault = ''
+            NoLicenseReads = $false; NoSoftDeleted = $false; SoftDeletedAddressBlocks = $false; OrganizationReadFails = $false }
         PageSize = 999; FilterCalls = 0; CaseHoldCalls = 0
         OrgHolds = @()
+        ResourceSchema = @('Room/Video','Equipment/Video')
         Calls = [System.Collections.Generic.List[string]]::new()
+        Reads = [System.Collections.Generic.List[string]]::new()
+        RecipientQueries = [System.Collections.Generic.List[object]]::new()
+        GraphQueries = [System.Collections.Generic.List[object]]::new()
+        UserWrites = [System.Collections.Generic.List[object]]::new()
     }
     $global:PraFake.CasePolicy = @{ Name = 'PRA-HOLD'; Guid = '22222222-2222-2222-2222-222222222222'; CaseId = 'case-pra'; Locations = [System.Collections.Generic.List[string]]::new() }
     $global:PraFake.CasePolicies.Add($global:PraFake.CasePolicy)
@@ -60,11 +88,32 @@ function global:Get-PraFakeHoldTag {
     'UniH' + $policy.Guid
 }
 
+function global:New-PraFakeResourceSettings {
+    $calendar = [ordered]@{ AutomateProcessing = 'AutoAccept'; AllowConflicts = $false; BookingWindowInDays = 180; MaximumDurationInMinutes = 120
+        AllowRecurringMeetings = $true; EnforceSchedulingHorizon = $true; ScheduleOnlyDuringWorkHours = $true; ConflictPercentageAllowed = 0; MaximumConflictInstances = 0
+        ForwardRequestsToDelegates = $true; DeleteAttachments = $true; DeleteComments = $false; RemovePrivateProperty = $true; DeleteSubject = $false
+        AddOrganizerToSubject = $true; DeleteNonCalendarItems = $true; TentativePendingApproval = $true; EnableResponseDetails = $true; OrganizerInfo = $true
+        AllBookInPolicy = $false; AllRequestInPolicy = $false; AllRequestOutOfPolicy = $false; AddAdditionalResponse = $true; AdditionalResponse = 'Contact reception.'
+        ProcessExternalMeetingMessages = $false; RemoveOldMeetingMessages = $true; ResourceDelegates = @('alice@contoso.com'); BookInPolicy = @('bob@contoso.com')
+        RequestInPolicy = @('carol@contoso.com'); RequestOutOfPolicy = @() }
+    return [ordered]@{ SchemaVersion = 2; Capacity = 12; ResourceCustom = @('Video'); Calendar = $calendar
+        Directory = @{ Office = 'Building A / room 101'; StreetAddress = '1 Test Street'; City = 'Paris'; StateOrProvince = ''; PostalCode = '75001'; CountryOrRegion = 'France'; Phone = '+33100000000'; Notes = 'Reception resource' }
+        RoomLists = @()
+        Delivery = @{ RequireSenderAuthenticationEnabled = $true; ModerationEnabled = $false; SendModerationNotifications = 'Never'
+            AcceptMessagesOnlyFromSendersOrMembers = @('bob@contoso.com'); RejectMessagesFromSendersOrMembers = @(); ModeratedBy = @(); BypassModerationFromSendersOrMembers = @() }
+        CalendarConfiguration = @{ WorkingHoursStartTime = '08:00:00'; WorkingHoursEndTime = '18:00:00'; WorkingHoursDays = @('monday','tuesday','wednesday','thursday','friday'); WorkingHoursTimeZone = 'Romance Standard Time' } }
+}
+
 function global:Add-PraFakeUser {
     param([Parameter(Mandatory)][string]$Upn, [ValidateSet('User','Shared','Room','Equipment')][string]$Kind = 'User', [string]$Id = ([guid]::NewGuid().ToString()),
         [string]$OnPremGuid = ([guid]::NewGuid().ToString()), [string]$ImmutableId = ('imm-' + $Upn), [string]$Component, [string]$UsageLocation = 'FR')
     $user = @{ Id = $Id; Upn = $Upn; Kind = $Kind; ImmutableId = $ImmutableId; OnPremGuid = $OnPremGuid; Synced = $true; CloudManaged = $false
-        UsageLocation = $UsageLocation; Direct = [System.Collections.Generic.List[hashtable]]::new()
+        UsageLocation = $UsageLocation; AccountEnabled = $true; Name = ($Upn -split '@')[0]; Alias = ($Upn -split '@')[0]; Mail = $Upn; Addresses = @("SMTP:$Upn"); Marker = ''; ResourceCapacity = 0
+        ResourceCustom = @(); Hidden = $false; Calendar = @{}; WorkHours = @{}
+        Directory = @{ Office = ''; StreetAddress = ''; City = ''; StateOrProvince = ''; PostalCode = ''; CountryOrRegion = ''; Phone = ''; Notes = '' }
+        Delivery = @{ RequireSenderAuthenticationEnabled = $false; ModerationEnabled = $false; SendModerationNotifications = 'Never'
+            AcceptMessagesOnlyFromSendersOrMembers = @(); RejectMessagesFromSendersOrMembers = @(); ModeratedBy = @(); BypassModerationFromSendersOrMembers = @() }
+        Direct = [System.Collections.Generic.List[hashtable]]::new()
         Type = 'MailUser'; ExchangeGuid = $OnPremGuid; DirSynced = $true; Holds = [System.Collections.Generic.List[string]]::new(); Tag = ''
         Component = $(if ($Component) { $Component } else { $null }); PendingShared = $false
         FullAccess = [System.Collections.Generic.List[string]]::new(); AutoMap = @{}; SendAs = [System.Collections.Generic.List[string]]::new()
@@ -86,7 +135,7 @@ function global:Resolve-PraFakeUser {
     param([string]$Identity)
     if (-not $Identity) { return $null }
     if ($global:PraFake.Users.Contains($Identity)) { return $global:PraFake.Users[$Identity] }
-    foreach ($user in $global:PraFake.Users.Values) { if ($user.Upn -eq $Identity) { return $user } }
+    foreach ($user in $global:PraFake.Users.Values) { if ($user.Upn -eq $Identity -or $user.Name -eq $Identity -or $user.Alias -eq $Identity -or $user.ExchangeGuid -eq $Identity -or @($user.Addresses) -contains $Identity -or @($user.Addresses) -contains "smtp:$Identity") { return $user } }
     return $null
 }
 
@@ -138,8 +187,8 @@ function global:Step-PraFake {
     }
     foreach ($user in @($fake.Recycle.Values)) {
         $known = @($fake.Inactive | Where-Object { $_.ExchangeGuid -eq $user.ExchangeGuid }).Count
-        if (-not $known -and $user.Type -match 'Mailbox$' -and $user.Holds.Count) {
-            $fake.Inactive.Add(@{ ExchangeGuid = $user.ExchangeGuid; Upn = $user.Upn; Holds = @($user.Holds); Tag = $user.Tag })
+        if (-not $known -and -not $fake.Faults.NoInactive -and $user.Type -match 'Mailbox$' -and $user.Holds.Count) {
+            $fake.Inactive.Add(@{ ExchangeGuid = $user.ExchangeGuid; Upn = $user.Upn; Holds = $(if ($fake.Faults.WrongInactiveHold) { @('UniHunrelated') } else { @($user.Holds) }); Tag = $user.Tag })
             Write-PraFakeCall "Inactive $($user.Upn) $($user.ExchangeGuid)"
         }
     }
@@ -161,6 +210,7 @@ function global:Invoke-PraFakeEntraConnect {
             }
             if ($fake.Faults.NoRecreate) { return 'fake Delta (objects not recreated)' }
             foreach ($ad in @($fake.Ad)) {
+                if ([bool](Get-PraValue $ad 'SyncExcluded' $false)) { continue }
                 if (@($fake.Users.Values | Where-Object { $_.ImmutableId -eq $ad.ImmutableId }).Count) { continue }
                 $deleted = @($fake.Recycle.Values | Where-Object { $_.ImmutableId -eq $ad.ImmutableId }) | Select-Object -First 1
                 if ($deleted) {
@@ -216,21 +266,147 @@ function global:ConvertTo-PraFakeGraphUser {
             $states += [pscustomobject]@{ skuId = $licence.skuId; assignedByGroup = $group.Id; disabledPlans = @($licence.disabledPlans); state = 'Active'; error = 'None' }
         }
     }
-    $plans = @(Get-PraFakeMailboxPlan $User | ForEach-Object { [pscustomobject]@{ service = 'exchange'; servicePlanId = $_; capabilityStatus = 'Enabled' } })
+    $plans = @(Get-PraFakeMailboxPlan $User | ForEach-Object { [pscustomobject]@{ service = 'exchange'; servicePlanId = $_; capabilityStatus = $(if ($global:PraFake.Faults.NoEnterprise -and $_ -eq 'plan-exo') { 'Suspended' } else { 'Enabled' }) } })
     if ($User.Direct.Count -or $group.Members.Contains($User.Id)) { $plans += [pscustomobject]@{ service = 'exchange'; servicePlanId = 'plan-foundation-other'; capabilityStatus = 'Enabled' } }
-    return [pscustomobject]@{ id = $User.Id; userPrincipalName = $User.Upn; accountEnabled = $true
+    return [pscustomobject]@{ id = $User.Id; userPrincipalName = $User.Upn; accountEnabled = $User.AccountEnabled; mail = (Get-PraValue $User 'Mail' $User.Upn); mailNickname = $User.Alias; proxyAddresses = @($User.Addresses)
         onPremisesSyncEnabled = $(if ($User.Synced -and -not $User.CloudManaged) { $true } else { $null }); onPremisesImmutableId = $User.ImmutableId
         usageLocation = $(if ($User.UsageLocation) { $User.UsageLocation } else { $null }); assignedLicenses = $licences; licenseAssignmentStates = $states
         assignedPlans = $plans; serviceProvisioningErrors = @() }
 }
 
+function global:ConvertFrom-PraFakeGraphFilter {
+    param([string]$Filter)
+    $state = @{ Position = 0; Tokens = [System.Collections.Generic.List[object]]::new() }
+    $pattern = "\G\s*(?:(?<Proxy>proxyAddresses/any\(p:p\s+eq\s+'(?<ProxyValue>(?:[^']|'')*)'\))|(?<Property>userPrincipalName|mailNickname|mail|onPremisesImmutableId)\s+eq\s+'(?<Value>(?:[^']|'')*)'|(?<Operator>and\b|or\b|\(|\)))"
+    while ($state.Position -lt $Filter.Length) {
+        $match = [regex]::Match($Filter.Substring($state.Position), $pattern)
+        if (-not $match.Success) { throw "Fake Graph: unsupported exact filter $Filter" }
+        if ($match.Groups['Operator'].Success) { $state.Tokens.Add([pscustomobject]@{ Kind = $match.Groups['Operator'].Value }) }
+        else {
+            $proxy = $match.Groups['Proxy'].Success
+            $state.Tokens.Add([pscustomobject]@{ Kind = 'Atom'; Property = $(if ($proxy) { 'proxyAddresses' } else { $match.Groups['Property'].Value })
+                Value = $(if ($proxy) { $match.Groups['ProxyValue'].Value } else { $match.Groups['Value'].Value }).Replace("''", "'") })
+        }
+        $state.Position += $match.Length
+        if ([string]::IsNullOrWhiteSpace($Filter.Substring($state.Position))) { break }
+    }
+    $state.Position = 0
+    $primary = {
+        if ($state.Position -ge $state.Tokens.Count) { throw 'Fake Graph: incomplete filter expression.' }
+        $token = $state.Tokens[$state.Position]; $state.Position++
+        if ($token.Kind -eq 'Atom') { return $token }
+        if ($token.Kind -ne '(') { throw 'Fake Graph: expected equality predicate.' }
+        $node = & $readOr
+        if ($state.Position -ge $state.Tokens.Count -or $state.Tokens[$state.Position].Kind -ne ')') { throw 'Fake Graph: unclosed filter group.' }
+        $state.Position++
+        return $node
+    }
+    $readAnd = {
+        $node = & $primary
+        while ($state.Position -lt $state.Tokens.Count -and $state.Tokens[$state.Position].Kind -eq 'and') {
+            $state.Position++
+            $node = [pscustomobject]@{ Kind = 'and'; Left = $node; Right = (& $primary) }
+        }
+        return $node
+    }
+    $readOr = {
+        $node = & $readAnd
+        while ($state.Position -lt $state.Tokens.Count -and $state.Tokens[$state.Position].Kind -eq 'or') {
+            $state.Position++
+            $node = [pscustomobject]@{ Kind = 'or'; Left = $node; Right = (& $readAnd) }
+        }
+        return $node
+    }
+    $expression = & $readOr
+    if ($state.Position -ne $state.Tokens.Count) { throw 'Fake Graph: trailing filter expression.' }
+    return $expression
+}
+
+function global:Test-PraFakeGraphFilter {
+    param([object]$Expression, [hashtable]$User)
+    switch ($Expression.Kind) {
+        and { return ((Test-PraFakeGraphFilter $Expression.Left $User) -and (Test-PraFakeGraphFilter $Expression.Right $User)) }
+        or { return ((Test-PraFakeGraphFilter $Expression.Left $User) -or (Test-PraFakeGraphFilter $Expression.Right $User)) }
+        Atom {
+            switch ($Expression.Property) {
+                userPrincipalName { return ($User.Upn -ieq $Expression.Value) }
+                mail { return ((Get-PraValue $User 'Mail' $User.Upn) -ieq $Expression.Value) }
+                mailNickname { return ($User.Alias -ieq $Expression.Value) }
+                onPremisesImmutableId { return ($User.ImmutableId -ceq $Expression.Value) }
+                proxyAddresses {
+                    # Conservatively model protocol casing as significant; addresses themselves are case-insensitive.
+                    foreach ($proxy in @($User.Addresses)) {
+                        $prefix, $address = $proxy -split ':', 2
+                        $wantedPrefix, $wantedAddress = $Expression.Value -split ':', 2
+                        if ($prefix -ceq $wantedPrefix -and $address -ieq $wantedAddress) { return $true }
+                    }
+                    return $false
+                }
+            }
+        }
+    }
+    throw 'Fake Graph: unknown filter expression.'
+}
+
+function global:Get-PraFakeGraphPage {
+    param([string]$Path, [string]$Query, [System.Collections.IDictionary]$Headers)
+    $fake = $global:PraFake
+    $parameters = @{}
+    foreach ($pair in @($Query -split '&' | Where-Object { $_ })) {
+        $name, $value = $pair -split '=', 2
+        $name = [uri]::UnescapeDataString($name)
+        if ($parameters.ContainsKey($name)) { throw 'Fake Graph: duplicate query parameter.' }
+        $parameters[$name] = [uri]::UnescapeDataString([string]$value)
+    }
+    $filter = [string]$parameters['$filter']
+    $requestHeaders = @{}
+    if ($Headers) { foreach ($name in $Headers.Keys) { $requestHeaders[$name] = $Headers[$name] } }
+    $fake.GraphQueries.Add([pscustomobject]@{ Path = $Path; Filter = $filter; Query = $Query; Headers = $requestHeaders })
+    if ($fake.Faults.GraphQueryFailsAt -eq $fake.GraphQueries.Count) { Stop-PraFakeGraph 403 'Authorization_RequestDenied' 'Graph query access denied.' }
+    if ($Path -eq 'users' -and -not $filter -and $fake.Faults.RejectUnfilteredGraphInventory) { throw 'Unfiltered active Graph inventory is forbidden in this regression.' }
+    if ($filter -and $fake.Faults.GraphQueryUnsupported) { Stop-PraFakeGraph 400 'Request_UnsupportedQuery' 'Unsupported equality property filter.' }
+    $nonSmtp = @([regex]::Matches($filter, "proxyAddresses/any\(p:p\s+eq\s+'(?<Value>(?:[^']|'')*)'\)") |
+        Where-Object { $_.Groups['Value'].Value -inotmatch '^smtp:' }).Count -gt 0
+    $advanced = $parameters['$count'] -ceq 'true' -and $requestHeaders['ConsistencyLevel'] -ceq 'eventual'
+    if (($nonSmtp -or $parameters.ContainsKey('$count') -or $requestHeaders.ContainsKey('ConsistencyLevel')) -and -not $advanced) {
+        Stop-PraFakeGraph 400 'Request_UnsupportedQuery' 'Non-SMTP proxy equality requires $count=true and ConsistencyLevel: eventual.'
+    }
+    if ($advanced -and $fake.Faults.GraphAdvancedStatus -and
+        ($fake.Faults.GraphAdvancedFailsAt -eq 0 -or $fake.Faults.GraphAdvancedFailsAt -le $fake.GraphQueries.Count)) {
+        $status = [int]$fake.Faults.GraphAdvancedStatus
+        $code = switch ($status) { 400 { 'Request_UnsupportedQuery' }; 403 { 'Authorization_RequestDenied' }; 429 { 'TooManyRequests' }; default { 'ServiceUnavailable' } }
+        Stop-PraFakeGraph $status $code 'Advanced Graph query failed.'
+    }
+    $all = @(if ($Path -eq 'users') { $fake.Users.Values } else { $fake.Recycle.Values })
+    if ($filter) {
+        $expression = ConvertFrom-PraFakeGraphFilter $filter
+        $all = @($all | Where-Object { Test-PraFakeGraphFilter -Expression $expression -User $_ })
+    }
+    $skip = if ($parameters.ContainsKey('$skiptoken')) { [int]$parameters['$skiptoken'] } else { 0 }
+    $size = $fake.PageSize
+    if ($parameters.ContainsKey('$top')) { $size = [Math]::Min($size, [int]$parameters['$top']) }
+    if ($size -lt 1 -or $skip -lt 0) { throw 'Fake Graph: invalid paging parameters.' }
+    $answer = [ordered]@{ value = @($all | Select-Object -Skip $skip -First $size | ForEach-Object { ConvertTo-PraFakeGraphUser $_ }) }
+    if ($advanced -and $skip -eq 0) { $answer['@odata.count'] = $all.Count }
+    if ($skip + $size -lt $all.Count) {
+        $nextQuery = @($Query -split '&' | Where-Object { $_ -notmatch '^\$skiptoken=' }) -join '&'
+        $answer['@odata.nextLink'] = 'https://graph.microsoft.com/v1.0/' + $Path + '?' + $nextQuery + '&$skiptoken=' + ($skip + $size)
+    }
+    return [pscustomobject]$answer
+}
+
 function global:Invoke-MgGraphRequest {
     [CmdletBinding()]
-    param([string]$Method = 'GET', [string]$Uri, [object]$Body, [string]$ContentType, [string]$OutputType)
+    param([string]$Method = 'GET', [string]$Uri, [object]$Body, [string]$ContentType, [string]$OutputType, [System.Collections.IDictionary]$Headers)
     $fake = $global:PraFake
     $relative = $Uri -replace '^https://graph\.microsoft\.com/', '' -replace '^v1\.0/', ''
     $path, $query = $relative -split '\?', 2
     $parts = @($path.Split('/') | ForEach-Object { [uri]::UnescapeDataString($_) })
+    if ($Method -eq 'GET') {
+        $fake.Reads.Add("Graph GET $path")
+        if ($fake.Faults.NoLicenseReads -and $path -match '^(subscribedSkus|organization|groups)') { Stop-PraFakeGraph 403 'Authorization_RequestDenied' 'Licence/organization/group read denied.' }
+    }
+    if ($Method -eq 'GET' -and $fake.Faults.GraphReadFails -and $path -match '^users') { Stop-PraFakeGraph 403 'Authorization_RequestDenied' 'User read denied.' }
     $data = if ($Body) { $Body | ConvertFrom-Json -AsHashtable } else { @{} }
     if ($Method -ne 'GET' -and $path -ne '$batch') { Write-PraFakeCall "Graph $Method $path" }
     switch -Regex ($path) {
@@ -247,8 +423,10 @@ function global:Invoke-MgGraphRequest {
         '^groups/[^/]+$' {
             if ($parts[1] -ne $fake.Group.Id) { Stop-PraFakeGraph 404 'Request_ResourceNotFound' 'Group not found.' }
             $group = $fake.Group
-            return [pscustomobject]@{ id = $group.Id; displayName = $group.Name; securityEnabled = $true; mailEnabled = $false
+            return [pscustomobject]@{ id = $group.Id; displayName = $group.Name; securityEnabled = (Get-PraValue $group 'SecurityEnabled' $true); mailEnabled = (Get-PraValue $group 'MailEnabled' $false); groupTypes = (Get-PraValue $group 'GroupTypes' @())
                 onPremisesSyncEnabled = $(if ($group.Synced -and -not $group.CloudManaged) { $true } else { $null })
+                onPremisesLastSyncDateTime = $(if ($group.Synced) { '2026-10-07T08:00:00Z' } else { $null })
+                onPremisesSecurityIdentifier = $(if ($group.Synced) { 'S-1-5-21-100-200-300-400' } else { $null })
                 assignedLicenses = @($group.Licences | ForEach-Object { [pscustomobject]@{ skuId = $_.skuId; disabledPlans = @($_.disabledPlans) } }) }
         }
         '^groups/[^/]+/onPremisesSyncBehavior$' {
@@ -266,19 +444,7 @@ function global:Invoke-MgGraphRequest {
             return $null
         }
         '^users$' {
-            $filter = [uri]::UnescapeDataString([string]$query)
-            if ($filter -match 'onPremisesImmutableId eq') {
-                $immutable = [regex]::Match($filter, "onPremisesImmutableId eq '([^']*)'").Groups[1].Value
-                return [pscustomobject]@{ value = @($fake.Users.Values | Where-Object { $_.ImmutableId -eq $immutable } | ForEach-Object { ConvertTo-PraFakeGraphUser $_ }) }
-            }
-            # Every user, page by page.
-            $token = [regex]::Match($filter, '\$skiptoken=(\d+)')
-            $skip = if ($token.Success) { [int]$token.Groups[1].Value } else { 0 }
-            $all = @($fake.Users.Values)
-            $page = @($all | Select-Object -Skip $skip -First $fake.PageSize | ForEach-Object { ConvertTo-PraFakeGraphUser $_ })
-            $answer = [ordered]@{ value = $page }
-            if ($skip + $fake.PageSize -lt $all.Count) { $answer['@odata.nextLink'] = 'https://graph.microsoft.com/v1.0/users?$select=id&$skiptoken={0}' -f ($skip + $fake.PageSize) }
-            return [pscustomobject]$answer
+            return Get-PraFakeGraphPage -Path $path -Query ([string]$query) -Headers $Headers
         }
         '^\$batch$' {
             $responses = foreach ($request in @($data.requests)) {
@@ -298,11 +464,42 @@ function global:Invoke-MgGraphRequest {
             $user = Resolve-PraFakeUser $parts[1]
             if (-not $user) { Stop-PraFakeGraph 404 'Request_ResourceNotFound' "Resource '$($parts[1])' does not exist." }
             switch ($Method) {
-                'GET' { return ConvertTo-PraFakeGraphUser $user }
-                'PATCH' { if ($data.ContainsKey('usageLocation')) { $user.UsageLocation = [string]$data.usageLocation }; return $null }
+                'GET' {
+                    $result = ConvertTo-PraFakeGraphUser $user
+                    if (Get-PraValue $user 'SignInVerificationActive' $false) {
+                        $user.SignInPollReads++
+                        if ($user.SignInPendingReads -gt 0) { $result.accountEnabled = $true; $user.SignInPendingReads-- }
+                        switch ($fake.Faults.SignInReadFault) {
+                            MissingAccount { $result.PSObject.Properties.Remove('accountEnabled') }
+                            NullAccount { $result.accountEnabled = $null }
+                            StringAccount { $result.accountEnabled = 'false' }
+                            WrongId { $result.id = [guid]::NewGuid().ToString() }
+                            Sync { $result.onPremisesSyncEnabled = $true }
+                            Anchor { $result.onPremisesImmutableId = 'unexpected-anchor' }
+                            MissingSync { $result.PSObject.Properties.Remove('onPremisesSyncEnabled') }
+                            MissingAnchor { $result.PSObject.Properties.Remove('onPremisesImmutableId') }
+                            NullAnchors { $result.onPremisesSyncEnabled = $null; $result.onPremisesImmutableId = $null }
+                            ReadError { throw 'Sign-in read access denied.' }
+                        }
+                    }
+                    return $result
+                }
+                'PATCH' {
+                    if ($data.ContainsKey('usageLocation')) { $user.UsageLocation = [string]$data.usageLocation }
+                    if ($data.ContainsKey('accountEnabled')) {
+                        $user['SignInVerificationActive'] = $true; $user['SignInPollReads'] = 0
+                        $user['SignInPendingReads'] = $fake.Faults.SignInPropagationReads
+                        if (-not $fake.Faults.SignInDisableFails) { $user.AccountEnabled = [bool]$data.accountEnabled }
+                    }
+                    return $null
+                }
                 'DELETE' {
                     if ($fake.Faults.DeleteFails) { Stop-PraFakeGraph 403 'Authorization_RequestDenied' 'Insufficient privileges to complete the operation.' }
-                    $fake.Users.Remove($user.Id); $fake.Recycle[$user.Id] = $user; return $null
+                    if ($fake.Faults.DeleteRejectedStatus) { Stop-PraFakeGraph $fake.Faults.DeleteRejectedStatus 'RequestRejected' 'Deletion refused.' }
+                    $fake.Users.Remove($user.Id); $user.WhenSoftDeleted = [datetime]::UtcNow; $fake.Recycle[$user.Id] = $user
+                    if ($fake.Faults.DeleteAmbiguousStatus) { Stop-PraFakeGraph $fake.Faults.DeleteAmbiguousStatus 'AmbiguousDelete' 'Deletion response lost.' }
+                    if ($fake.Faults.CrashAfterDelete) { $fake.Faults.CrashAfterDelete = $false; throw 'Interrupted after identity deletion.' }
+                    return $null
                 }
             }
         }
@@ -329,9 +526,10 @@ function global:Invoke-MgGraphRequest {
             return $null
         }
         '^directory/deletedItems/[^/]+$' {
+            if ($parts[2] -eq 'microsoft.graph.user') { return Get-PraFakeGraphPage -Path $path -Query ([string]$query) -Headers $Headers }
             if (-not $fake.Recycle.Contains($parts[2])) { Stop-PraFakeGraph 404 'Request_ResourceNotFound' 'Deleted item not found.' }
             if ($Method -eq 'DELETE') { $fake.Recycle.Remove($parts[2]); return $null }
-            return [pscustomobject]@{ id = $parts[2] }
+            return ConvertTo-PraFakeGraphUser $fake.Recycle[$parts[2]]
         }
     }
     throw "Fake Graph: $Method $path is not implemented."
@@ -358,8 +556,11 @@ function global:Get-PraFakeFiltered {
 
 function global:ConvertTo-PraFakeRecipient {
     param([hashtable]$User)
-    [pscustomobject]@{ RecipientTypeDetails = $User.Type; ExchangeGuid = $User.ExchangeGuid; ExternalDirectoryObjectId = $User.Id; Guid = $User.Id
-        Name = ($User.Upn -split '@')[0]; Identity = $User.Upn; PrimarySmtpAddress = $User.Upn; CustomAttribute1 = $User.Tag }
+    $result = [pscustomobject]@{ RecipientTypeDetails = $User.Type; ExchangeGuid = $User.ExchangeGuid; ExternalDirectoryObjectId = $User.Id; Guid = $User.Id
+        Name = $User.Name; Alias = $User.Alias; EmailAddresses = @($User.Addresses); Identity = $User.Upn; PrimarySmtpAddress = $User.Upn
+        LegacyExchangeDN = $(if ($User.ContainsKey('LegacyExchangeDN')) { $User.LegacyExchangeDN } else { '' }); CustomAttribute1 = $User.Tag; CustomAttribute15 = $User.Marker }
+    if ($User.ContainsKey('WhenSoftDeleted')) { $result | Add-Member -NotePropertyName WhenSoftDeleted -NotePropertyValue $User.WhenSoftDeleted }
+    return $result
 }
 
 function global:Get-PraFakeLocationText {
@@ -370,7 +571,67 @@ function global:Get-PraFakeLocationText {
 }
 
 function global:Get-Recipient {
-    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity)
+    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [string]$Filter, [object]$ResultSize, [switch]$IncludeSoftDeletedRecipients)
+    if ($global:PraFake.Faults.ResourceReadAfterCreateFails -and $Filter -like "Name -eq 'PRA-R-*" -and
+        @($global:PraFake.Users.Values | Where-Object { $_.Name -like 'PRA-R-*' }).Count) { throw 'Resource post-create read refused.' }
+    if ($global:PraFake.Faults.ContactReadAfterCreateFails -and $Filter -like "Name -eq 'PRA-C-*" -and
+        $global:PraFake.Contacts.Count) { throw 'Contact post-create read refused.' }
+    if ($global:PraFake.Faults.RecipientReadFails) { throw 'Exchange recipient inventory access denied.' }
+    if ($Identity -and $IncludeSoftDeletedRecipients) {
+        $global:PraFake.RecipientQueries.Add([pscustomobject]@{ Identity = $Identity; Filter = ''; IncludeSoftDeletedRecipients = $true; ResultSize = $ResultSize; ErrorAction = $ErrorActionPreference })
+        if ($global:PraFake.Faults.RecipientIdentityError) { $PSCmdlet.ThrowTerminatingError($global:PraFake.Faults.RecipientIdentityError) }
+        if ($global:PraFake.Faults.RecipientIdentityEmpty) { return }
+        $all = @($global:PraFake.Users.Values | ForEach-Object { ConvertTo-PraFakeRecipient $_ }) + @($global:PraFake.Contacts.Values | ForEach-Object { [pscustomobject]$_ }) +
+            @($global:PraFake.RoomLists.Values | ForEach-Object { [pscustomobject]$_ }) + @($global:PraFake.Recycle.Values | ForEach-Object {
+                    $recipient = ConvertTo-PraFakeRecipient $_
+                    # Preserve the fake's existing proxy-release timing, but never hide a pure internal LegacyDN.
+                    if (-not $_.Holds.Count -and -not $global:PraFake.Faults.SoftDeletedAddressBlocks) { $recipient.EmailAddresses = @() }
+                    $recipient
+                })
+        $lookupResults = @(foreach ($recipient in $all) {
+                $legacy = $recipient.PSObject.Properties['LegacyExchangeDN']
+                $addresses = $recipient.PSObject.Properties['EmailAddresses']
+                if (($legacy -and [string]$legacy.Value -ieq $Identity) -or ($addresses -and @($addresses.Value) -icontains "x500:$Identity")) { $recipient }
+            })
+        if (-not $lookupResults.Count) {
+            $exception = [Exception]::new("Impossible d'effectuer l'opération, car l'objet est introuvable.")
+            $exception.Data['RemoteException'] = [pscustomobject]@{ TypeName = 'Microsoft.Exchange.Configuration.Tasks.ManagementObjectNotFoundException'
+                Message = $exception.Message; StackTrace = $null; InnerError = $null }
+            $PSCmdlet.ThrowTerminatingError([System.Management.Automation.ErrorRecord]::new(
+                $exception, '[],Write-ErrorMessage', 'NotSpecified', $Identity))
+        }
+        return $lookupResults
+    }
+    if ($Filter -or (-not $Identity -and $ResultSize)) {
+        $global:PraFake.RecipientQueries.Add([pscustomobject]@{ Identity = ''; Filter = $Filter; IncludeSoftDeletedRecipients = [bool]$IncludeSoftDeletedRecipients; ResultSize = $ResultSize; ErrorAction = $ErrorActionPreference })
+        if (-not $Filter -and $global:PraFake.Faults.RejectUnfilteredRecipientInventory) { throw 'Unfiltered recipient inventory is forbidden in this regression.' }
+        if ($global:PraFake.Faults.RecipientQueryFailsAt -eq $global:PraFake.RecipientQueries.Count) { throw 'Exchange recipient filtered query access denied.' }
+        $all = @($global:PraFake.Users.Values | ForEach-Object { ConvertTo-PraFakeRecipient $_ }) + @($global:PraFake.Contacts.Values | ForEach-Object { [pscustomobject]$_ }) +
+            @($global:PraFake.RoomLists.Values | ForEach-Object { [pscustomobject]$_ })
+        if ($IncludeSoftDeletedRecipients) { $all += @($global:PraFake.Recycle.Values | Where-Object { $_.Holds.Count -or $global:PraFake.Faults.SoftDeletedAddressBlocks } | ForEach-Object { ConvertTo-PraFakeRecipient $_ }) }
+        if ($Filter) {
+            $pattern = "(Alias|EmailAddresses|PrimarySmtpAddress|Name) -eq '((?:[^']|'')*)'"
+            $predicates = [regex]::Matches($Filter, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            $remainder = [regex]::Replace($Filter, $pattern, '', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            $remainder = $remainder -replace '(?i)-or', '' -replace '[\s()]', ''
+            if (-not $predicates.Count -or $remainder) { throw "Fake Get-Recipient: unsupported OPATH filter $Filter" }
+            return @(foreach ($recipient in $all) {
+                    foreach ($predicate in $predicates) {
+                        $field = $predicate.Groups[1].Value
+                        $value = $predicate.Groups[2].Value.Replace("''", "'")
+                        $property = $recipient.PSObject.Properties[$field]
+                        if ($property -and @($property.Value | ForEach-Object { [string]$_ }) -contains $value) { $recipient; break }
+                    }
+                })
+        }
+        return $all
+    }
+    foreach ($contact in $global:PraFake.Contacts.Values) {
+        if ($contact.Guid -eq $Identity -or $contact.Identity -eq $Identity -or $contact.PrimarySmtpAddress -eq $Identity -or $contact.EmailAddresses -contains "smtp:$Identity") { return [pscustomobject]$contact }
+    }
+    foreach ($group in $global:PraFake.RoomLists.Values) {
+        if ($group.Guid -eq $Identity -or $group.PrimarySmtpAddress -eq $Identity) { return [pscustomobject]$group }
+    }
     $user = Get-PraFakeUserOrError $Identity
     if (-not $user) { return }
     ConvertTo-PraFakeRecipient $user
@@ -386,9 +647,104 @@ function global:Get-User {
     [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [string]$Filter, [object]$ResultSize)
     $users = if ($Filter) { @(Get-PraFakeFiltered $Filter) } else { @(Get-PraFakeUserOrError $Identity) }
     foreach ($user in @($users | Where-Object { $_ })) {
-        [pscustomobject]@{ IsDirSynced = $user.DirSynced; ExternalDirectoryObjectId = $user.Id; UserPrincipalName = $user.Upn
-            RecipientTypeDetails = $(if ($user.Type -match 'Mailbox$') { $user.Type } else { 'User' }) }
+        $result = $user.Directory.Clone()
+        $result.IsDirSynced = $user.DirSynced; $result.ExternalDirectoryObjectId = $user.Id; $result.UserPrincipalName = $user.Upn
+        $result.RecipientTypeDetails = if ($user.Type -match 'Mailbox$') { $user.Type } else { 'User' }
+        if ($global:PraFake.Faults.DirectoryReadMismatch) { $result.City = 'Wrong city' }
+        if ($global:PraFake.Faults.DirectoryNotesReadMismatch) { $result.Notes = 'Wrong notes' }
+        if ($global:PraFake.Faults.DirectoryNotesReadMissing) { $result.Remove('Notes') }
+        [pscustomobject]$result
     }
+}
+
+function global:Set-User {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param([string]$Identity, [string]$Office, [string]$StreetAddress, [string]$City, [string]$StateOrProvince,
+        [string]$PostalCode, [string]$CountryOrRegion, [string]$Phone, [string]$Notes, [switch]$Force)
+    $user = Get-PraFakeUserOrError $Identity
+    Write-PraFakeCall "Set-User $($user.Upn)"
+    $parameters = @{}
+    foreach ($entry in $PSBoundParameters.GetEnumerator()) { $parameters[$entry.Key] = $entry.Value }
+    $global:PraFake.UserWrites.Add($parameters)
+    $fields = @('Office','StreetAddress','City','StateOrProvince','PostalCode','CountryOrRegion','Phone','Notes')
+    # Model the observed noninteractive failure of Set-User's built-in pause without prompting the test host.
+    if (@($fields | Where-Object { $PSBoundParameters.ContainsKey($_) }).Count -and -not $Force -and
+        (-not $PSBoundParameters.ContainsKey('Confirm') -or [bool]$PSBoundParameters['Confirm'])) {
+        throw 'A server side error has occurred because of which the operation could not be completed.'
+    }
+    if ($global:PraFake.Faults.DirectoryWriteFails) { throw 'Resource directory update refused.' }
+    foreach ($field in $fields) {
+        if ($PSBoundParameters.ContainsKey($field)) { $user.Directory[$field] = [string]$PSBoundParameters[$field] }
+    }
+}
+
+function global:Get-DistributionGroup {
+    [CmdletBinding()] param([string]$Identity, [string]$Filter, [object]$ResultSize)
+    if ($global:PraFake.Faults.RoomListReadAfterCreateFails -and $global:PraFake.RoomLists.Count) { throw 'Room-list post-create read refused.' }
+    $groups = @($global:PraFake.RoomLists.Values)
+    if ($Identity) {
+        $groups = @($groups | Where-Object { $_.Guid -eq $Identity -or $_.PrimarySmtpAddress -eq $Identity })
+        if (-not $groups.Count) { throw "Room list $Identity not found." }
+    }
+    if ($Filter -match "^(Name|PrimarySmtpAddress) -eq '([^']+)'$") {
+        $property = $Matches[1]; $value = $Matches[2]
+        $groups = @($groups | Where-Object { $_[$property] -eq $value })
+    }
+    foreach ($group in $groups) {
+        $result = $group.Clone()
+        if ($global:PraFake.Faults.RoomListConfigMismatch) { $result.MemberJoinRestriction = 'Open' }
+        [pscustomobject]$result
+    }
+}
+
+function global:New-DistributionGroup {
+    [CmdletBinding()] param([string]$Name, [string]$Alias, [string]$DisplayName, [string]$PrimarySmtpAddress, [switch]$RoomList,
+        [switch]$IgnoreNamingPolicy, [string]$MemberJoinRestriction, [string]$MemberDepartRestriction, [bool]$RequireSenderAuthenticationEnabled)
+    if ($global:PraFake.Faults.NewRoomListFails) { throw 'New-DistributionGroup refused.' }
+    if (@($global:PraFake.RoomLists.Values | Where-Object { $_.Alias -eq $Alias -or $_.PrimarySmtpAddress -eq $PrimarySmtpAddress -or $_.Name -eq $Name }).Count) { throw 'Room-list identity already assigned.' }
+    $guid = [guid]::NewGuid().ToString()
+    $group = @{ Guid = $guid; ExternalDirectoryObjectId = $guid; Name = $Name; Alias = $Alias; DisplayName = $DisplayName; PrimarySmtpAddress = $PrimarySmtpAddress
+        EmailAddresses = @("SMTP:$PrimarySmtpAddress"); Identity = $PrimarySmtpAddress; IsDirSynced = $false; RecipientTypeDetails = 'RoomList'; HiddenFromAddressListsEnabled = $false
+        CustomAttribute15 = ''; MemberJoinRestriction = $MemberJoinRestriction; MemberDepartRestriction = $MemberDepartRestriction
+        RequireSenderAuthenticationEnabled = $RequireSenderAuthenticationEnabled; ModerationEnabled = $false; SendModerationNotifications = 'Never'
+        AcceptMessagesOnlyFromSendersOrMembers = @(); RejectMessagesFromSendersOrMembers = @(); ModeratedBy = @(); BypassModerationFromSendersOrMembers = @()
+        Members = [System.Collections.Generic.List[string]]::new() }
+    if ($global:PraFake.Faults.RoomListExchangeOnly) { $group.ExternalDirectoryObjectId = '' }
+    $global:PraFake.RoomLists[$guid] = $group
+    Write-PraFakeCall "New-RoomList $PrimarySmtpAddress Name=$Name"
+    if ($global:PraFake.Faults.CrashAfterNewRoomList) { $global:PraFake.Faults.CrashAfterNewRoomList = $false; throw 'Interrupted after room-list creation.' }
+    [pscustomobject]$group
+}
+
+function global:Set-DistributionGroup {
+    [CmdletBinding()] param([string]$Identity, [string[]]$EmailAddresses, [bool]$HiddenFromAddressListsEnabled, [string]$CustomAttribute15,
+        [switch]$BypassSecurityGroupManagerCheck, [string]$MemberJoinRestriction, [string]$MemberDepartRestriction,
+        [bool]$RequireSenderAuthenticationEnabled, [bool]$ModerationEnabled, [string]$SendModerationNotifications,
+        [string[]]$AcceptMessagesOnlyFromSendersOrMembers, [string[]]$RejectMessagesFromSendersOrMembers, [string[]]$ModeratedBy, [string[]]$BypassModerationFromSendersOrMembers)
+    if ($global:PraFake.Faults.RoomListConfigFails) { throw 'Room-list configuration refused.' }
+    $read = Get-DistributionGroup -Identity $Identity
+    $group = $global:PraFake.RoomLists[$read.Guid]
+    foreach ($key in $PSBoundParameters.Keys) {
+        if ($key -notin @('Identity','BypassSecurityGroupManagerCheck','ErrorAction')) { $group[$key] = $PSBoundParameters[$key] }
+    }
+    Write-PraFakeCall "Set-RoomList $($group.PrimarySmtpAddress)"
+    if ($global:PraFake.Faults.CrashAfterRoomListConfig) { $global:PraFake.Faults.CrashAfterRoomListConfig = $false; throw 'Interrupted after room-list configuration.' }
+}
+
+function global:Get-DistributionGroupMember {
+    [CmdletBinding()] param([string]$Identity, [object]$ResultSize)
+    if ($global:PraFake.Faults.RoomListReadFails) { throw 'Room list membership read refused.' }
+    $group = Get-DistributionGroup -Identity $Identity
+    foreach ($id in $group.Members) { ConvertTo-PraFakeRecipient (Get-PraFakeUserOrError $id) }
+}
+
+function global:Add-DistributionGroupMember {
+    [CmdletBinding()] param([string]$Identity, [string]$Member, [switch]$BypassSecurityGroupManagerCheck)
+    if ($global:PraFake.Faults.RoomListAddFails) { throw 'Room list membership update refused.' }
+    $group = Get-DistributionGroup -Identity $Identity
+    if (-not $global:PraFake.Faults.RoomListNoMembership -and -not $group.Members.Contains($Member)) { $group.Members.Add($Member) }
+    Write-PraFakeCall "RoomList Add $($group.PrimarySmtpAddress) $Member"
+    if ($global:PraFake.Faults.CrashAfterRoomListAdd) { $global:PraFake.Faults.CrashAfterRoomListAdd = $false; throw 'Interrupted after room-list membership update.' }
 }
 
 function global:Get-MailUser {
@@ -415,17 +771,34 @@ function global:Get-EXOMailbox {
 }
 
 function global:Get-Mailbox {
-    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [switch]$InactiveMailboxOnly, [object]$ResultSize)
+    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [switch]$InactiveMailboxOnly, [switch]$SoftDeletedMailbox, [object]$ResultSize)
+    if ($SoftDeletedMailbox) {
+        $global:PraFake.Reads.Add('Get-Mailbox SoftDeletedMailbox')
+        if ($global:PraFake.Faults.NoSoftDeleted) { return }
+        foreach ($one in @($global:PraFake.Recycle.Values | Where-Object { $_.Type -match 'Mailbox$' -and (-not $Identity -or $_.ExchangeGuid -eq $Identity) })) {
+            [pscustomobject]@{ ExchangeGuid = $one.ExchangeGuid; ExternalDirectoryObjectId = $one.Id; IsInactiveMailbox = [bool]$one.Holds.Count; InPlaceHolds = @($one.Holds)
+                LitigationHoldEnabled = $false; RetentionHoldEnabled = $false; DelayHoldApplied = $false; DelayReleaseHoldApplied = $false; ComplianceTagHoldApplied = $false }
+        }
+        return
+    }
     if ($InactiveMailboxOnly) {
-        $inactive = @($global:PraFake.Inactive | Where-Object { $_.ExchangeGuid -eq $Identity -or $_.Upn -eq $Identity })
-        if (-not $inactive.Count) { Write-Error "The operation couldn't be performed because object '$Identity' couldn't be found."; return }
-        return [pscustomobject]@{ ExchangeGuid = $inactive[0].ExchangeGuid; InPlaceHolds = @($inactive[0].Holds); CustomAttribute1 = $inactive[0].Tag; PrimarySmtpAddress = $inactive[0].Upn }
+        $global:PraFake.Reads.Add('Get-Mailbox InactiveMailboxOnly')
+        $inactive = @($global:PraFake.Inactive | Where-Object { -not $Identity -or $_.ExchangeGuid -eq $Identity -or $_.Upn -eq $Identity })
+        if (-not $inactive.Count) { if ($Identity) { Write-Error "The operation couldn't be performed because object '$Identity' couldn't be found." }; return }
+        foreach ($one in $inactive) { [pscustomobject]@{ ExchangeGuid = $one.ExchangeGuid; InPlaceHolds = @($one.Holds); CustomAttribute1 = $one.Tag; PrimarySmtpAddress = $one.Upn } }
+        return
     }
     $user = Get-PraFakeUserOrError $Identity
     if (-not $user) { return }
     if ($user.Type -notmatch 'Mailbox$') { Write-Error "$Identity isn't a mailbox."; return }
-    [pscustomobject]@{ ExchangeGuid = $user.ExchangeGuid; InPlaceHolds = @($user.Holds); LitigationHoldEnabled = $false; GrantSendOnBehalfTo = @($user.SendOnBehalf)
-        CustomAttribute1 = $user.Tag; DelayHoldApplied = $false; DelayReleaseHoldApplied = $false }
+    $result = @{ ExchangeGuid = $user.ExchangeGuid; ExternalDirectoryObjectId = $user.Id; InPlaceHolds = @($user.Holds); LitigationHoldEnabled = $false; GrantSendOnBehalfTo = @($user.SendOnBehalf)
+        CustomAttribute1 = $user.Tag; CustomAttribute15 = $user.Marker; CustomAttribute14 = (Get-PraValue $user 'Marker14' ''); DelayHoldApplied = $false; DelayReleaseHoldApplied = $false
+        PrimarySmtpAddress = $user.Upn; EmailAddresses = @($user.Addresses); ResourceCapacity = $user.ResourceCapacity; ResourceCustom = @($user.ResourceCustom); HiddenFromAddressListsEnabled = $user.Hidden }
+    foreach ($field in @('LitigationHoldEnabled','RetentionHoldEnabled','DelayHoldApplied','DelayReleaseHoldApplied','ComplianceTagHoldApplied')) {
+        $result[$field] = Get-PraValue $user $field $false
+    }
+    foreach ($field in $user.Delivery.Keys) { $result[$field] = $user.Delivery[$field] }
+    [pscustomobject]$result
 }
 
 function global:Get-MailboxLocation {
@@ -446,18 +819,125 @@ function global:Set-MailUser {
 }
 
 function global:Set-Mailbox {
-    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [string]$Type, [string]$CustomAttribute1, [object]$GrantSendOnBehalfTo)
+    [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [string]$Type, [string]$CustomAttribute1, [string]$CustomAttribute2, [string]$CustomAttribute3,
+        [string]$CustomAttribute4, [string]$CustomAttribute5, [string]$CustomAttribute6, [string]$CustomAttribute7, [string]$CustomAttribute8,
+        [string]$CustomAttribute9, [string]$CustomAttribute10, [string]$CustomAttribute11, [string]$CustomAttribute12, [string]$CustomAttribute13, [string]$CustomAttribute14, [string]$CustomAttribute15,
+        [string[]]$EmailAddresses, [int]$ResourceCapacity, [string[]]$ResourceCustom, [bool]$HiddenFromAddressListsEnabled, [object]$GrantSendOnBehalfTo,
+        [bool]$RequireSenderAuthenticationEnabled, [bool]$ModerationEnabled, [string]$SendModerationNotifications, [string[]]$AcceptMessagesOnlyFromSendersOrMembers,
+        [string[]]$RejectMessagesFromSendersOrMembers, [string[]]$ModeratedBy, [string[]]$BypassModerationFromSendersOrMembers)
     $user = Get-PraFakeUserOrError $Identity
     if (-not $user) { return }
     if ($user.Type -notmatch 'Mailbox$') { Write-Error "$Identity isn't a mailbox."; return }
     if ($Type -eq 'Shared' -and $user.Type -ne 'SharedMailbox') { $user.PendingShared = $true; Write-PraFakeCall "Set-Mailbox $($user.Upn) Type=Shared" }
     if ($PSBoundParameters.ContainsKey('CustomAttribute1')) { $user.Tag = $CustomAttribute1; Write-PraFakeCall "Set-Mailbox $($user.Upn) CustomAttribute1=$CustomAttribute1" }
+    if ($PSBoundParameters.ContainsKey('CustomAttribute15')) { $user.Marker = $CustomAttribute15 }
+    if ($PSBoundParameters.ContainsKey('CustomAttribute14')) { $user['Marker14'] = $CustomAttribute14 }
+    if ($PSBoundParameters.ContainsKey('EmailAddresses')) { $user.Addresses = @($EmailAddresses); $user.Upn = (@($EmailAddresses | Where-Object { $_ -cmatch '^SMTP:' })[0]).Substring(5) }
+    if ($PSBoundParameters.ContainsKey('ResourceCapacity')) { $user.ResourceCapacity = $ResourceCapacity }
+    if ($PSBoundParameters.ContainsKey('ResourceCustom')) { $user.ResourceCustom = @($ResourceCustom) }
+    if ($PSBoundParameters.ContainsKey('HiddenFromAddressListsEnabled')) { $user.Hidden = $HiddenFromAddressListsEnabled }
+    if ($PSBoundParameters.ContainsKey('HiddenFromAddressListsEnabled') -and -not $HiddenFromAddressListsEnabled -and $global:PraFake.Faults.HiddenFinalFails) { throw 'Final visibility write interrupted.' }
+    foreach ($field in @($user.Delivery.Keys)) {
+        if ($PSBoundParameters.ContainsKey($field)) { $user.Delivery[$field] = $PSBoundParameters[$field] }
+    }
     if ($GrantSendOnBehalfTo -is [hashtable] -and $GrantSendOnBehalfTo.ContainsKey('Add')) {
         $delegate = Resolve-PraFakeUser ([string]$GrantSendOnBehalfTo.Add)
         if (-not $delegate) { Write-Error "Delegate $($GrantSendOnBehalfTo.Add) not found."; return }
         if (-not $user.SendOnBehalf.Contains($delegate.Id)) { $user.SendOnBehalf.Add($delegate.Id) }
         Write-PraFakeCall "SendOnBehalf $($user.Upn) $($delegate.Upn)"
     }
+}
+
+function global:New-Mailbox {
+    [CmdletBinding()] param([string]$Name, [string]$Alias, [string]$DisplayName, [string]$PrimarySmtpAddress, [switch]$Room, [switch]$Equipment)
+    if ($global:PraFake.Faults.NewMailboxFails) { throw 'New-Mailbox refused.' }
+    if (Resolve-PraFakeUser $PrimarySmtpAddress) { throw 'Address already assigned.' }
+    $kind = if ($Room) { 'Room' } else { 'Equipment' }
+    $user = Add-PraFakeUser -Upn $PrimarySmtpAddress -Kind $kind -UsageLocation ''
+    $global:PraFake.Ad.RemoveAt($global:PraFake.Ad.Count - 1)
+    $user.Synced = $false; $user.DirSynced = $false; $user.ImmutableId = ''; $user.ExchangeGuid = [guid]::NewGuid().ToString()
+    $user.Type = "${kind}Mailbox"; $user.Name = $Name; $user.Alias = $Alias; $user.AccountEnabled = [bool]$global:PraFake.Faults.SignInDisableFails
+    $user.Calendar = @{ AutomateProcessing = 'AutoAccept'; AllBookInPolicy = $true; AllRequestInPolicy = $false; AllRequestOutOfPolicy = $false
+        ForwardRequestsToDelegates = $true; ProcessExternalMeetingMessages = $false
+        ResourceDelegates = @(); BookInPolicy = @(); RequestInPolicy = @(); RequestOutOfPolicy = @() }
+    if ($global:PraFake.Faults.SignInPropagationReads -gt 0) { $user.AccountEnabled = $true }
+    Write-PraFakeCall "New-Mailbox $PrimarySmtpAddress $kind Name=$Name"
+    if ($global:PraFake.Faults.CrashAfterNewMailbox) { $global:PraFake.Faults.CrashAfterNewMailbox = $false; throw 'Interrupted after mailbox creation.' }
+    ConvertTo-PraFakeRecipient $user
+}
+
+function global:Set-CalendarProcessing {
+    [CmdletBinding()] param([string]$Identity, [string]$AutomateProcessing, [bool]$AllowConflicts, [int]$BookingWindowInDays, [int]$MaximumDurationInMinutes,
+        [bool]$AllowRecurringMeetings, [bool]$EnforceSchedulingHorizon, [bool]$ScheduleOnlyDuringWorkHours, [int]$ConflictPercentageAllowed, [int]$MaximumConflictInstances,
+        [bool]$ForwardRequestsToDelegates, [bool]$DeleteAttachments, [bool]$DeleteComments, [bool]$RemovePrivateProperty, [bool]$DeleteSubject, [bool]$AddOrganizerToSubject,
+        [bool]$DeleteNonCalendarItems, [bool]$TentativePendingApproval, [bool]$EnableResponseDetails, [bool]$OrganizerInfo, [bool]$AllBookInPolicy, [bool]$AllRequestInPolicy,
+        [bool]$AllRequestOutOfPolicy, [bool]$AddAdditionalResponse, [string]$AdditionalResponse, [bool]$ProcessExternalMeetingMessages, [bool]$RemoveOldMeetingMessages,
+        [string[]]$ResourceDelegates, [string[]]$BookInPolicy, [string[]]$RequestInPolicy, [string[]]$RequestOutOfPolicy)
+    $user = Get-PraFakeUserOrError $Identity
+    if ($AutomateProcessing -eq 'None' -and $global:PraFake.Faults.BookingDisableFails) { throw 'Booking disable refused.' }
+    if ($AutomateProcessing -ne 'None' -and $global:PraFake.Faults.CalendarEnableFails) { throw 'Booking activation refused.' }
+    foreach ($key in $PSBoundParameters.Keys) { if ($key -notin @('Identity', 'ErrorAction')) { $user.Calendar[$key] = $PSBoundParameters[$key] } }
+    Write-PraFakeCall "Set-CalendarProcessing $($user.Upn) AutomateProcessing=$($user.Calendar.AutomateProcessing) AllBookInPolicy=$($user.Calendar.AllBookInPolicy)"
+}
+
+function global:Get-CalendarProcessing {
+    [CmdletBinding()] param([string]$Identity)
+    $calendar = (Get-PraFakeUserOrError $Identity).Calendar.Clone()
+    if ($calendar.AutomateProcessing -ne 'None' -and $global:PraFake.Faults.CalendarEnabledReadMismatch) { $calendar.AllBookInPolicy = -not $calendar.AllBookInPolicy }
+    [pscustomobject]$calendar
+}
+
+function global:Set-MailboxCalendarConfiguration {
+    [CmdletBinding()] param([string]$Identity, [string]$WorkingHoursStartTime, [string]$WorkingHoursEndTime, [string[]]$WorkDays, [string]$WorkingHoursTimeZone)
+    $user = Get-PraFakeUserOrError $Identity
+    $user.WorkHours = @{ WorkingHoursStartTime = $WorkingHoursStartTime; WorkingHoursEndTime = $WorkingHoursEndTime; WorkDays = ($WorkDays -join ', '); WorkingHoursTimeZone = $WorkingHoursTimeZone }
+    Write-PraFakeCall "Set-MailboxCalendarConfiguration $($user.Upn) WorkDays=$($WorkDays -join ',')"
+}
+
+function global:Get-MailboxCalendarConfiguration {
+    [CmdletBinding()] param([string]$Identity)
+    $hours = (Get-PraFakeUserOrError $Identity).WorkHours.Clone()
+    if ($global:PraFake.Faults.WorkDaysAliasRead) { $hours.WorkDays = $global:PraFake.Faults.WorkDaysAliasRead }
+    if ($global:PraFake.Faults.WorkTimeZoneObjectRead) { $hours.WorkingHoursTimeZone = [pscustomobject]@{ Id = $hours.WorkingHoursTimeZone; DisplayName = 'Localized time-zone display name' } }
+    [pscustomobject]$hours
+}
+
+function global:New-MailContact {
+    [CmdletBinding()] param([string]$Name, [string]$Alias, [string]$ExternalEmailAddress)
+    $global:PraFake.Reads.Add('New-MailContact attempt')
+    if ($global:PraFake.Faults.ContactFails) { throw 'Contact address reuse blocked; deleted account retained.' }
+    if ($global:PraFake.Faults.ContactSoftDeletedAliasBlocks -and @($global:PraFake.Recycle.Values | Where-Object { $_.Alias -eq $Alias }).Count) {
+        throw 'Exchange New-MailContact uniqueness conflict: alias retained by soft-deleted recipient.'
+    }
+    $id = [guid]::NewGuid().ToString()
+    $global:PraFake.Contacts[$id] = @{ Guid = $id; ExternalDirectoryObjectId = ''; ExchangeGuid = ''; Name = $Name; Alias = $Alias; Identity = $id; RecipientTypeDetails = 'MailContact'
+        ExternalEmailAddress = $ExternalEmailAddress; PrimarySmtpAddress = $ExternalEmailAddress; EmailAddresses = @("SMTP:$ExternalEmailAddress"); CustomAttribute15 = ''; CustomAttribute14 = ''; HiddenFromAddressListsEnabled = $false }
+    Write-PraFakeCall "New-MailContact $Name $ExternalEmailAddress"
+    if ($global:PraFake.Faults.CrashAfterContact) { $global:PraFake.Faults.CrashAfterContact = $false; throw 'Interrupted after routing contact creation.' }
+    [pscustomobject]$global:PraFake.Contacts[$id]
+}
+
+function global:Get-MailContact {
+    [CmdletBinding()] param([string]$Identity)
+    $contact = $global:PraFake.Contacts.Values | Where-Object { $_.Guid -eq $Identity -or $_.Name -eq $Identity } | Select-Object -First 1
+    if (-not $contact) { throw 'Mail contact not found.' }
+    [pscustomobject]$contact
+}
+
+function global:Set-MailContact {
+    [CmdletBinding()] param([string]$Identity, [string]$ExternalEmailAddress, [string[]]$EmailAddresses, [bool]$HiddenFromAddressListsEnabled,
+        [string]$CustomAttribute15, [string]$CustomAttribute14)
+    $global:PraFake.Reads.Add('Set-MailContact attempt')
+    if ($global:PraFake.Faults.ContactSoftDeletedProxyBlocks -and @($global:PraFake.Recycle.Values | Where-Object {
+        @($_.Addresses | Where-Object { $_ -in $EmailAddresses }).Count
+    }).Count) { throw 'Exchange Set-MailContact uniqueness conflict: proxy retained by soft-deleted recipient.' }
+    $contact = $global:PraFake.Contacts[$Identity]
+    $contact.ExternalEmailAddress = $ExternalEmailAddress; $contact.EmailAddresses = @($EmailAddresses)
+    $contact.PrimarySmtpAddress = (@($EmailAddresses | Where-Object { $_ -cmatch '^SMTP:' })[0]).Substring(5)
+    $contact.HiddenFromAddressListsEnabled = $HiddenFromAddressListsEnabled
+    if ($PSBoundParameters.ContainsKey('CustomAttribute15')) { $contact.CustomAttribute15 = $CustomAttribute15 }
+    if ($PSBoundParameters.ContainsKey('CustomAttribute14')) { $contact.CustomAttribute14 = $CustomAttribute14 }
+    Write-PraFakeCall "Set-MailContact $Identity $ExternalEmailAddress"
 }
 
 function global:Get-MailboxPermission {
@@ -491,12 +971,20 @@ function global:Add-RecipientPermission {
 
 function global:Get-OrganizationConfig {
     [CmdletBinding()] param()
+    $global:PraFake.Reads.Add('Get-OrganizationConfig')
+    if ($global:PraFake.Faults.OrganizationReadFails) { throw 'Organization holds access denied.' }
     [pscustomobject]@{ InPlaceHolds = @($global:PraFake.OrgHolds) }
+}
+
+function global:Get-ResourceConfig {
+    [CmdletBinding()] param()
+    [pscustomobject]@{ ResourcePropertySchema = @($global:PraFake.ResourceSchema) }
 }
 
 function global:Get-CaseHoldPolicy {
     <# -Identity: one policy with its locations (by object ID, as the lab shows). -Case: the policies of a case, WITHOUT their locations (lab 8 Oct). #>
     [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [string]$Case)
+    $global:PraFake.Reads.Add('Get-CaseHoldPolicy')
     if ($Case) {
         return @($global:PraFake.CasePolicies | Where-Object { $_.CaseId -eq $Case } | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Guid = [guid]$_.Guid; CaseId = $_.CaseId; Mode = (Get-PraValue $_ 'Mode' 'Enforce'); ExchangeLocation = @() } })
     }
@@ -546,8 +1034,13 @@ function global:New-CaseHoldRule {
 }
 #endregion
 
-$global:PraFakeCommands = @('Invoke-MgGraphRequest', 'Get-Recipient', 'Get-User', 'Get-MailUser', 'Get-Mailbox', 'Get-MailboxLocation', 'Set-MailUser', 'Set-Mailbox', 'Get-OrganizationConfig', 'Get-PraFakeMailboxPlan',
+$global:PraFakeCommands = @('Get-MgContext', 'Get-MgRequestContext', 'Set-MgRequestContext', 'Reset-PraFakeGraphTransport', 'Invoke-MgGraphRequest', 'Get-Recipient', 'Get-User', 'Get-MailUser', 'Get-Mailbox', 'Get-MailboxLocation', 'Set-MailUser', 'Set-Mailbox', 'Get-OrganizationConfig', 'Get-PraFakeMailboxPlan',
+    'New-Mailbox', 'Set-CalendarProcessing', 'Get-CalendarProcessing', 'Set-MailboxCalendarConfiguration', 'Get-MailboxCalendarConfiguration', 'New-MailContact', 'Get-MailContact', 'Set-MailContact', 'Get-ResourceConfig',
+    'Set-User', 'Get-DistributionGroup', 'Get-DistributionGroupMember', 'Add-DistributionGroupMember',
+    'New-DistributionGroup', 'Set-DistributionGroup',
     'Get-MailboxPermission', 'Add-MailboxPermission', 'Get-RecipientPermission', 'Add-RecipientPermission', 'Get-CaseHoldPolicy', 'Set-CaseHoldPolicy', 'New-CaseHoldPolicy', 'New-CaseHoldRule',
     'New-PraFakeTenant', 'Get-PraFakeHoldTag', 'Add-PraFakeUser', 'Write-PraFakeCall', 'Resolve-PraFakeUser', 'Test-PraFakeExchangePlan', 'Step-PraFake',
+    'New-PraFakeResourceSettings',
     'Invoke-PraFakeEntraConnect', 'Invoke-PraFakeWait', 'Stop-PraFakeGraph', 'ConvertTo-PraFakeGraphUser', 'Get-PraFakeUserOrError',
+    'ConvertFrom-PraFakeGraphFilter', 'Test-PraFakeGraphFilter', 'Get-PraFakeGraphPage',
     'Get-PraFakeFiltered', 'ConvertTo-PraFakeRecipient', 'Get-PraFakeLocationText', 'Get-EXORecipient', 'Get-EXOMailbox')
