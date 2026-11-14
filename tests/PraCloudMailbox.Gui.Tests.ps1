@@ -12,6 +12,8 @@
 #Requires -Version 7.5
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
     $script:Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
     . (Join-Path $script:Repo 'tools\DocumentationImages\New-ToolCopy.ps1')
@@ -79,6 +81,7 @@ function Done($result) { Write-Output ('RESULT:' + ($result | ConvertTo-Json -De
 
 AfterAll {
     Remove-PcmTestPackage $script:Root
+    Restore-PcmGlobalState $script:GlobalBefore
 }
 
 Describe 'Console: the request and the command line of a run' {
@@ -1188,11 +1191,20 @@ Describe 'Console: the engine behind the console (the real script, a synthetic s
     BeforeAll {
         $script:Engine = New-DocumentationToolCopy -Repository $script:Repo -Destination (Join-Path $TestDrive 'engine') -RealEngine
         $script:EngineFixture = New-ConsoleFixture -ToolRoot $script:Engine -NoScenario
+        # The engine checks that the cloud modules are installed before it reads anything: empty modules at the minimum versions stand in for them, in a folder of their own.
+        $script:CloudModules = Join-Path $TestDrive 'cloud-modules'
+        foreach ($module in @{ Name = 'ExchangeOnlineManagement'; Version = '3.10.1' }, @{ Name = 'Microsoft.Graph.Authentication'; Version = '2.41.1' }) {
+            $folder = Join-Path $script:CloudModules "$($module.Name)\$($module.Version)"
+            $null = New-Item -ItemType Directory -Path $folder -Force
+            New-ModuleManifest -Path (Join-Path $folder "$($module.Name).psd1") -ModuleVersion $module.Version
+        }
         function script:Invoke-RealEngine {
             param([string[]]$Arguments)
             $events = Join-Path $TestDrive ('events-{0}.jsonl' -f [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $modulePath = $env:PSModulePath
             $env:PRA_EVENT_FILE = $events
-            try { $output = (& pwsh -NoProfile -File (Join-Path $script:Engine 'Invoke-PraCloudMailbox.ps1') @Arguments -ConfigPath $script:EngineFixture.Config 2>&1 | Out-String) } finally { Remove-Item Env:\PRA_EVENT_FILE -ErrorAction SilentlyContinue }
+            $env:PSModulePath = $script:CloudModules + [IO.Path]::PathSeparator + $modulePath
+            try { $output = (& pwsh -NoProfile -File (Join-Path $script:Engine 'Invoke-PraCloudMailbox.ps1') @Arguments -ConfigPath $script:EngineFixture.Config 2>&1 | Out-String) } finally { $env:PSModulePath = $modulePath; Remove-Item Env:\PRA_EVENT_FILE -ErrorAction SilentlyContinue }
             return [pscustomobject]@{ Exit = $LASTEXITCODE; Output = $output; Events = @($(if (Test-Path -LiteralPath $events) { Get-Content -LiteralPath $events -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json } })) }
         }
         $script:HashBefore = @(Get-ChildItem -LiteralPath (Join-Path $script:Engine 'data') -Filter '*.db' | Sort-Object Name | ForEach-Object { '{0}={1}' -f $_.Name, (Get-FileHash -LiteralPath $_.FullName).Hash })

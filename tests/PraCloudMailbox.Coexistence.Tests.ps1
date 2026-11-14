@@ -14,6 +14,8 @@
 #Requires -Version 7.5
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
     $script:Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
     $script:Source = Join-Path $script:Repo 'package'
@@ -32,6 +34,10 @@ BeforeAll {
         $export = $ast.Find({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Export-ModuleMember' }, $true)
         foreach ($name in @($export.CommandElements | Select-Object -Skip 1 | ForEach-Object { $_.FindAll({ param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] }, $true) } | ForEach-Object Value | Where-Object { $_ -cne 'Function' })) { $script:Exported.Add($name) }
     }
+}
+
+AfterAll {
+    Restore-PcmGlobalState $script:GlobalBefore
 }
 
 Describe 'No command of PRA Cloud Mailbox can replace a command of PRA Remote Mailbox' {

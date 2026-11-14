@@ -18,6 +18,8 @@
 #Requires -Version 7.5
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
     . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
     $script:Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     $script:Package = Join-Path $script:Repo 'package'
@@ -91,6 +93,10 @@ BeforeAll {
         $aliases = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Attributes | Where-Object { $_.TypeName.Name -eq 'Alias' } | ForEach-Object { $_.PositionalArguments | ForEach-Object { $_.Value } } })
         $names + $aliases + @('Confirm', 'WhatIf', 'Verbose', 'Debug', 'ErrorAction')
     }
+}
+
+AfterAll {
+    Restore-PcmGlobalState $script:GlobalBefore
 }
 
 Describe 'Pictures' {

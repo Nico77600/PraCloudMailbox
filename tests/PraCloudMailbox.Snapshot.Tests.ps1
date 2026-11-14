@@ -9,6 +9,8 @@
 #Requires -Version 7.5
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
     $script:Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
     $script:Root = New-PcmTestPackage -Repository $script:Repo
@@ -119,6 +121,7 @@ exit $LASTEXITCODE
 
 AfterAll {
     foreach ($path in @($script:Work, (Split-Path $script:Root -Parent))) { if ($path -and (Test-Path -LiteralPath $path)) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue } }
+    Restore-PcmGlobalState $script:GlobalBefore
 }
 
 Describe 'Snapshot hash file: format, reading and checking' {

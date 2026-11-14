@@ -12,6 +12,8 @@
 #Requires -Version 7.5
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
     $script:Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
     $script:AnsiBefore = $env:PRA_ANSI; $script:IconsBefore = $env:PRA_ICONS
@@ -180,6 +182,7 @@ AfterAll {
     Remove-Variable -Name PraFake, PraFakeCommands, ConsoleWaveSize, ConsoleAnswersNo, ConsoleCaller -Scope Global -ErrorAction SilentlyContinue
     if ($null -eq $script:AnsiBefore) { Remove-Item Env:\PRA_ANSI -ErrorAction SilentlyContinue } else { $env:PRA_ANSI = $script:AnsiBefore }
     if ($null -eq $script:IconsBefore) { Remove-Item Env:\PRA_ICONS -ErrorAction SilentlyContinue } else { $env:PRA_ICONS = $script:IconsBefore }
+    Restore-PcmGlobalState $script:GlobalBefore
 }
 
 Describe 'Console: usage' {

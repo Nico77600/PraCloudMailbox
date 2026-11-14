@@ -11,6 +11,16 @@
 #>
 #Requires -Version 7.5
 
+BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
+}
+
+AfterAll {
+    Restore-PcmGlobalState $script:GlobalBefore
+}
+
+
 Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.PSEdition -ne 'Core') {
     BeforeAll {
         $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))

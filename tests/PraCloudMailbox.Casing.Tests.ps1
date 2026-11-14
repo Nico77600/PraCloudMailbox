@@ -8,6 +8,8 @@
 #Requires -Version 7.5
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
     $script:Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
     $script:Root = New-PcmTestPackage -Repository $script:Repo
@@ -45,6 +47,10 @@ BeforeAll {
     Logging = @{ Folder = '$Folder\logs' }
     Report = @{ Folder = '$Folder\reports' }
 $Extra
+}
+
+AfterAll {
+    Restore-PcmGlobalState $script:GlobalBefore
 }
 "@
         return $path

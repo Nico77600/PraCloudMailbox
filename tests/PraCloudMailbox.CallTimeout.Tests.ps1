@@ -12,6 +12,8 @@
 #Requires -Version 7.5
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
     $script:Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
     $script:Root = New-PcmTestPackage -Repository $script:Repo
@@ -37,7 +39,7 @@ BeforeAll {
         foreach ($argument in (@('-NoProfile', '-NonInteractive', '-File', $script:ChildEntry) + $Arguments + @('-ConfigPath', (Join-Path $Work 'child.config.psd1')))) { $info.ArgumentList.Add($argument) }
         $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true; $info.UseShellExecute = $false
         $info.Environment['PCM_TEST_ROOT'] = $script:Root; $info.Environment['PCM_TEST_WORK'] = $Work; $info.Environment['PCM_TEST_SCENARIO'] = $Scenario
-        $info.Environment['PCM_TEST_DIR'] = $PSScriptRoot; $info.Environment['PRA_ICONS'] = 'Ascii'; $info.Environment.Remove('PRA_ANSI')
+        $info.Environment['PCM_TEST_DIR'] = $PSScriptRoot; $info.Environment['PRA_ICONS'] = 'Ascii'; $null = $info.Environment.Remove('PRA_ANSI')
         $clock = [Diagnostics.Stopwatch]::StartNew()
         $process = [Diagnostics.Process]::Start($info)
         $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
@@ -68,6 +70,7 @@ BeforeAll {
 
 AfterAll {
     foreach ($name in 'Get-MgContext', 'Get-MgRequestContext', 'Set-MgRequestContext', 'Reset-PraFakeGraphTransport') { Remove-Item -Path "Function:$name" -ErrorAction SilentlyContinue }
+    Restore-PcmGlobalState $script:GlobalBefore
 }
 
 Describe 'Call time limit: the setting' {
@@ -115,10 +118,14 @@ Describe 'Call time limit: the sentence of a stop' {
 
 Describe 'Call time limit: Microsoft Graph' {
     BeforeAll {
-        foreach ($name in 'Connect-MgGraph', 'Disconnect-MgGraph', 'Connect-ExchangeOnline', 'Disconnect-ExchangeOnline') { Set-Item -Path "Function:\global:$name" -Value { } }
+        function global:Connect-MgGraph { [CmdletBinding()] param($ClientId, $TenantId, $CertificateThumbprint, $ContextScope, [switch]$NoWelcome, $Scopes) }
+        function global:Disconnect-MgGraph { [CmdletBinding()] param() }
+        function global:Connect-ExchangeOnline { [CmdletBinding()] param($AppId, $CertificateThumbprint, $Organization, $ShowBanner, $CommandName, $UserPrincipalName, [switch]$DisableWAM) }
+        function global:Disconnect-ExchangeOnline { [CmdletBinding(SupportsShouldProcess)] param() }
+        function global:Invoke-MgGraphRequest { [CmdletBinding()] param([string]$Method = 'GET', [string]$Uri, [object]$Body, [string]$ContentType, [string]$OutputType, [System.Collections.IDictionary]$Headers) }
     }
     AfterAll {
-        foreach ($name in 'Connect-MgGraph', 'Disconnect-MgGraph', 'Connect-ExchangeOnline', 'Disconnect-ExchangeOnline') { Remove-Item -Path "Function:\$name" -ErrorAction SilentlyContinue }
+        foreach ($name in 'Connect-MgGraph', 'Disconnect-MgGraph', 'Invoke-MgGraphRequest', 'Connect-ExchangeOnline', 'Disconnect-ExchangeOnline') { Remove-Item -Path "Function:\$name" -ErrorAction SilentlyContinue }
     }
     BeforeEach {
         Reset-PraFakeGraphTransport

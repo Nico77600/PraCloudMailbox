@@ -17,6 +17,8 @@
 #Requires -Version 7.5
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
     . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
     $script:Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     $script:Source = Join-Path $script:Repo 'package'
@@ -68,6 +70,7 @@ AfterAll {
             Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint } | ForEach-Object { [IO.Directory]::Delete($_.FullName) }
         Remove-Item -LiteralPath $script:Work -Recurse -Force -ErrorAction SilentlyContinue
     }
+    Restore-PcmGlobalState $script:GlobalBefore
 }
 
 Describe 'Static package contract' {

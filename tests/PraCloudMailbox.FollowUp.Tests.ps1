@@ -8,6 +8,8 @@
 #Requires -Version 7.5
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
     $script:Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
     $script:Root = New-PcmTestPackage -Repository $script:Repo
@@ -32,6 +34,7 @@ AfterAll {
     foreach ($name in @('Get-MgContext', 'Get-MgRequestContext', 'Set-MgRequestContext', 'Reset-PraFakeGraphTransport', 'Connect-MgGraph', 'Disconnect-MgGraph', 'Connect-ExchangeOnline', 'Disconnect-ExchangeOnline', 'Connect-IPPSSession')) {
         Remove-Item -Path "function:$name" -ErrorAction SilentlyContinue
     }
+    Restore-PcmGlobalState $script:GlobalBefore
 }
 
 Describe 'Expectations of a batch (Check -Batch), pure rules' {

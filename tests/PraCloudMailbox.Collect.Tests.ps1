@@ -17,6 +17,8 @@ BeforeDiscovery {
 }
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
     $script:Repo =[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
     . (Join-Path $PSScriptRoot 'DeserializedFixture.ps1')
@@ -66,6 +68,7 @@ AfterAll {
             'Get-MailContact', 'Get-DistributionGroup', 'Get-DistributionGroupMember', 'Get-DynamicDistributionGroup', 'Get-ExchangeServer', 'Set-ADServerSettings')) {
         Remove-Item -Path "function:global:$name" -ErrorAction SilentlyContinue
     }
+    Restore-PcmGlobalState $script:GlobalBefore
 }
 
 Describe 'The fixtures are what a remote session returns' {

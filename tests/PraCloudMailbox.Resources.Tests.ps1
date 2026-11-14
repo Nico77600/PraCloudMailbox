@@ -1,4 +1,14 @@
 ﻿#Requires -Version 7.5
+
+BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
+}
+
+AfterAll {
+    Restore-PcmGlobalState $script:GlobalBefore
+}
+
 Describe 'Native resource safety rules' {
     BeforeAll {
         . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')

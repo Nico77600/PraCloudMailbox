@@ -1,5 +1,15 @@
 ﻿#Requires -Version 7.5
 
+BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
+}
+
+AfterAll {
+    Restore-PcmGlobalState $script:GlobalBefore
+}
+
+
 Describe 'Graph transport lifecycle (offline context model)' {
     BeforeAll {
         . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')

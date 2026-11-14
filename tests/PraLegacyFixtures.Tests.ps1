@@ -12,6 +12,8 @@
 #Requires -Version 7.5
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
     $script:Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
     $script:Root = New-PcmTestPackage -Repository $script:Repo
@@ -32,6 +34,7 @@ AfterAll {
     [GC]::Collect(); [GC]::WaitForPendingFinalizers()
     Remove-Item -LiteralPath $script:Work -Recurse -Force -ErrorAction SilentlyContinue
     Remove-PcmTestPackage $script:Root
+    Restore-PcmGlobalState $script:GlobalBefore
 }
 
 Describe 'The frozen stores' {
