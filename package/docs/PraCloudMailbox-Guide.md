@@ -142,6 +142,8 @@ The mails received in the cloud during the disaster are **never deleted**: those
 - It never deletes a shared mailbox identity before the case hold is stamped on the mailbox (`InPlaceHolds`): otherwise the mailbox would be soft-deleted, not inactive, and purged after 30 days.
 - It never lifts a hold from an object that is already back on-premises.
 - It never handles a room or equipment mailbox unless `Scope.ConvertRooms` is set (`KIND_NOT_SUPPORTED` otherwise). The default `SynchronizedShared` path retains the released shared-mailbox behaviour; `CloudResource` is a separate opt-in lifecycle for native resources excluded from synchronisation (chapter 6.2). Neither path automatically merges cloud reservations into the native calendar.
+- It never recreates contacts, distribution groups, mail-enabled security groups, dynamic distribution groups or Microsoft 365 groups. Collect can store contacts, distribution groups (distribution and mail-enabled security) and dynamic distribution groups in the snapshot (`Collect.Contacts`, `Collect.DistributionGroups`, `Collect.DynamicDistributionGroups`), for reference only: Check, Convert and Recover never read them. Microsoft 365 groups are cloud objects: they are not collected and not handled. The members of the groups named in `Collect.TargetGroups` (and of `Scope.GroupDN`) are used for one thing, to choose the objects of a run with `-Group`. The only groups the tool changes are the licence group (its source of authority moves to the cloud, chapter 9) and the room lists of the native resources (chapter 6.2).
+- It restores calendar settings (booking policies, work hours, booking delegates) only for the native rooms and equipment of the `CloudResource` mode (chapter 6.2). The calendar of a user or of a shared mailbox is not touched, and no calendar-folder permission is restored.
 
 # Part II · Set up
 
@@ -261,6 +263,8 @@ The Collect account uses the cmdlets that the code imports from the remote sessi
 | `config\PraCloudMailbox.config.psd1` | read; write only to the administrator who edits it | |
 | the package folder | read (execute) only | everyone: the integrity check refuses a package that changed |
 | the snapshot and its backups | a **restricted** access list, never **Domain Users** | the administrators of the tool and the backup account |
+
+The tool creates the `data`, `logs` and `reports` folders itself when they are missing, **private from the first moment**: no inherited permission, full control for the account that runs it, SYSTEM and the local Administrators only. A folder that already exists is left exactly as you set it. If a folder cannot be created, or cannot be made private, the run stops and says why. The letter case of these folder names does not matter in the configuration (`.\Logs` is the same as `.\logs`).
 
 <!-- icon: download -->
 ## 5. Installation
@@ -670,9 +674,11 @@ Each run writes:
 |---|---|
 | `logs\PRA_<date>_<run>.log` | every step with its time; last line `RESULT: PASS`, `RESULT: PENDING` (exit code 2), `RESULT: FAIL` or `RESULT: CANCELLED` |
 | `logs\PRA_<date>_<run>.transcript.txt` | the PowerShell transcript of the run |
-| `reports\PRA_<date>_<run>.csv` | one row per object |
+| `reports\PRA_<date>_<run>.csv` | one row per object; UTF-8 with a byte order mark, semicolon as separator, and a text that starts like a formula (`=`, `+`, `-`, `@`) gets a leading apostrophe |
 | `reports\PRA_<date>_<run>.html` | the same, self-contained (no external resource): result, counters, next step, the settings of the run that differ from the file, the skipped members, a filterable table |
-| `reports\PraCloudMailbox_<environment>_batch<id>_global.html` and `.csv` | the **global report** of a batch |
+| `reports\PraCloudMailbox_<environment>_batch<id>_global.html` | the **global report** of a batch: every object and every step of its journey |
+| `reports\PraCloudMailbox_<environment>_batch<id>_global.csv` | the same objects, one line each, for Excel |
+| `reports\PraCloudMailbox_<environment>_batch<id>_global_events.csv` | every step of every object, one line each (the journeys) |
 
 ![HTML report of a Convert](images/report-convert-light.png)
 
@@ -684,7 +690,7 @@ Each run writes:
 | `FinalStatus` | `Planned`, `AlreadyDone`, `Success`, `Error`, `Pending`, `Skipped` |
 | `Detail`, `Warnings` | the explanation, and what to look at |
 
-**The global report.** One page per Convert batch, written at the end of every Convert, Recover and `Check -Batch` run (its path is in the next steps, and the two files are replaced at each run). It follows the batch end to end: every Convert run, every resume, every follow-up and every Recover wave, with the source of each run (which group, which list), and, for each object, its journey. The report carries no script and no external resource.
+**The global report.** One page per Convert batch, written at the end of every Convert, Recover and `Check -Batch` run (its path is in the next steps, and the three files are replaced at each run). It follows the batch end to end: every Convert run, every resume, every follow-up and every Recover wave, with the source of each run (which group, which list), and, for each object, its journey. The report has no limit: every object and every event of the journal is in it, however many there are. It is one self-contained page with no external resource and no network access. The totals, the batches, the runs and the settings of each run are plain HTML, readable even when scripts are blocked. The objects, their events and the follow-up check are stored compressed (gzip, not encrypted) and read by the script of the page in a current desktop Microsoft Edge or Google Chrome; the objects are shown through a virtual grid (at most 200 rows exist in the page), and a click on an object opens its whole journey, built from the events, in pages of 100. The page can be opened on a journey directly, with `#object=<identity or object GUID>` at the end of its address. The two CSV files hold the same data without any script: `…_global.csv` has one line per object (`ObjectGuid`, `Identity`, `Kind`, `Verdict`, `Batches`, `Stages`, `Note`, `EventCount`) and `…_global_events.csv` one line per event (`ObjectGuid`, `Identity`, `Kind`, `Time`, `Batch`, `Action`, `Step`, `Outcome`, `Detail`; the events of the batch itself have no object). Both are UTF-8 with a byte order mark, with a semicolon as separator, and a text that starts like a formula gets a leading apostrophe.
 
 ![The global report of a batch](images/report-global-light.png)
 
@@ -699,7 +705,7 @@ Exit codes: `0` done, `1` failed (or an object is not ready for Check), `2` done
 |---|---|
 | `Invoke-PraCloudMailbox.ps1` | entry script: parameters, edition check, the package integrity bootstrap, the run context, the four actions (`Invoke-PcmCollect`, `Invoke-PcmCheck`, `Invoke-PcmCheckBatch`, `Invoke-PcmConvert`, `Invoke-PcmRecover`) and their helpers (targets, licence need, assessment of the current state, journal) |
 | `PraCloudMailbox.psd1`, `PraCloudMailbox.psm1` | the manifest (the single source of the tool version, read by `Get-PcmToolVersion`) and the root module that loads `PRA.Common` and `PRA.Store` |
-| `module\PRA.Common.psm1` | console theme, banner, steps, summary card, log, configuration (`Import-PcmConfiguration`), audit (log + transcript), results and reports (`Complete-PcmRun`), the global report, the cloud module report |
+| `module\PRA.Common.psm1` | console theme, banner, steps, summary card, log, configuration (`Import-PcmConfiguration`), audit (log + transcript), private creation of the data, log and report folders, results and reports (`Complete-PcmRun`), the global report (`templates\GlobalReport.template.html`), the cloud module report |
 | `module\PRA.Store.psm1` | SQLite (System.Data.SQLite in `lib\sqlite`): snapshot schema 3, journal schema 2; older stores remain readable; the `.sha256` helpers |
 | `module\PRA.Collect.psm1` | Collect (remote Exchange session): scope, mailboxes, permissions, groups expanded, contacts and distribution groups, target groups |
 | `module\PRA.Cloud.psm1` | cloud: connections (certificate or interactive), Graph with retries, tenant facts, readiness rules (`Get-PcmReadiness`, pure functions), the follow-up of a batch, source of authority, licences, permissions, case hold, Entra Connect operations |

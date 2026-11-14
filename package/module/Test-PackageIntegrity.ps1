@@ -46,6 +46,7 @@ $required = @(
     'module\Test-PackageIntegrity.ps1'
     'module\PRA.Gui.xaml'
     'templates\Report.template.html'
+    'templates\GlobalReport.template.html'
     'config\Targets.sample.csv'
     'config\EntraConnect.sample.ps1'
     'lib\sqlite\README.txt'

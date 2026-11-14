@@ -1,0 +1,481 @@
+<!doctype html>
+<!--
+    PRA Cloud Mailbox - global report template (the batch from end to end)
+    Author  : Nicolas Fabert
+    Version : 2.0.0
+    PRA.Common.psm1 (Write-PcmGlobalReportHtml) replaces the markers below. Texts are HTML-encoded by the code:
+      {{TITLE}} {{HEADING}} {{SUBTITLE}} {{VERSION}}  texts of the header (the title of the page, the heading, the line under it, the tool version)
+      {{TILES}}        tiles (Objects, Converted, Rolled back, In progress, Failed, Skipped, Events, Runs)
+      {{BATCHES}}      "Batches" card: the Convert batch and the Recover batches that rolled it back
+      {{RUNS}}         "Runs" card: every run on the batch
+      {{SETTINGS}}     "Run settings changed from the configuration file" card
+      {{DATA_NOTICE}}  plain sentence for the no-JavaScript fallback: how many objects and events the data holds, and the CSV files that hold them all
+      {{DATA}}         (the LAST occurrence in the file) the data, streamed by the code: the compressed chunks, then a JSON header (script elements)
+    The summary above is plain HTML and stays readable when scripts are blocked. The objects, their events (the journey of each object) and the follow-up check are NOT
+    HTML tables: they are stored as dictionary-indexed columns in gzip+base64 chunks (compression is not encryption), decoded by the script at the end of this file.
+    The objects are shown through a virtual grid (at most 200 rows exist in the page at any time); the journey of an object is built from the events when its row is
+    clicked and is shown in pages, so no object and no event is ever left out. Adding #object=<identity or object GUID> to the address opens that journey.
+    Everything else is static: edit texts, colours or layout here.
+-->
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f7f4ef; --surface: #ffffff; --soft: #f5f5f5; --border: #dedede; --text: #242424; --muted: #5c5c5c;
+  --accent: #b11f4b; --accent-2: #9a1a41; --accent-soft: rgba(177, 31, 75, 0.08); --accent-fg: #ffffff; --highlight: rgba(177, 31, 75, 0.12);
+  --ok: #16a34a; --warn: #d97706; --fail: #dc2626; --info: #0078d4;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #3d3b3a; --surface: #292929; --soft: #2e2e2e; --border: #474747; --text: #dedede; --muted: #a0a0a0;
+    --accent: #fd8ea1; --accent-2: #fb7b91; --accent-soft: rgba(253, 142, 161, 0.14); --accent-fg: #1a1a1a; --highlight: rgba(253, 142, 161, 0.12);
+    --ok: #4ade80; --warn: #fbbf24; --fail: #f87171; --info: #4da6ff;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 28px 32px; background: var(--bg); color: var(--text); font: 14px "Segoe UI", Aptos, Calibri, -apple-system, sans-serif; }
+header { position: relative; overflow: hidden; border: 1px solid var(--border); border-top: 4px solid var(--accent); border-radius: 16px; padding: 24px; margin-bottom: 20px; background: linear-gradient(125deg, var(--surface) 35%, var(--accent-soft)); }
+header::before { content: ""; position: absolute; width: 280px; height: 280px; right: -100px; top: -160px; border: 40px solid var(--highlight); border-radius: 50%; pointer-events: none; }
+.origin { color: var(--accent); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; }
+h1 { font-size: 30px; font-weight: 650; letter-spacing: -0.02em; margin: 8px 0 6px; }
+h2 { font-size: 16px; font-weight: 600; margin: 0 0 12px; }
+.subtitle { color: var(--muted); margin: 0; }
+.tiles { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 14px; margin: 0 0 20px; }
+.tile { position: relative; overflow: hidden; padding: 16px 18px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); transition: transform 160ms ease, border-color 160ms ease; }
+.tile:hover { transform: translateY(-3px); border-color: var(--accent); }
+.tile::after { content: ""; position: absolute; width: 70px; height: 70px; right: -26px; bottom: -30px; border: 12px solid var(--highlight); border-radius: 50%; }
+.tile-label { font-size: 12px; font-weight: 600; color: var(--muted); }
+.tile-value { font-size: 28px; font-weight: 650; margin-top: 8px; font-variant-numeric: tabular-nums; }
+.tile.ok .tile-value { color: var(--ok); } .tile.warn .tile-value { color: var(--warn); } .tile.fail .tile-value { color: var(--fail); } .tile.info .tile-value { color: var(--info); }
+.tile:first-child { background: linear-gradient(125deg, var(--accent-2), var(--accent)); border-color: var(--accent); }
+.tile:first-child .tile-label, .tile:first-child .tile-value { color: var(--accent-fg); }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 20px; margin-bottom: 20px; }
+.warnings { border-left: 4px solid var(--warn); }
+.loading { border-left: 4px solid var(--info); }
+.loading.error { border-left-color: var(--fail); }
+.loading.error #loading-text { color: var(--fail); font-weight: 600; }
+.progress { height: 8px; border-radius: 999px; background: var(--soft); border: 1px solid var(--border); overflow: hidden; margin-top: 10px; }
+.progress div { height: 100%; width: 0; background: var(--accent); }
+.nojs { border-left: 4px solid var(--info); }
+.controls { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px 14px; margin-bottom: 12px; }
+.controls label { display: block; font-size: 11px; color: var(--accent); font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; margin-bottom: 3px; }
+.controls .wide { grid-column: span 2; }
+input, select, button { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); padding: 7px 10px; border-radius: 10px; min-width: 0; width: 100%; }
+button { width: auto; cursor: pointer; font-weight: 600; }
+button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+button:disabled { opacity: 0.55; cursor: default; }
+:focus-visible { outline: 2px solid var(--info); outline-offset: 1px; }
+.bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 0 0 12px; }
+.bar .grow { flex: 1 1 260px; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { font-size: 12px; padding: 1px 9px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); font-variant-numeric: tabular-nums; }
+.viewport { position: relative; height: min(68vh, 640px); min-height: 280px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.grid-head, .grid-row { display: grid; grid-template-columns: var(--cols); min-width: var(--gridw); }
+.grid-head { position: sticky; top: 0; z-index: 2; background: var(--soft); border-bottom: 1px solid var(--border); font-weight: 600; font-size: 12.5px; }
+.grid-head > div { padding: 8px 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.spacer { position: relative; min-width: var(--gridw); }
+.grid-row { position: absolute; left: 0; right: 0; height: var(--rowh); border-bottom: 1px solid var(--border); font-size: 12.5px; cursor: pointer; align-items: center; }
+.grid-row:hover, .grid-row.active { background: var(--accent-soft); }
+.grid-row.active { outline: 2px solid var(--accent); outline-offset: -2px; }
+.grid-row > div { padding: 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.grid-row small { display: block; color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+.mono { font-family: Consolas, "Cascadia Mono", monospace; font-size: 11.5px; }
+.empty { padding: 28px; text-align: center; color: var(--muted); }
+.badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-weight: 600; font-size: 11.5px; border: 1px solid currentColor; white-space: nowrap; }
+.badge.ok { color: var(--ok); } .badge.warn { color: var(--warn); } .badge.fail { color: var(--fail); } .badge.muted { color: var(--muted); }
+.pill { display: inline-block; padding: 1px 10px; border-radius: 999px; font-weight: 600; font-size: 12px; background: var(--soft); }
+.pill.ok { color: var(--ok); } .pill.warn { color: var(--warn); } .pill.fail { color: var(--fail); } .pill.muted { color: var(--muted); }
+.pager { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 0 0 10px; }
+.pager input { max-width: 320px; }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th { background: var(--soft); text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; font-weight: 600; }
+td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; overflow-wrap: anywhere; }
+.summary-table th { color: var(--accent); font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; }
+ul.plain { margin: 6px 0 0; padding-left: 18px; }
+.muted { color: var(--muted); }
+dialog { max-width: min(1100px, 96vw); width: 100%; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); color: var(--text); padding: 20px; }
+dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+.dialog-head { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin: 0 0 12px; } .dialog-head h2 { margin: 0; overflow-wrap: anywhere; }
+#journey-stages { margin: 0 0 12px; }
+.facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 6px 18px; margin: 0 0 12px; font-size: 12.5px; }
+.facts span { display: block; font-size: 11px; color: var(--accent); font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+footer { color: var(--muted); font-size: 12px; margin-top: 8px; }
+@media (max-width: 1100px) { .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@media (max-width: 700px) {
+  body { padding: 14px 12px; } h1 { font-size: 24px; }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; } .tile-value { font-size: 22px; }
+  .controls { grid-template-columns: 1fr; } .controls .wide { grid-column: auto; }
+  header { padding: 16px; } .card { padding: 14px; }
+}
+@media print { body { padding: 0; background: #fff; } .controls, .bar, .pager { display: none; } .tile:hover { transform: none; } }
+</style></head>
+<body>
+<header>
+  <div class="origin">PRA Cloud Mailbox &middot; global report &middot; v{{VERSION}}</div>
+  <h1>{{HEADING}}</h1>
+  <p class="subtitle">{{SUBTITLE}}</p>
+</header>
+<div class="tiles">{{TILES}}</div>
+{{BATCHES}}
+{{RUNS}}
+{{SETTINGS}}
+<noscript><section class="card nojs"><h2>JavaScript is required to read the objects and their journeys</h2>
+<p>{{DATA_NOTICE}}</p>
+<p>The summary above is complete. The objects, their journeys and the follow-up check are stored compressed and are displayed by the page script. Enable JavaScript (current desktop Microsoft Edge or Google Chrome), or open the CSV files with the same name, which hold every object and every event.</p></section></noscript>
+<section class="card loading" id="loading" role="status" aria-live="polite" hidden>
+  <h2>Report data</h2>
+  <div id="loading-text">Loading the report data...</div>
+  <div class="progress" aria-hidden="true"><div id="loading-fill"></div></div>
+</section>
+<section class="card" id="followup-card" hidden>
+  <h2>Follow-up check of this run</h2>
+  <div class="pager" id="followup-pager"></div>
+  <div class="scroll"><table><thead id="followup-head"></thead><tbody id="followup-body"></tbody></table></div>
+</section>
+<section class="card" id="objects-card" hidden>
+  <h2>Objects, end to end</h2>
+  <div class="controls" role="group" aria-label="Filters of the objects">
+    <div class="wide"><label for="f-search">Search (all fields)</label><input id="f-search" type="search" autocomplete="off" placeholder="Text found in any field of the object"></div>
+    <div><label for="f-verdict">Verdict</label><select id="f-verdict"></select></div>
+    <div><label for="f-kind">Type</label><select id="f-kind"></select></div>
+    <div><label for="f-batch">Batch ID</label><input id="f-batch" type="search" autocomplete="off" placeholder="Batch ID"></div>
+  </div>
+  <div class="bar">
+    <button type="button" id="reset">Reset filters</button>
+    <button type="button" id="export-objects" class="primary">Export filtered objects (CSV)</button>
+    <button type="button" id="export-events" class="primary">Export their journeys (CSV)</button>
+    <span id="result-state" class="grow" role="status" aria-live="polite"></span>
+  </div>
+  <div class="bar"><div class="chips" id="verdict-chips" aria-label="Filtered objects per verdict"></div></div>
+  <div id="viewport" class="viewport" tabindex="0" role="grid" aria-label="Objects of the batch" aria-describedby="grid-help">
+    <div id="grid-head" class="grid-head" role="row"></div>
+    <div id="spacer" class="spacer" role="rowgroup"></div>
+    <div id="empty" class="empty" hidden>No object matches the filters.</div>
+  </div>
+  <p class="sr-only" id="grid-help">Use the arrow keys, Page Up, Page Down, Home and End to move between objects. Enter shows the journey of the object.</p>
+  <footer id="grid-note"></footer>
+</section>
+<section class="card warnings" id="batch-events-card" hidden>
+  <h2>Events of the batch itself</h2>
+  <div class="pager" id="batch-events-pager"></div>
+  <div class="scroll"><table><thead id="batch-events-head"></thead><tbody id="batch-events-body"></tbody></table></div>
+</section>
+<dialog id="journey" aria-labelledby="journey-title">
+  <div class="dialog-head"><h2 id="journey-title">Journey</h2><button type="button" id="journey-close" autofocus>Close</button></div>
+  <div class="facts" id="journey-facts"></div>
+  <p class="muted" id="journey-note"></p>
+  <div id="journey-stages"></div>
+  <div class="pager" id="journey-pager"></div>
+  <div class="scroll"><table><thead id="journey-head"></thead><tbody id="journey-body"></tbody></table></div>
+</dialog>
+<footer>Self-contained report (no external resource, no network access). The objects and their events are stored compressed (gzip, not encrypted), all decoded when the page opens. The objects are shown through a virtual grid that keeps at most 200 rows in the page, and the journey of an object is shown in full, in pages. Reading them needs a current desktop Microsoft Edge or Google Chrome. The CSV files with the same name hold every object and every event.</footer>
+{{DATA}}
+<script>
+(async () => {
+  "use strict";
+  const el = id => document.getElementById(id);
+  const root = document.documentElement;
+  const state = { phase: "loading", error: "", objects: 0, events: 0, followup: 0, mounted: 0, maxMounted: 0, shown: 0, journey: null, metrics: {} };
+  window.__praGlobalState = state;
+  const number = n => Number(n).toLocaleString("en-GB");
+  const fail = text => { el("loading").hidden = false; el("loading").classList.add("error"); el("loading-text").textContent = text; state.phase = "error"; state.error = text; root.dataset.state = "error"; };
+  const t0 = performance.now();
+  let meta;
+  try { meta = JSON.parse(el("pra-meta").textContent); } catch (error) { fail("The report data header is missing or damaged. Use the CSV files with the same name."); return; }
+  el("loading").hidden = false;
+  if (typeof DecompressionStream !== "function") {
+    fail("This browser cannot decompress the report data (DecompressionStream is required: use a current desktop Microsoft Edge or Google Chrome). The CSV files with the same name hold every object and every event.");
+    return;
+  }
+
+  // ---- Data loading: JSON -> gzip -> base64 chunks, all decoded one after the other ----
+  const KINDS = ["objects", "events", "followup"];
+  const data = {};
+  for (const k of KINDS) { const spec = meta[k]; data[k] = { fields: spec.fields, n: 0, count: spec.count, dict: spec.fields.map(() => []), col: spec.fields.map(() => new Uint32Array(spec.count)) }; }
+  async function decode(b64) {
+    const bin = atob(b64), bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+    return JSON.parse(await new Response(stream).text());
+  }
+  const blocks = Array.from(document.querySelectorAll('script[type="application/x-pra-chunk"]'));
+  const expected = meta.chunks.objects + meta.chunks.events + meta.chunks.followup;
+  if (blocks.length !== expected) { fail(`The report data is incomplete: ${blocks.length} of ${expected} chunks found. Use the CSV files with the same name.`); return; }
+  const totalItems = meta.objects.count + meta.events.count + meta.followup.count;
+  let done = 0;
+  try {
+    for (let b = 0; b < blocks.length; b++) {
+      const kind = blocks[b].dataset.kind, ds = data[kind];
+      if (!ds) throw new Error("unknown data kind");
+      const c = await decode(blocks[b].textContent);
+      blocks[b].remove();
+      if (ds.n + c.n > ds.count) throw new Error("more items than announced");
+      for (let f = 0; f < ds.fields.length; f++) {
+        const add = c.d[f], dict = ds.dict[f];
+        for (let i = 0; i < add.length; i++) dict.push(add[i]);
+        ds.col[f].set(c.c[f], ds.n);
+      }
+      ds.n += c.n; done += c.n;
+      el("loading-text").textContent = `Loading ${number(done)} of ${number(totalItems)} item(s)...`;
+      el("loading-fill").style.width = `${totalItems ? done / totalItems * 100 : 100}%`;
+      await new Promise(r => setTimeout(r, 0));
+    }
+    for (const k of KINDS) if (data[k].n !== data[k].count) throw new Error(`${k}: ${data[k].n} of ${data[k].count}`);
+  } catch (error) {
+    fail("The compressed report data could not be read (" + (error && error.message ? error.message : "decoding error") + "). Nothing is displayed so that no partial result is mistaken for the full one. Use a current desktop Microsoft Edge or Google Chrome, or the CSV files with the same name.");
+    return;
+  }
+
+  const O = data.objects, E = data.events, U = data.followup, TOTAL = O.n;
+  const OX = {}; O.fields.forEach((name, i) => { OX[name] = i; });
+  const EX = {}; E.fields.forEach((name, i) => { EX[name] = i; });
+  const ov = (name, i) => O.dict[OX[name]][O.col[OX[name]][i]];
+  const ev = (name, i) => E.dict[EX[name]][E.col[EX[name]][i]];
+  const txt = v => v === null || v === undefined ? "" : String(v);
+  const clip = (s, n) => s.length > n ? s.slice(0, n) + "\u2026" : s;
+  const nodeText = (tag, text, cls) => { const n = document.createElement(tag); n.textContent = text; if (cls) n.className = cls; return n; };
+
+  // ---- The journey of every object: its events, found through an index built once -------------------------
+  const evObject = new Int32Array(E.n), evCount = new Uint32Array(TOTAL), batchLevel = [];
+  {
+    const dict = E.dict[EX.Object], col = E.col[EX.Object];
+    for (let i = 0; i < E.n; i++) {
+      const v = dict[col[i]], o = typeof v === "number" ? v : -1;
+      evObject[i] = o;
+      if (o >= TOTAL) { fail("The report data is damaged: an event points to an object that does not exist. Use the CSV files with the same name."); return; }
+      if (o >= 0) evCount[o]++; else batchLevel.push(i);
+    }
+  }
+  const evStart = new Uint32Array(TOTAL + 1);
+  for (let o = 0; o < TOTAL; o++) evStart[o + 1] = evStart[o] + evCount[o];
+  const evOrder = new Uint32Array(evStart[TOTAL]);
+  { const next = evStart.slice(0, TOTAL); for (let i = 0; i < E.n; i++) { const o = evObject[i]; if (o >= 0) evOrder[next[o]++] = i; } }
+  for (let o = 0; o < TOTAL; o++) {
+    if (Number(txt(ov("Events", o))) !== evCount[o]) { fail(`The journey of an object is incomplete (${evCount[o]} of ${txt(ov("Events", o))} events found). Use the CSV files with the same name.`); return; }
+  }
+  state.metrics.decodeMs = Math.round(performance.now() - t0);
+  el("loading").hidden = true;
+  state.objects = TOTAL; state.events = E.n; state.followup = U.n;
+
+  const verdictClass = v => { const s = v.toLowerCase(); return s === "converted" || s === "rolled back" ? "ok" : /failed/.test(s) ? "fail" : /progress/.test(s) ? "warn" : "muted"; };
+  const outcomeClass = v => { const s = v.toLowerCase(); return /^(ok|success|done|met)$/.test(s) ? "ok" : /fail|error/.test(s) ? "fail" : /warn|pending|running|planned|not yet/.test(s) ? "warn" : "muted"; };
+  const fill = (select, entries) => { select.replaceChildren(); for (const [v, t] of entries) { const o = document.createElement("option"); o.value = v; o.textContent = t; select.append(o); } };
+
+  // ---- Paged table (follow-up, events of the batch, journey of an object): a text filter, pages of rows, no row left out ----
+  function makePager(host, headId, bodyId, titles, cells, haystack, options) {
+    const PAGE = options.page || 100;
+    let full = new Uint32Array(0), list = full, page = 0, query = "";
+    const search = document.createElement("input"); search.type = "search"; search.autocomplete = "off"; search.setAttribute("aria-label", "Filter the " + options.title); search.placeholder = "Filter the " + options.title;
+    const prev = nodeText("button", "Previous"), next = nodeText("button", "Next"), info = nodeText("span", "", "subtitle"); info.setAttribute("role", "status"); info.setAttribute("aria-live", "polite");
+    prev.type = next.type = "button";
+    host.replaceChildren(search, prev, next, info);
+    const head = el(headId), body = el(bodyId);
+    const tr = document.createElement("tr"); for (const t of titles) tr.append(nodeText("th", t)); head.replaceChildren(tr);
+    const summary = { shown: 0, total: 0, page: 0, pages: 0, text: "", maxRows: 0 };
+    const draw = () => {
+      const pages = Math.max(1, Math.ceil(list.length / PAGE)); page = Math.max(0, Math.min(page, pages - 1));
+      const from = page * PAGE, to = Math.min(list.length, from + PAGE), frag = document.createDocumentFragment();
+      for (let p = from; p < to; p++) {
+        const i = list[p], row = document.createElement("tr");
+        for (const c of cells(i)) { if (typeof c === "string") row.append(nodeText("td", c)); else { const td = document.createElement("td"); td.append(c); row.append(td); } }
+        frag.append(row);
+      }
+      body.replaceChildren(frag);
+      prev.disabled = page === 0; next.disabled = page >= pages - 1;
+      info.textContent = list.length ? `${number(from + 1)} to ${number(to)} of ${number(list.length)}` + (list.length !== full.length ? ` (filtered from ${number(full.length)})` : "") + `, page ${page + 1} of ${pages}` : `No ${options.title} match (${number(full.length)} in total).`;
+      summary.shown = list.length; summary.total = full.length; summary.page = page + 1; summary.pages = pages; summary.text = info.textContent; summary.maxRows = Math.max(summary.maxRows, to - from);
+    };
+    const refilter = () => {
+      query = search.value.trim().toLowerCase();
+      if (!query) list = full; else { const out = new Uint32Array(full.length); let n = 0; for (let p = 0; p < full.length; p++) if (haystack(full[p]).toLowerCase().includes(query)) out[n++] = full[p]; list = out.slice(0, n); }
+      page = 0; draw();
+    };
+    let timer = null; search.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(refilter, 250); });
+    prev.addEventListener("click", () => { page--; draw(); }); next.addEventListener("click", () => { page++; draw(); });
+    return { set(items) { full = items; search.value = ""; query = ""; list = full; page = 0; draw(); }, summary };
+  }
+
+  // ---- Follow-up check of this run ----
+  if (U.n) {
+    const UX = {}; U.fields.forEach((name, i) => { UX[name] = i; });
+    const uv = (name, i) => txt(U.dict[UX[name]][U.col[UX[name]][i]]);
+    const cells = i => [uv("Identity", i), uv("Expect", i), nodeText("span", uv("Result", i), "pill " + outcomeClass(uv("Result", i))), uv("Detail", i)];
+    const pager = makePager(el("followup-pager"), "followup-head", "followup-body", ["Object", "Expected", "Result", "Detail"], cells, i => ["Identity", "Expect", "Result", "Detail"].map(n => uv(n, i)).join(" "), { title: "follow-up rows" });
+    const all = new Uint32Array(U.n); for (let i = 0; i < U.n; i++) all[i] = i;
+    pager.set(all); el("followup-card").hidden = false; state.followupPager = pager.summary;
+  }
+
+  // ---- Events and journey rows ----
+  const eventCells = i => [txt(ev("Time", i)), (txt(ev("Action", i)) + " " + txt(ev("Batch", i))).trim(), txt(ev("Step", i)), nodeText("span", txt(ev("Outcome", i)), "pill " + outcomeClass(txt(ev("Outcome", i)))), txt(ev("Detail", i))];
+  const eventText = i => ["Time", "Action", "Batch", "Step", "Outcome", "Detail"].map(n => txt(ev(n, i))).join(" ");
+  const eventTitles = ["Time", "Batch", "Step", "Outcome", "Detail"];
+  if (batchLevel.length) {
+    const pager = makePager(el("batch-events-pager"), "batch-events-head", "batch-events-body", eventTitles, eventCells, eventText, { title: "batch events" });
+    pager.set(Uint32Array.from(batchLevel)); el("batch-events-card").hidden = false; state.batchEventsPager = pager.summary;
+  }
+  const journeyPager = makePager(el("journey-pager"), "journey-head", "journey-body", eventTitles, eventCells, eventText, { title: "events of this object", page: 100 });
+  function openJourney(o) {
+    const guid = txt(ov("ObjectGuid", o)), name = txt(ov("Identity", o)) || guid;
+    el("journey-title").textContent = "Journey of " + name;
+    const facts = el("journey-facts"); facts.replaceChildren();
+    for (const [label, value] of [["Object GUID", guid], ["Type", txt(ov("Kind", o)) || "-"], ["Verdict", txt(ov("Verdict", o))], ["Batches", txt(ov("Batches", o))], ["Events", number(evCount[o])]]) {
+      const box = document.createElement("div"); box.append(nodeText("span", label), document.createTextNode(value)); facts.append(box);
+    }
+    el("journey-note").textContent = txt(ov("Note", o));
+    const stages = el("journey-stages"); stages.replaceChildren();
+    const lines = txt(ov("Stages", o)).split(" | ").filter(s => s);
+    if (lines.length) { const ul = document.createElement("ul"); ul.className = "plain"; for (const s of lines) ul.append(nodeText("li", s, "mono")); stages.append(ul); }
+    journeyPager.set(evOrder.subarray(evStart[o], evStart[o + 1]));
+    state.journey = journeyPager.summary; state.journey.object = o; state.journey.name = name; state.journey.events = evCount[o];
+    el("journey").dataset.events = String(evCount[o]);
+    if (!el("journey").open) el("journey").showModal();
+  }
+  el("journey-close").addEventListener("click", () => el("journey").close());
+
+  // ---- Summary columns of the objects ----
+  const summaryColumns = [
+    { title: "#", width: "70px", cell: i => nodeText("div", String(i + 1), "mono") },
+    { title: "Object", width: "minmax(260px,1.3fr)", cell: i => { const c = document.createElement("div"); c.append(nodeText("strong", txt(ov("Identity", i)) || txt(ov("ObjectGuid", i)))); c.append(nodeText("small", txt(ov("ObjectGuid", i)), "mono")); return c; } },
+    { title: "Type", width: "90px", cell: i => nodeText("div", txt(ov("Kind", i)) || "-") },
+    { title: "Verdict", width: "170px", cell: i => { const c = document.createElement("div"), v = txt(ov("Verdict", i)); c.append(nodeText("span", v, "badge " + verdictClass(v))); return c; } },
+    { title: "Batches", width: "170px", cell: i => nodeText("div", clip(txt(ov("Batches", i)), 60), "mono") },
+    { title: "Stages", width: "minmax(340px,2fr)", cell: i => nodeText("div", clip(txt(ov("Stages", i)), 300)) },
+    { title: "Events", width: "80px", cell: i => nodeText("div", number(evCount[i])) },
+    { title: "Note", width: "minmax(260px,1.5fr)", cell: i => nodeText("div", clip(txt(ov("Note", i)), 300)) }
+  ];
+  const widthOf = cols => cols.reduce((sum, c) => sum + (/^(\d+)px$/.test(c.width) ? Number(RegExp.$1) : Number((/minmax\((\d+)px/.exec(c.width) || [0, 200])[1])), 0);
+
+  // ---- Filters (they read every object through the typed index arrays) ----
+  const SEARCHED = ["Identity", "ObjectGuid", "Kind", "Verdict", "Batches", "Stages", "Note"];
+  const maskOf = (dict, q) => { const m = new Uint8Array(dict.length); for (let i = 0; i < dict.length; i++) { const v = dict[i]; if (v !== null && v !== undefined && String(v).toLowerCase().includes(q)) m[i] = 1; } return m; };
+  const exactMask = (dict, wanted) => { const m = new Uint8Array(dict.length); for (let i = 0; i < dict.length; i++) if (dict[i] === wanted) m[i] = 1; return m; };
+  const distinct = name => Array.from(new Set(O.dict[OX[name]].filter(v => v !== null && v !== ""))).sort();
+  const order = ["Converted", "Rolled back", "In progress", "Rollback in progress", "Failed", "Rollback failed", "Skipped"];
+  const verdicts = distinct("Verdict").sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99));
+  fill(el("f-verdict"), [["", "All verdicts"]].concat(verdicts.map(v => [v, v])));
+  fill(el("f-kind"), [["", "All types"]].concat(distinct("Kind").map(v => [v, v])));
+  let view = new Uint32Array(0), active = -1;
+  function applyFilters() {
+    const t1 = performance.now(), conds = [];
+    const search = el("f-search").value.trim().toLowerCase(), verdict = el("f-verdict").value, kind = el("f-kind").value, batch = el("f-batch").value.trim().toLowerCase();
+    if (verdict) conds.push([O.col[OX.Verdict], exactMask(O.dict[OX.Verdict], verdict)]);
+    if (kind) conds.push([O.col[OX.Kind], exactMask(O.dict[OX.Kind], kind)]);
+    if (batch) conds.push([O.col[OX.Batches], maskOf(O.dict[OX.Batches], batch)]);
+    const searchCols = search ? SEARCHED.map(name => [O.col[OX[name]], maskOf(O.dict[OX[name]], search)]) : [];
+    const out = new Uint32Array(TOTAL), perVerdict = {}; let n = 0;
+    const verdictCol = O.col[OX.Verdict], verdictDict = O.dict[OX.Verdict];
+    outer: for (let i = 0; i < TOTAL; i++) {
+      for (let c = 0; c < conds.length; c++) if (!conds[c][1][conds[c][0][i]]) continue outer;
+      if (searchCols.length) { let hit = false; for (let s = 0; s < searchCols.length; s++) if (searchCols[s][1][searchCols[s][0][i]]) { hit = true; break; } if (!hit) continue; }
+      out[n++] = i;
+      const vv = txt(verdictDict[verdictCol[i]]); perVerdict[vv] = (perVerdict[vv] || 0) + 1;
+    }
+    view = out.slice(0, n); active = -1; state.shown = n;
+    const chips = el("verdict-chips"); chips.replaceChildren();
+    for (const v of verdicts) if (perVerdict[v]) chips.append(nodeText("span", `${v}: ${number(perVerdict[v])}`, "chip"));
+    el("result-state").textContent = n === TOTAL ? `${number(n)} object(s), no filter.` : `${number(n)} of ${number(TOTAL)} object(s) match the filters.`;
+    state.metrics.lastFilterMs = Math.round(performance.now() - t1);
+    render(true);
+  }
+
+  // ---- Virtual grid: only the visible rows (never more than 200) exist in the page ----
+  const viewport = el("viewport"), spacer = el("spacer"), head = el("grid-head");
+  const OVERSCAN = 10, MAX_MOUNT = 200, ROW = 52, columns = summaryColumns;
+  root.style.setProperty("--cols", columns.map(c => c.width).join(" ")); root.style.setProperty("--gridw", widthOf(columns) + "px"); root.style.setProperty("--rowh", ROW + "px");
+  columns.forEach((c, k) => { const d = nodeText("div", c.title); d.setAttribute("role", "columnheader"); d.setAttribute("aria-colindex", String(k + 1)); head.append(d); });
+  viewport.setAttribute("aria-colcount", String(columns.length));
+  function render(reset) {
+    if (reset) viewport.scrollTop = 0;
+    spacer.style.height = view.length * ROW + "px";
+    el("empty").hidden = view.length > 0;
+    viewport.setAttribute("aria-rowcount", String(view.length + 1));
+    const height = viewport.clientHeight || 600, headHeight = head.offsetHeight || 36;
+    const first = Math.max(0, Math.floor(Math.max(0, viewport.scrollTop - headHeight) / ROW) - OVERSCAN);
+    const last = Math.min(view.length, first + Math.min(MAX_MOUNT, Math.ceil(height / ROW) + 2 * OVERSCAN));
+    const fragment = document.createDocumentFragment();
+    for (let p = first; p < last; p++) {
+      const i = view[p], line = document.createElement("div");
+      line.className = "grid-row" + (p === active ? " active" : "");
+      line.setAttribute("role", "row"); line.setAttribute("aria-rowindex", String(p + 2)); line.id = "row-" + p; line.style.top = p * ROW + "px"; line.dataset.pos = String(p);
+      columns.forEach((c, k) => { const cell = c.cell(i); cell.setAttribute("role", "gridcell"); cell.setAttribute("aria-colindex", String(k + 1)); line.append(cell); });
+      fragment.append(line);
+    }
+    spacer.replaceChildren(fragment);
+    const mounted = last - first; state.mounted = mounted; if (mounted > state.maxMounted) state.maxMounted = mounted;
+    if (active >= 0) viewport.setAttribute("aria-activedescendant", "row-" + active); else viewport.removeAttribute("aria-activedescendant");
+    el("grid-note").textContent = view.length ? `Objects ${number(first + 1)} to ${number(last)} of ${number(view.length)} are in the page. Click an object or press Enter for its journey.` : "";
+  }
+  let ticking = false;
+  viewport.addEventListener("scroll", () => { if (!ticking) { ticking = true; requestAnimationFrame(() => { render(false); ticking = false; }); } });
+  window.addEventListener("resize", () => render(false));
+  function moveTo(p) {
+    if (!view.length) return;
+    active = Math.max(0, Math.min(view.length - 1, p));
+    const top = active * ROW, bottom = top + ROW, hh = head.offsetHeight || 36;
+    if (top < viewport.scrollTop) viewport.scrollTop = top; else if (bottom + hh > viewport.scrollTop + viewport.clientHeight) viewport.scrollTop = bottom + hh - viewport.clientHeight;
+    render(false);
+  }
+  viewport.addEventListener("keydown", e => {
+    const page = Math.max(1, Math.floor((viewport.clientHeight || 600) / ROW) - 1);
+    const keys = { ArrowDown: () => moveTo(active + 1), ArrowUp: () => moveTo(active < 0 ? 0 : active - 1), PageDown: () => moveTo(active + page), PageUp: () => moveTo(active - page), Home: () => moveTo(0), End: () => moveTo(view.length - 1) };
+    if (keys[e.key]) { e.preventDefault(); keys[e.key](); }
+    else if ((e.key === "Enter" || e.key === " ") && active >= 0) { e.preventDefault(); openJourney(view[active]); }
+  });
+  spacer.addEventListener("click", e => { const r = e.target.closest(".grid-row"); if (r) { active = Number(r.dataset.pos); render(false); viewport.focus(); openJourney(view[active]); } });
+
+  // ---- Export of the filtered objects, and of their journeys: ALL matching objects and ALL their events, in batches ----
+  const csvCell = v => {
+    let s = txt(v);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return '"' + s.replace(/"/g, '""') + '"';
+  };
+  async function exportCsv(button, name, header, lineAt) {
+    const started = performance.now(), snapshot = view.slice(); button.disabled = true;
+    try {
+      const parts = ["\ufeff" + header.map(csvCell).join(";") + "\r\n"]; let lines = [], written = 0;
+      for (let p = 0; p < snapshot.length; p++) {
+        for (const line of lineAt(snapshot[p])) {
+          lines.push(line); written++;
+          if (lines.length === 5000) { parts.push(lines.join("\r\n") + "\r\n"); lines = []; el("result-state").textContent = `Exporting ${number(written)} line(s)...`; await new Promise(r => setTimeout(r, 0)); }
+        }
+      }
+      if (lines.length) parts.push(lines.join("\r\n") + "\r\n");
+      const blob = new Blob(parts, { type: "text/csv;charset=utf-8" });
+      const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; document.body.append(a); a.click();
+      state.lastExport = { name: name, lines: written, bytes: blob.size, ms: Math.round(performance.now() - started) };
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+      el("result-state").textContent = `${number(written)} line(s) exported (${number(blob.size)} bytes).`;
+    } catch (error) { el("result-state").textContent = "The export failed: " + (error && error.message ? error.message : "error") + ". The report data is unchanged."; }
+    finally { button.disabled = false; }
+  }
+  el("export-objects").addEventListener("click", () => exportCsv(el("export-objects"), "pra-global-objects-filtered.csv", O.fields,
+    o => [O.fields.map(name => csvCell(ov(name, o))).join(";")]));
+  el("export-events").addEventListener("click", () => exportCsv(el("export-events"), "pra-global-journeys-filtered.csv", ["ObjectGuid", "Identity"].concat(E.fields.filter(n => n !== "Object")),
+    o => Array.from(evOrder.subarray(evStart[o], evStart[o + 1]), i => [csvCell(ov("ObjectGuid", o)), csvCell(ov("Identity", o))].concat(E.fields.filter(n => n !== "Object").map(n => csvCell(ev(n, i)))).join(";"))));
+
+  // ---- Wiring ----
+  let timer = null;
+  const later = () => { clearTimeout(timer); timer = setTimeout(applyFilters, 250); };
+  el("f-search").addEventListener("input", later); el("f-batch").addEventListener("input", later);
+  for (const id of ["f-verdict", "f-kind"]) el(id).addEventListener("change", applyFilters);
+  el("reset").addEventListener("click", () => { el("f-search").value = ""; el("f-batch").value = ""; for (const id of ["f-verdict", "f-kind"]) el(id).value = ""; applyFilters(); });
+  function openFromAddress() {
+    let wanted = ""; try { const m = /^#object=(.+)$/.exec(decodeURIComponent(location.hash)); if (m) wanted = m[1].trim().toLowerCase(); } catch (error) { return; }
+    if (!wanted) return;
+    for (let o = 0; o < TOTAL; o++) if (txt(ov("ObjectGuid", o)).toLowerCase() === wanted || txt(ov("Identity", o)).toLowerCase() === wanted) { openJourney(o); return; }
+  }
+  window.addEventListener("hashchange", openFromAddress);
+
+  el("objects-card").hidden = false;
+  el("grid-note").textContent = TOTAL ? "" : "This batch has no object.";
+  applyFilters();
+  openFromAddress();
+  state.metrics.readyMs = Math.round(performance.now() - t0);
+  root.dataset.objects = String(TOTAL); root.dataset.events = String(E.n);
+  state.phase = "ready"; root.dataset.state = "ready";
+})();
+</script>
+</body></html>

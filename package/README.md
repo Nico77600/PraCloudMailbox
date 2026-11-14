@@ -48,6 +48,8 @@ This folder contains everything needed to run the tool: `Invoke-PraCloudMailbox.
 
 Every command can be narrowed: `-Identity`, `-CsvPath`, `-SearchBase`, `-Group`, `-Scope`, `-MaxObjects`. Without `-Mode Apply` nothing is changed.
 
+What Convert and Recover handle: user mailboxes, shared mailboxes and, if you turn it on, native rooms and equipment. They do **not** recreate contacts, distribution groups, mail-enabled security groups, dynamic distribution groups or Microsoft 365 groups. Collect can keep contacts, distribution groups and dynamic distribution groups in the snapshot, for reference only; Microsoft 365 groups are not collected. The members of the groups you name are used only to choose the objects of a run with `-Group`. Calendar settings are restored only for the native rooms and equipment of the `CloudResource` mode.
+
 ## Protect the snapshot
 
 After the disaster the snapshot file is the **only copy** of the directory data. Back it up every day and **externalise the backup**: off-site, out of reach of the domain that can be compromised (offline, immutable, or separate credentials), in several generations. Restrict the access list of the file and of its backups (no share open to *Domain Users*). Copy the `.sha256` file with the snapshot: Check, Convert and Recover verify the file against it, and a **changed** file stops the run: restore it from the external backup (`-AcceptUnverifiedSnapshot` only when you know why). The journal, `data\PraCloudMailbox-journal.db`, is not covered by the hash because Convert and Recover write it: back it up during the operations.
@@ -67,7 +69,7 @@ Output folders: `Store.Path`, `Store.BackupFolder`, `Store.JournalPath`, `Loggin
 | `Invoke-PraCloudMailbox.ps1` | Entry script. |
 | `module\` | Modules, WPF console (`PRA.Gui*.ps1`, `PRA.Gui.xaml`) and the integrity verifier. |
 | `config\` | Configuration to fill in, the CSV sample and the Entra Connect script sample. |
-| `templates\` | HTML report template. |
+| `templates\` | HTML report templates: the report of a run and the global report of a batch. |
 | `lib\sqlite\` | System.Data.SQLite (SQLite, public domain) for PowerShell 7. |
 | `docs\` | User guide and administrator guide, Markdown and self-contained HTML, with images. |
 | `PraCloudMailbox.psd1`, `PraCloudMailbox.psm1` | Module manifest and root module (loaded by the script). |
