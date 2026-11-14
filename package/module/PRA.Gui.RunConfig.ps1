@@ -4,25 +4,9 @@
 # Dot-sourced by PRA.Gui.psm1.
 
 function Initialize-PcmGuiFolder {
-    <# Creates a folder (and its parents) readable by the current account, SYSTEM and the administrators only; an existing folder is left as it is. #>
+    <# Creates a missing folder (and its parents) readable by the current account, SYSTEM and the administrators only; an existing folder is left as it is. A folder that cannot be created or made private is an error. #>
     param([Parameter(Mandatory)][string]$Path)
-    if (Test-Path -LiteralPath $Path -PathType Container) { return }
-    if (Test-Path -LiteralPath $Path) { throw "A file exists where the folder is expected: $Path" }
-    $parent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))
-    if ($parent) { [void][IO.Directory]::CreateDirectory($parent) }
-    [void][IO.Directory]::CreateDirectory($Path)
-    try {
-        $info = New-Object IO.DirectoryInfo $Path
-        $acl = $info.GetAccessControl()
-        $acl.SetAccessRuleProtection($true, $false)
-        $inherit = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-        $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User
-        foreach ($sid in @($identity.Value, 'S-1-5-18', 'S-1-5-32-544')) {
-            $rule = New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($sid)), [Security.AccessControl.FileSystemRights]::FullControl, $inherit, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
-            [void]$acl.AddAccessRule($rule)
-        }
-        $info.SetAccessControl($acl)
-    } catch { Write-Verbose $_.Exception.Message }
+    Initialize-PcmPrivateFolder -Path $Path
 }
 
 function ConvertTo-PcmGuiDataLiteral {

@@ -41,6 +41,7 @@ $ErrorActionPreference = 'Stop'
     & $verifier -Root $PackageRoot
 } ([IO.Path]::GetDirectoryName($PSScriptRoot))
 # <<< PRA package integrity bootstrap
+Import-Module (Join-Path $PSScriptRoot 'PRA.Common.psm1') -ErrorAction Stop
 $script:SchemaVersion = 3
 $script:SqliteLoaded = $false
 
@@ -198,7 +199,7 @@ function Open-PcmStore {
     $schema = if ($Kind -eq 'Journal') { $script:JournalSchema } else { $script:Schema }
     $expected = if ($Kind -eq 'Journal') { $script:JournalSchemaVersion } else { $script:SchemaVersion }
     $folder = Split-Path -Parent $Path
-    if (-not $ReadOnly -and $folder) { $null = New-Item -ItemType Directory -Path $folder -Force -WhatIf:$false -Confirm:$false }
+    if (-not $ReadOnly -and $folder) { Initialize-PcmPrivateFolder -Path $folder }
     $builder = New-Object System.Data.SQLite.SQLiteConnectionStringBuilder
     $builder.DataSource = $Path
     $builder.ForeignKeys = $true
@@ -548,7 +549,7 @@ function Backup-PcmStore {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param([Parameter(Mandatory)][object]$Connection, [Parameter(Mandatory)][string]$Folder, [Parameter(Mandatory)][string]$Name)
     if ($Name -notmatch '^[A-Za-z0-9_.-]+\z') { throw "Invalid backup file name: $Name" }
-    $null = New-Item -ItemType Directory -Path $Folder -Force -WhatIf:$false -Confirm:$false
+    Initialize-PcmPrivateFolder -Path $Folder
     $target = Join-Path $Folder $Name
     if (Test-Path -LiteralPath $target) { throw "Backup file already exists: $target" }
     if (-not $PSCmdlet.ShouldProcess($target, 'Backup database')) { return '' }
@@ -658,27 +659,6 @@ function Test-PcmSnapshotHash {
 #endregion
 
 #region Lists written by a person ----------------------------------------------------------------
-
-function Read-PcmCsvText {
-    <#
-    .SYNOPSIS
-        The text of a list or CSV file written by a person: a byte order mark (UTF-8, UTF-16) is honoured, a file without one is read as strict UTF-8, and a file that is not valid UTF-8
-        (Excel "CSV", Notepad "ANSI") is read with the ANSI code page of this computer, so that accents are not lost.
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param([Parameter(Mandatory)][string]$Path)
-    $bytes = [IO.File]::ReadAllBytes($Path)
-    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { return [Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3) }
-    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { return [Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2) }
-    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) { return [Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $bytes.Length - 2) }
-    try { return (New-Object Text.UTF8Encoding($false, $true)).GetString($bytes) }
-    catch [Text.DecoderFallbackException] {
-        try { $ansi = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage) }
-        catch { $ansi = [Text.Encoding]::GetEncoding(1252) }
-        return $ansi.GetString($bytes)
-    }
-}
 
 function Get-PcmCsvDelimiter {
     <# The delimiter of a header line that holds the column Identity (comma or semicolon, the column anywhere, letter case and quotes ignored): ',' or ';'. '' when the line has no such column. #>
@@ -846,7 +826,7 @@ function Get-PcmBatchHistory {
 
 Export-ModuleMember -Function Import-PcmSqlite, Open-PcmStore, Close-PcmStore, Invoke-PcmSql, New-PcmSnapshot, Set-PcmSnapshotStatus,
     Add-PcmRow, Get-PcmSnapshot, Get-PcmSnapshotList, Read-PcmTable, Test-PcmTable, Find-PcmTargetGroup, Remove-PcmOldSnapshot, Get-PcmSnapshotDigest, Get-PcmSnapshotInUse, Backup-PcmStore, Get-PcmFileHash, Write-PcmHashFile, Remove-PcmHashFile, Read-PcmHashFile, Test-PcmSnapshotHash,
-    Read-PcmCsvText, Get-PcmCsvDelimiter,
+    Get-PcmCsvDelimiter,
     New-PcmBatch, Set-PcmBatch, Get-PcmBatch, Set-PcmBatchItem, Get-PcmBatchItem, Add-PcmBatchEvent, Set-PcmTenantChange, Get-PcmTenantChange, Add-PcmBatchRun, Get-PcmBatchHistory
 
 # SIG # Begin signature block

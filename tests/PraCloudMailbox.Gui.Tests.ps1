@@ -1715,3 +1715,24 @@ Describe 'Console: the lists of the window virtualize, and the activity log says
         $script:XamlText | Should -Match '(?s)<Style x:Key="PlainList".*?VirtualizingPanel\.VirtualizationMode.*?Recycling.*?</Style>'
     }
 }
+
+Describe 'Console: the folders of a run are created private, and a failure is reported' {
+    It 'creates a missing folder with protected permissions' {
+        $path = Join-Path $TestDrive 'gui-private\logs'
+        & $script:Gui { param($p) Initialize-PcmGuiFolder $p } $path
+        $path | Should -Exist
+        (Get-Acl -LiteralPath $path).AreAccessRulesProtected | Should -BeTrue
+    }
+    It 'leaves an existing folder as it is' {
+        $path = Join-Path $TestDrive 'gui-existing'
+        $null = New-Item -ItemType Directory -Path $path
+        & $script:Gui { param($p) Initialize-PcmGuiFolder $p } $path
+        (Get-Acl -LiteralPath $path).AreAccessRulesProtected | Should -BeFalse
+    }
+    It 'reports a folder that cannot be created instead of going on' {
+        $file = Join-Path $TestDrive 'gui-a-file'
+        Set-Content -LiteralPath $file -Value 'x'
+        { & $script:Gui { param($p) Initialize-PcmGuiFolder $p } $file } | Should -Throw '*a file exists where the folder is expected*'
+        { & $script:Gui { param($p) Initialize-PcmGuiFolder $p } (Join-Path $TestDrive 'gui|bad') } | Should -Throw '*cannot be created*'
+    }
+}

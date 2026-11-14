@@ -970,3 +970,47 @@ Describe 'Entra Connect Script mode: the signed sample runs as it is' {
         (Import-PcmConfiguration -Path (Join-Path $script:Repo 'package\config\PraCloudMailbox.config.psd1') -Root $script:Root).Collect.MaxDropPercent | Should -Be 50
     }
 }
+
+Describe 'The folders of the store are created private' {
+    BeforeAll {
+        function script:Get-FolderSids { param([string]$Path) @((Get-Acl -LiteralPath $Path).Access | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } | Sort-Object -Unique) }
+    }
+    It 'creates the folder of a database with protected permissions: the account, SYSTEM and the Administrators only' {
+        $folder = Join-Path $TestDrive 'private-db\data'
+        $cn = Open-PcmStore -Path (Join-Path $folder 'pra.db') -Root $script:Root
+        Close-PcmStore $cn
+        (Get-Acl -LiteralPath $folder).AreAccessRulesProtected | Should -BeTrue
+        $sids = Get-FolderSids $folder
+        $sids | Should -Contain 'S-1-5-18'
+        $sids | Should -Contain 'S-1-5-32-544'
+        $sids.Count | Should -BeLessOrEqual 3
+    }
+    It 'creates the folder of a journal private as well' {
+        $folder = Join-Path $TestDrive 'private-journal\data'
+        $cn = Open-PcmStore -Path (Join-Path $folder 'journal.db') -Root $script:Root -Kind Journal
+        Close-PcmStore $cn
+        (Get-Acl -LiteralPath $folder).AreAccessRulesProtected | Should -BeTrue
+    }
+    It 'creates the backup folder private' {
+        $cn = Open-PcmStore -Path (Join-Path $TestDrive 'private-backup\pra.db') -Root $script:Root
+        try {
+            $folder = Join-Path $TestDrive 'private-backup\copies'
+            $null = Backup-PcmStore -Connection $cn -Folder $folder -Name 'copy.db' -Confirm:$false
+            (Get-Acl -LiteralPath $folder).AreAccessRulesProtected | Should -BeTrue
+            Join-Path $folder 'copy.db' | Should -Exist
+        } finally { Close-PcmStore $cn }
+    }
+    It 'leaves an existing folder as the administrator set it' {
+        $folder = Join-Path $TestDrive 'existing-db'
+        $null = New-Item -ItemType Directory -Path $folder
+        $cn = Open-PcmStore -Path (Join-Path $folder 'pra.db') -Root $script:Root
+        Close-PcmStore $cn
+        (Get-Acl -LiteralPath $folder).AreAccessRulesProtected | Should -BeFalse
+    }
+    It 'stops with the folder and the reason when the folder cannot be created' {
+        $file = Join-Path $TestDrive 'a-file-not-a-folder'
+        Set-Content -LiteralPath $file -Value 'x'
+        { Open-PcmStore -Path (Join-Path $file 'pra.db') -Root $script:Root } | Should -Throw '*cannot be created*'
+        { Open-PcmStore -Path (Join-Path $TestDrive 'bad|name\pra.db') -Root $script:Root } | Should -Throw '*cannot be created*'
+    }
+}
