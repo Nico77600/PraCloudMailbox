@@ -3634,14 +3634,17 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         $html = [IO.File]::ReadAllText($result.Html)
         $html | Should -Match 'Batch [0-9a-f]{8} from end to end'
         $html | Should -Match 'Polling.IntervalSeconds: 20 -&gt; 5'
-        $html | Should -Match 'Journey of alice@contoso.com'
         $html | Should -Match 'Follow-up check of this run'
-        $html | Should -Not -Match '<script'
+        $html | Should -Not -Match 'https?://'
+        $data = Read-PcmGlobalReportData -Html $html
+        $alice = [array]::IndexOf(@($data.Objects | ForEach-Object { $_.Identity }), 'alice@contoso.com')
+        $alice | Should -BeGreaterOrEqual 0
+        @($data.Events | Where-Object { $_.Object -eq $alice -and $_.Step -eq 'MailboxReady' }).Count | Should -BeGreaterThan 0
         $rows = @(Import-Csv -LiteralPath $result.Csv -Delimiter ';')
         $rows.Count | Should -Be 2
         ($rows | Where-Object Identity -eq 'alice@contoso.com').Verdict | Should -Be 'Rolled back'
         ($rows | Where-Object Identity -eq 'bob@contoso.com').Verdict | Should -Be 'Converted'
-        ($rows | Where-Object Identity -eq 'alice@contoso.com').Journey | Should -Match 'MailboxReady'
+        @(Import-Csv -LiteralPath $result.EventsCsv -Delimiter ';' | Where-Object { $_.Identity -eq 'alice@contoso.com' -and $_.Step -eq 'MailboxReady' }).Count | Should -BeGreaterThan 0
         $result.Html | Should -Match "_batch$convert`_global\.html$"
     }
     It 'records the run in the journal at the end of an Apply, and adds the global report path to the next steps' -Tag 'FollowUp' {

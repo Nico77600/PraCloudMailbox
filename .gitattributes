@@ -27,6 +27,7 @@ package/PackageIntegrity.psd1 -text whitespace=blank-at-eol,space-before-tab,bla
 # Stable hashed files (SHA256 in the signed manifest) and the distribution copy of the changelog.
 package/module/PRA.Gui.xaml -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
 package/templates/Report.template.html -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/templates/GlobalReport.template.html -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
 package/config/Targets.sample.csv -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
 package/lib/sqlite/README.txt -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
 package/README.md -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol

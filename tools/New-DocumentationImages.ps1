@@ -369,7 +369,7 @@ function Save-Report([string]$Path, [string]$Name) {
     $measure = "<script>window.addEventListener('load', () => setTimeout(() => document.body.setAttribute('data-h', Math.ceil(document.body.getBoundingClientRect().height) + 24), 50));</script></body>"
     foreach ($theme in 'light', 'dark') {
         # The report follows the colour scheme of the browser: the picture of the other theme asks for it.
-        $html = $original.Replace('window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"', ('"{0}"' -f $theme)).Replace('@media (prefers-color-scheme:dark){', $(if ($theme -eq 'dark') { '@media all{' } else { '@media not all{' }))
+        $html = $original.Replace('window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"', ('"{0}"' -f $theme)).Replace('@media (prefers-color-scheme:dark){', $(if ($theme -eq 'dark') { '@media all{' } else { '@media not all{' })).Replace('@media (prefers-color-scheme: dark) {', $(if ($theme -eq 'dark') { '@media all {' } else { '@media not all {' }))
         $page = Join-Path $work "$Name-$theme.html"
         [IO.File]::WriteAllText($page, $html.Replace('</body>', $measure), [Text.UTF8Encoding]::new($true))
         Save-Page $page "$Name-$theme" 1280

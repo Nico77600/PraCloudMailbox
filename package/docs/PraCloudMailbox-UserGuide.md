@@ -40,6 +40,9 @@ Think of a fire in an office building. Everyone moves to a temporary office the 
 
 ![The states of a mailbox: before the disaster, after Convert, after Recover](images/readme-states-light.png)
 
+> [!NOTE]
+> **What the tool moves.** The tool moves mailboxes: users and shared mailboxes. If you turn it on, it also moves cloud rooms and equipment. It does **not** recreate contacts, distribution groups, mail-enabled security groups, dynamic distribution groups or Microsoft 365 groups. Collect can keep contacts and groups in the snapshot, but only to look at them. The members of a group are used for one thing: to choose the mailboxes of a run with `-Group`. Calendar settings are restored only for the cloud rooms and equipment that you turned on. The calendar of a user is not touched.
+
 > [!CAUTION]
 > The old mails are **not copied** by this tool. A user keeps what the cloud already holds, mainly the Teams storage. The mails received in the cloud are **kept** when you go back: they stay under an eDiscovery case hold. A shared mailbox becomes an inactive mailbox under the hold. Nothing is deleted. A cloud room or equipment mailbox is different: see [chapter 6.2 of the administrator guide](PraCloudMailbox-Guide.md#62-unsynchronised-native-resource-lifecycle). Ask before you go back.
 
@@ -656,6 +659,8 @@ Every run writes a log, a transcript, a CSV and an HTML **report**. The report i
 | `reports\PRA_<date>_<run>.html` | the report: result, numbers, next step, one row per object |
 | `reports\PRA_<date>_<run>.csv` | the same rows, for Excel |
 | `reports\PraCloudMailbox_<environment>_batch<id>_global.html` | the **global report** of a batch |
+| `reports\PraCloudMailbox_<environment>_batch<id>_global.csv` | the same objects, one line each, for Excel |
+| `reports\PraCloudMailbox_<environment>_batch<id>_global_events.csv` | every step of every object, one line each, for Excel |
 | `logs\PRA_<date>_<run>.log` | every step with its time. The last line is `RESULT: PASS`, `RESULT: PENDING` (exit code 2), `RESULT: FAIL` or `RESULT: CANCELLED` (you answered no to the confirmation: nothing was written). |
 | `logs\PRA_<date>_<run>.transcript.txt` | the PowerShell transcript |
 
@@ -676,7 +681,9 @@ A **warning** is an orange word. It means "done, but read this".
 
 #### The global report
 
-A batch has **one global report**. It follows the batch from end to end: every Convert run, every resume, every follow-up, every Recover wave. Each object has its **journey**. The tool writes it at the end of every Convert, Recover and `Check -Batch`, and puts its path in the **Next steps**. The **Open global report** button opens it.
+A batch has **one global report**. It follows the batch from end to end: every Convert run, every resume, every follow-up, every Recover wave. Each object has its **journey**: every step, in time order. The tool writes it at the end of every Convert, Recover and `Check -Batch`, and puts its path in the **Next steps**. The **Open global report** button opens it.
+
+The global report has **no limit**. Every object and every step is in it, however many there are. The top of the page is plain text: the totals, the batches and the runs. You can read it even when scripts are blocked. The list of objects below it needs Edge or Chrome. Click an object to read its whole journey. The journey comes in pages of 100 steps. The two CSV files hold the same data for Excel: one line per object, and one line per step.
 
 ![The global report of a batch: the runs, then every object end to end](images/report-global-light.png)
 

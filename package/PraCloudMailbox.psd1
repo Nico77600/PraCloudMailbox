@@ -33,9 +33,10 @@
         'Write-PcmBanner', 'Write-PcmStep', 'Write-PcmPlan', 'Write-PcmStepState', 'Write-PcmStepCount', 'Write-PcmSummary', 'Write-PcmHost', 'Resolve-PcmPath',
         'Import-PcmConfiguration', 'Initialize-PcmAudit', 'Get-PcmOutcome', 'Complete-PcmRun', 'Write-PcmEvent', 'Test-PcmStopRequest', 'Request-PcmOperator',
         'Get-PcmToolVersion', 'Test-PcmSameText', 'Get-PcmDistinctText', 'Resolve-PcmOfficialValue', 'Get-PcmCloudModuleReport', 'Get-PcmReportHtml', 'Write-PcmReportHtml',
-        'Read-PcmReportData', 'ConvertTo-PcmHtmlText', 'Get-PcmGlobalModel', 'Write-PcmGlobalReport', 'Write-PcmGlobalReportHtml', 'Write-PcmGlobalReportCsv', 'Format-PcmUtcText',
+        'Read-PcmReportData', 'ConvertTo-PcmHtmlText', 'Get-PcmGlobalModel', 'Write-PcmGlobalReport', 'Write-PcmGlobalReportHtml', 'Write-PcmGlobalReportCsv', 'Write-PcmGlobalEventsCsv', 'Read-PcmGlobalReportData', 'Format-PcmUtcText',
         'Get-PcmConfigurationDifference', 'Get-PcmConfigurationFlat', 'ConvertTo-PcmScheduleTime', 'ConvertTo-PcmPlainMessage', 'Test-PcmSystemMailboxName', 'ConvertTo-PcmDnKey', 'ConvertFrom-PcmDnToCanonical', 'Test-PcmInSearchBase',
         'ConvertTo-PcmGuidKey', 'New-PcmRecordIndex', 'Find-PcmRecord',
+        'Initialize-PcmPrivateFolder', 'ConvertTo-PcmCsvCell', 'ConvertTo-PcmCsvRow', 'Read-PcmCsvText',
         # Snapshot and journal store (PRA.Store)
         'Import-PcmSqlite', 'Open-PcmStore', 'Close-PcmStore', 'Invoke-PcmSql', 'New-PcmSnapshot', 'Set-PcmSnapshotStatus', 'Add-PcmRow', 'Get-PcmSnapshot', 'Get-PcmSnapshotList',
         'Read-PcmTable', 'Test-PcmTable', 'Find-PcmTargetGroup', 'Remove-PcmOldSnapshot', 'Backup-PcmStore', 'Get-PcmFileHash', 'Write-PcmHashFile', 'Remove-PcmHashFile', 'Read-PcmHashFile', 'Test-PcmSnapshotHash', 'New-PcmBatch', 'Set-PcmBatch', 'Get-PcmBatch', 'Set-PcmBatchItem',
