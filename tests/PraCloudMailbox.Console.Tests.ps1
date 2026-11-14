@@ -315,6 +315,7 @@ Describe 'Console: a batch end to end' {
         $next.Count | Should -BeGreaterThan 1
         ($next | ForEach-Object { $_.Text }) -join "`n" | Should -Match ('\.\\Invoke-PraCloudMailbox\.ps1 -Action Recover -Batch {0} -ConfigPath' -f $script:Batch)
         ($next | ForEach-Object { $_.Text }) -join "`n" | Should -Match 'Global report of batch'
+        ($next | ForEach-Object { $_.Text }) -join "`n" | Should -Match 'Events of batch'
     }
     It 'follows the batch with a Check: 4 steps for 4 announced, the expected state and the single look in the next steps' {
         $follow = Invoke-Console @{ Action = 'Check'; Batch = $script:Batch; Expect = 'provisioned'; Once = $true }

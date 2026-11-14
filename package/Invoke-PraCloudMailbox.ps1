@@ -3481,6 +3481,7 @@ function Write-PcmBatchRecord {
     if ($report.Html) {
         $context.GlobalReportPath = [string]$report.Html
         $lines = @(('Global report of batch {0} (every run and every object of the batch):' -f $convertId), [string]$report.Html)
+        if ($report.EventsCsv) { $lines += @(('Events of batch {0} (CSV, one line per event of every object):' -f $convertId), [string]$report.EventsCsv) }
         $context.NextSteps = @(@($context.NextSteps) + $lines)
         $context.FallbackNext = @(@($context.FallbackNext) + $lines)
     }

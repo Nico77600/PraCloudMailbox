@@ -3657,8 +3657,11 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         Write-PcmBatchRecord
         $context.GlobalReportPath | Should -Match "_batch$convert`_global\.html$" -Because (@(Get-Content -LiteralPath $context.LogFile | Where-Object { $_ -match 'WARN|ERROR' }) -join ' | ')
         $context.GlobalReportPath | Should -Exist
-        @($context.NextSteps)[-2] | Should -Match "^Global report of batch $convert"
-        @($context.NextSteps)[-1] | Should -Be $context.GlobalReportPath
+        @($context.NextSteps)[-4] | Should -Match "^Global report of batch $convert"
+        @($context.NextSteps)[-3] | Should -Be $context.GlobalReportPath
+        @($context.NextSteps)[-2] | Should -Match "^Events of batch $convert"
+        @($context.NextSteps)[-1] | Should -Match "_batch$convert`_global_events\.csv$"
+        @($context.NextSteps)[-1] | Should -Exist
         Close-E2E
         $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal -ReadOnly
         try {
