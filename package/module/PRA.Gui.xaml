@@ -155,6 +155,9 @@
     <Style x:Key="PlainList" TargetType="ListBox">
       <Setter Property="BorderThickness" Value="0"/><Setter Property="Background" Value="Transparent"/>
       <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled"/>
+      <Setter Property="ScrollViewer.CanContentScroll" Value="True"/>
+      <Setter Property="VirtualizingPanel.IsVirtualizing" Value="True"/>
+      <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling"/>
       <Setter Property="ItemContainerStyle" Value="{StaticResource RowItem}"/>
     </Style>
 
@@ -707,8 +710,9 @@
                 <Grid.ColumnDefinitions><ColumnDefinition Width="34"/><ColumnDefinition Width="190"/><ColumnDefinition Width="260"/><ColumnDefinition Width="80"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                 <TextBlock Grid.Column="1" Text="NAME" Style="{StaticResource Label}"/><TextBlock Grid.Column="2" Text="ACCOUNT" Style="{StaticResource Label}"/><TextBlock Grid.Column="3" Text="TYPE" Style="{StaticResource Label}"/><TextBlock Grid.Column="4" Text="IN THE CLOUD" Style="{StaticResource Label}"/>
               </Grid>
-              <ScrollViewer Grid.Row="1" MaxHeight="190" VerticalScrollBarVisibility="Auto">
-                <ItemsControl x:Name="WaveGrid">
+                <ItemsControl x:Name="WaveGrid" Grid.Row="1" MaxHeight="190" ScrollViewer.CanContentScroll="True" ScrollViewer.VerticalScrollBarVisibility="Auto" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling">
+                  <ItemsControl.Template><ControlTemplate TargetType="ItemsControl"><ScrollViewer Focusable="False" Padding="{TemplateBinding Padding}"><ItemsPresenter/></ScrollViewer></ControlTemplate></ItemsControl.Template>
+                  <ItemsControl.ItemsPanel><ItemsPanelTemplate><VirtualizingStackPanel/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
                   <ItemsControl.ItemTemplate><DataTemplate>
                     <Grid Height="30">
                       <Grid.ColumnDefinitions><ColumnDefinition Width="34"/><ColumnDefinition Width="190"/><ColumnDefinition Width="260"/><ColumnDefinition Width="80"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
@@ -720,7 +724,6 @@
                     </Grid>
                   </DataTemplate></ItemsControl.ItemTemplate>
                 </ItemsControl>
-              </ScrollViewer>
             </Grid>
           </Border>
         </StackPanel>
@@ -891,7 +894,7 @@
             <TextBox x:Name="DetRaw" Style="{StaticResource Mono}" MaxHeight="130" MinHeight="40" VerticalScrollBarVisibility="Auto" FontSize="11"/>
           </Expander>
           <Expander x:Name="LogExpander" Header="Activity log" Margin="0,2,0,0">
-            <ListBox x:Name="ActivityLog" MaxHeight="150" Margin="0,4,0,0" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+            <ListBox x:Name="ActivityLog" MaxHeight="150" Margin="0,4,0,0" ScrollViewer.HorizontalScrollBarVisibility="Disabled" ScrollViewer.CanContentScroll="True" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling">
               <ListBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Text}" Foreground="{Binding Brush}" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11"/></DataTemplate></ListBox.ItemTemplate>
             </ListBox>
           </Expander>

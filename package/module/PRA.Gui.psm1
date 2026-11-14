@@ -623,6 +623,17 @@ function Get-PcmGuiWindowRequest {
             }
             $values.CsvPath = $g.WaveFile
         }
+        elseif ($action -eq 'Recover' -and @($g.SelectedBatch.Wave).Count) {
+            $remaining = @($g.SelectedBatch.Wave)
+            $selectionKey = Get-PcmGuiSelectionKey -Prefix ('continue-' + $values.Batch) -Guids @($remaining | ForEach-Object { $_.Guid })
+            if (-not $g.WaveFile -or -not $g.WaveKey -or $g.WaveKey -ne $selectionKey) {
+                $folder = Join-Path (Join-Path $g.Root 'logs') 'gui'
+                Initialize-PcmGuiFolder (Join-Path $g.Root 'logs'); Initialize-PcmGuiFolder $folder
+                $g.WaveFile = Write-PcmGuiWave -Folder $folder -Name $values.Batch -Rows $remaining
+                $g.WaveKey = $selectionKey
+            }
+            $values.CsvPath = $g.WaveFile
+        }
         if ($action -eq 'Check') {
             $values.Expect = Get-PcmGuiField 'Expect'
             $values.Once = [bool](Get-PcmGuiField 'Once')
