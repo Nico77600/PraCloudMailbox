@@ -88,7 +88,13 @@ function Connect-PcmExchange {
         throw ("Cannot open the remote session to Exchange on {0}: {1} Collect needs a domain-joined computer, an account allowed to use Exchange remote PowerShell, and an Exchange server that answers on {2} with Kerberos." -f $server, $_.Exception.Message.Trim(), $uri)
     }
     $Context.Server = $server
-    if (Get-Command Set-ADServerSettings -ErrorAction SilentlyContinue) { Set-ADServerSettings -ViewEntireForest $true -ErrorAction SilentlyContinue }
+    try {
+        if (-not (Get-Command Set-ADServerSettings -ErrorAction SilentlyContinue)) { throw 'the command Set-ADServerSettings is not available to this account' }
+        Set-ADServerSettings -ViewEntireForest $true -ErrorAction Stop
+    } catch {
+        Disconnect-PcmExchange -Context $Context
+        throw ("Collect cannot read the whole forest on {0}: {1}. Without it Exchange would answer for its own domain only, and the mailboxes of the other domains would be missing from the snapshot. Check that the account is in the Exchange role group View-Only Organization Management, wait a few minutes for the change to replicate, then run Collect again. Nothing was written." -f $server, $_.Exception.Message.Trim().TrimEnd('.'))
+    }
     $version = ''
     $shortName = ($server -split '\.')[0]
     try { $found = Get-ExchangeServer -ErrorAction Stop | Where-Object { $_.Name -eq $shortName } | Select-Object -First 1; if ($found) { $version = [string]$found.AdminDisplayVersion } } catch { $version = '' }
@@ -181,23 +187,45 @@ function Get-PcmGroupMemberDn {
             $dn = ConvertTo-PcmDistinguishedName $member
             if (-not $dn) { continue }
             $isGroup = $false
-            try { $null = Get-Group -Identity $dn -ErrorAction Stop @dc; $isGroup = $true } catch { $isGroup = $false }
+            try { $null = Get-Group -Identity $dn -ErrorAction Stop @dc; $isGroup = $true }
+            catch {
+                if (-not (Test-PcmNotFoundError -ErrorRecord $_)) { throw ('the member {0} of group {1} could not be read to tell whether it is a group: {2}' -f $dn, $current, $_.Exception.Message.Trim()) }
+                $isGroup = $false
+            }
             if ($isGroup) { $queue.Enqueue($dn) } elseif ($listed.Add($dn)) { [void]$result.Add($dn) }
         }
     }
     return $result.ToArray()
 }
 
+function Test-PcmNotFoundError {
+    <# Is this error the answer "there is no such object" (Exchange: ManagementObjectNotFoundException), as opposed to a read that failed (session, network, server busy)? #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$ErrorRecord)
+    $text = '{0} {1}' -f $ErrorRecord.FullyQualifiedErrorId, $ErrorRecord.Exception.Message
+    return $text -match 'ManagementObjectNotFound|couldn.t be found|could not be found|no such object|\b(group|object|mailbox|recipient|user)\b[^.]*\b(not found|does not exist)'
+}
+
+function Get-PcmLdapPath {
+    <# The LDAP path of a distinguished name for ADSI: the "/" of a name is escaped (ADSI reads an unescaped "/" as the end of the name), the domain controller is named when one is set. #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][string]$DistinguishedName, [AllowEmptyString()][string]$DomainController = '')
+    $escaped = $DistinguishedName.Replace('/', '\/')
+    if ($DomainController) { return "LDAP://$DomainController/$escaped" }
+    return "LDAP://$escaped"
+}
+
 function Get-PcmDirectoryObject {
     <#
     .SYNOPSIS
         One Active Directory object read with ADSI, whatever its class (user, computer, contact, group): class, names, GUID. $null when it cannot be read.
+    .PARAMETER Strict
+        $null only when the object does not exist; any other failure of the read (the domain controller does not answer) is thrown, so that it is not taken for a missing object.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$DistinguishedName)
-    $dc = [string]$Context.Config.Exchange.DomainController
-    $escaped = $DistinguishedName.Replace('/', '\/')
-    $path = if ($dc) { "LDAP://$dc/$escaped" } else { "LDAP://$escaped" }
+    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$DistinguishedName, [switch]$Strict)
+    $path = Get-PcmLdapPath -DistinguishedName $DistinguishedName -DomainController ([string]$Context.Config.Exchange.DomainController)
     $entry = $null
     try {
         $entry = New-Object System.DirectoryServices.DirectoryEntry($path)
@@ -210,7 +238,10 @@ function Get-PcmDirectoryObject {
             Class = $class; Name = (& $read 'name'); Sam = (& $read 'sAMAccountName'); Upn = (& $read 'userPrincipalName'); Smtp = (& $read 'mail')
             DisplayName = (& $read 'displayName'); Dn = $DistinguishedName; Guid = $(if ($bytes.Count -and $bytes[0] -is [byte[]]) { ([guid]$bytes[0]).ToString() } else { '' })
         }
-    } catch { return $null }
+    } catch {
+        if ($Strict -and -not (Test-PcmNotFoundError -ErrorRecord $_)) { throw }
+        return $null
+    }
     finally { if ($entry) { try { $entry.PSBase.Dispose() } catch { $null = $_ } } }
 }
 
@@ -298,15 +329,22 @@ function Get-PcmScopeMailbox {
             'OU' { $mailboxes = @(Get-Mailbox -OrganizationalUnit $scope.SearchBase -ResultSize Unlimited -RecipientTypeDetails $types -ErrorAction Stop @dc) }
             'Group' {
                 foreach ($dn in (Get-PcmGroupMemberDn -Context $Context -Identity $scope.GroupDN)) {
-                    $mailbox = Get-Mailbox -Identity $dn -ErrorAction SilentlyContinue @dc
+                    $mailbox = $null
+                    try { $mailbox = Get-Mailbox -Identity $dn -ErrorAction Stop @dc }
+                    catch {
+                        if (-not (Test-PcmNotFoundError -ErrorRecord $_)) { throw ("Collect stopped before writing the snapshot: the member {0} of the group {1} could not be read ({2}). Run Collect again; a member that cannot be read is never taken for a member without mailbox." -f $dn, $scope.GroupDN, $_.Exception.Message.Trim()) }
+                    }
                     if ($mailbox -and [string]$mailbox.RecipientTypeDetails -in $types) { $mailboxes += $mailbox; continue }
                     if ($mailbox) { [void]$Context.Excluded.Add(('{0}: {1} not in scope' -f $mailbox.Name, $mailbox.RecipientTypeDetails)); continue }
                     [void]$Context.Excluded.Add(('{0}: {1}' -f (Get-PcmMemberLabel -Context $Context -DistinguishedName $dn), (Get-PcmNoMailboxReason -Context $Context -DistinguishedName $dn)))
                 }
             }
             'Csv' {
-                $entries = @(Import-Csv -LiteralPath $scope.CsvPath)
-                if ($entries.Count -and -not $entries[0].PSObject.Properties['Identity']) { throw "Scope.CsvPath: column Identity missing ($($scope.CsvPath))." }
+                $csvText = Read-PcmCsvText -Path $scope.CsvPath
+                if ([string]::IsNullOrWhiteSpace($csvText)) { throw "Scope.CsvPath: the file is empty ($($scope.CsvPath))." }
+                $csvDelimiter = Get-PcmCsvDelimiter (($csvText -split '\r?\n', 2)[0])
+                if (-not $csvDelimiter) { throw "Scope.CsvPath: column Identity missing, or the columns are not separated by a comma or a semicolon ($($scope.CsvPath))." }
+                $entries = @(ConvertFrom-Csv -InputObject $csvText -Delimiter $csvDelimiter -ErrorAction Stop)
                 foreach ($entry in $entries) {
                     $identityText = ([string]$entry.Identity).Trim()
                     if (-not $identityText) { continue }
@@ -584,6 +622,8 @@ function Get-PcmTargetGroup {
         $queue.Enqueue([pscustomobject]@{ Source = $found; Guid = $topGuid; Depth = 1 })
         [void]$seen.Add($topGuid)
         $rows = [System.Collections.Generic.List[object]]::new()
+        $unreadable = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $unreadableList = [System.Collections.Generic.List[string]]::new()
         $count = 0
         try {
             while ($queue.Count) {
@@ -594,9 +634,10 @@ function Get-PcmTargetGroup {
                     if (-not (ConvertTo-PcmDistinguishedName $member)) { continue }
                     $dn = Resolve-PcmMemberDn -Context $Context -Member $member
                     if (-not $dn) { throw ('the member {0} cannot be found in Active Directory' -f (ConvertTo-PcmDistinguishedName $member)) }
-                    $object = Get-PcmDirectoryObject -Context $Context -DistinguishedName $dn
+                    $object = Get-PcmDirectoryObject -Context $Context -DistinguishedName $dn -Strict
                     $class = if ($object) { [string]$object.Class } else { 'Unknown' }
                     $guid = if ($object) { ([string]$object.Guid).ToLowerInvariant() } else { '' }
+                    if (-not $object -and $unreadable.Add($dn)) { $unreadableList.Add($dn) }
                     if ($class -eq 'Group' -and $guid) {
                         if ($seen.Add($guid)) {
                             $queue.Enqueue([pscustomobject]@{ Source = [pscustomobject]@{ DistinguishedName = $dn }; Guid = $guid; Depth = ($current.Depth + 1) })
@@ -616,6 +657,9 @@ function Get-PcmTargetGroup {
         } catch {
             [void]$warnings.Add(('Target group {0}: its members could not all be read ({1}); the group is not captured.' -f $value, $_.Exception.Message))
             continue
+        }
+        if ($unreadableList.Count) {
+            [void]$warnings.Add(('Target group {0}: {1} member(s) do not exist in Active Directory any more and are stored as Unknown, which a run skips ({2}{3}).' -f $value, $unreadableList.Count, (($unreadableList | Select-Object -First 3) -join '; '), $(if ($unreadableList.Count -gt 3) { '; ...' } else { '' })))
         }
         foreach ($row in $rows) { [void]$members.Add($row) }
         [void]$groups.Add([ordered]@{ group_guid = $topGuid; name = [string]$found.Name; sam_account_name = [string]$found.SamAccountName
@@ -687,8 +731,7 @@ function Get-PcmDelegateListLink {
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$DistinguishedName)
-    $dc = [string]$Context.Config.Exchange.DomainController
-    $path = if ($dc) { "LDAP://$dc/$DistinguishedName" } else { "LDAP://$DistinguishedName" }
+    $path = Get-PcmLdapPath -DistinguishedName $DistinguishedName -DomainController ([string]$Context.Config.Exchange.DomainController)
     $entry = New-Object System.DirectoryServices.DirectoryEntry($path)
     try { return @($entry.Properties['msExchDelegateListLink'] | ForEach-Object { [string]$_ }) }
     finally { $entry.Dispose() }
@@ -752,6 +795,7 @@ function Get-PcmSharedPermission {
             try {
                 foreach ($memberDn in (Get-PcmGroupMemberDn -Context $Context -Identity $resolved.Dn)) {
                     $member = Resolve-PcmTrustee -Context $Context -Trustee $memberDn
+                    if (-not $member.Resolved) { [void]$warnings.Add(('{0}: member {1} of group {2} could not be read ({3}); it is stored as Unknown' -f $Mailbox.PrimarySmtpAddress, $memberDn, $resolved.Name, $member.Note)) }
                     [void]$members.Add([ordered]@{
                         group_guid = $resolved.Guid; member_guid = $member.Guid; member_kind = $member.Kind; member_upn = $member.Upn
                         member_smtp = $member.Smtp; member_name = $member.Name; via_group_guid = $resolved.Guid; depth = 1
@@ -1136,7 +1180,7 @@ function Register-PcmCollectTask {
 
 Export-ModuleMember -Function Connect-PcmExchange, Disconnect-PcmExchange, Get-PcmRecipientType, Get-PcmScopeMailbox, Get-PcmGroupMemberDn,
     ConvertTo-PcmImmutableId, ConvertTo-PcmSizeBytes, ConvertTo-PcmMailboxRecord, Test-PcmExcludedTrustee, Resolve-PcmTrustee,
-    Get-PcmDelegateListLink, Get-PcmSharedPermission, Get-PcmContact, Get-PcmDistributionGroup, Get-PcmResourceSettings, Get-PcmTargetGroup, Find-PcmExchangeGroup, Get-PcmDirectoryObject,
+    Get-PcmDelegateListLink, Get-PcmSharedPermission, Get-PcmContact, Get-PcmDistributionGroup, Get-PcmResourceSettings, Get-PcmTargetGroup, Find-PcmExchangeGroup, Get-PcmDirectoryObject, Get-PcmLdapPath, Test-PcmNotFoundError,
     Test-PcmElevated, Test-PcmInteractiveHost, Test-PcmScheduleWindow, Hide-PcmPassword, Get-PcmScheduleSetting, Get-PcmDirectoryAccount, Get-PcmScheduleAccount, Test-PcmExchangeAccess,
     Test-PcmDomainController, Export-PcmUserRight, Test-PcmBatchLogonRight, Get-PcmScheduledCollectTask, Register-PcmCollectTask
 

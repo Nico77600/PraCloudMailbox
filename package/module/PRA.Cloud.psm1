@@ -3015,7 +3015,8 @@ function Invoke-PcmEntraConnect {
     .DESCRIPTION
         EntraConnect.Mode:
           Remoting  Invoke-Command to EntraConnect.Server (ADSync cmdlets), with the current account.
-          Script    EntraConnect.ScriptPath -Operation <op>: any way to reach the server (exit 0 = done).
+          Script    EntraConnect.ScriptPath -Operation <op>: any way to reach the server (exit 0 = done). EntraConnect.Server and EntraConnect.CredentialPath are given
+                    as -Server and -CredentialPath to a script that declares those parameters (the sample does), so that a signed script needs no edit.
           Manual    The operator does it; the tool asks for a confirmation (in the console, or in the window when the
                     run belongs to it; impossible with -Force in the console).
     #>
@@ -3063,10 +3064,17 @@ function Invoke-PcmEntraConnect {
         'Script' {
             # A script that ends without 'exit' leaves $LASTEXITCODE unset (StrictMode) or at the value of an earlier call.
             $global:LASTEXITCODE = 0
-            $output = & $entra.ScriptPath -Operation $Operation
+            # The server and the credential file of the configuration go to a script that declares -Server and -CredentialPath (the signed sample does), so that it runs as it is signed;
+            # a script of the administrator that does not declare them gets -Operation only.
+            $scriptArguments = @{ Operation = $Operation }
+            $declared = (Get-Command -Name $entra.ScriptPath -CommandType ExternalScript -ErrorAction Stop).Parameters
+            if ($entra.Server -and $declared.ContainsKey('Server')) { $scriptArguments.Server = [string]$entra.Server }
+            if ((Get-PcmValue $entra 'CredentialPath' '') -and $declared.ContainsKey('CredentialPath')) { $scriptArguments.CredentialPath = [string]$entra.CredentialPath }
+            $output = & $entra.ScriptPath @scriptArguments
             $code = Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly -ErrorAction SilentlyContinue
-            if ($code) { throw "EntraConnect.ScriptPath -Operation $Operation ended with exit code $code." }
-            return (@($output | ForEach-Object { [string]$_ -split '\r?\n' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | ')
+            $lines = (@($output | ForEach-Object { [string]$_ -split '\r?\n' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | ')
+            if ($code) { throw "EntraConnect.ScriptPath -Operation $Operation ended with exit code $code$(if ($lines) { ': ' + $lines } else { '.' })" }
+            return $lines
         }
         'Manual' {
             $text = @{ Pause = 'Pause the Entra Connect scheduler (Set-ADSyncScheduler -SyncCycleEnabled $false)'; Resume = 'Resume the Entra Connect scheduler (Set-ADSyncScheduler -SyncCycleEnabled $true)'; Delta = 'Run a delta synchronisation (Start-ADSyncSyncCycle -PolicyType Delta) and wait for its end' }[$Operation]

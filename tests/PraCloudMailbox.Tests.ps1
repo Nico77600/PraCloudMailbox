@@ -336,13 +336,13 @@ Describe 'SQLite store' {
         (Invoke-PcmSql $script:cn "SELECT value FROM meta WHERE key = 'schema_version'" -As Scalar) | Should -Be '3'
         @(Read-PcmTable $script:cn mailbox $id)[0].resource_settings_json | Should -BeNullOrEmpty
     }
-    It 'round-trips resource settings, and the journal holds the runs of a batch (schema 2)' {
+    It 'round-trips resource settings, and the journal holds the runs of a batch (schema 3)' {
         $id = New-PcmSnapshot $script:cn @{ RunId = 'resource' }
         $settings = '{"SchemaVersion":1,"Capacity":12,"Calendar":{"AutomateProcessing":"AutoAccept"}}'
         $null = Add-PcmRow $script:cn mailbox $id @(@{ object_guid = 'room'; kind = 'Room'; resource_settings_json = $settings })
         (@(Read-PcmTable $script:cn mailbox $id)[0].resource_settings_json | ConvertFrom-Json).Capacity | Should -Be 12
         $journal = Open-PcmStore -Path (Join-Path $TestDrive 'resource-journal.db') -Root $script:Root -Kind Journal
-        try { (Invoke-PcmSql $journal "SELECT value FROM meta WHERE key = 'schema_version'" -As Scalar) | Should -Be '2' }
+        try { (Invoke-PcmSql $journal "SELECT value FROM meta WHERE key = 'schema_version'" -As Scalar) | Should -Be '3' }
         finally { Close-PcmStore $journal }
     }
 }
@@ -393,7 +393,7 @@ Describe 'Collect: mailboxes' {
             switch ($Identity) {
                 'CN=G1' { [pscustomobject]@{ Members = @('CN=u1', 'CN=G2') } }
                 'CN=G2' { [pscustomobject]@{ Members = @('CN=u2', 'CN=G1') } }
-                default { throw 'not a group' }
+                default { throw "The operation couldn't be performed because object '$Identity' couldn't be found on 'dc01.contoso.com'." }
             }
         }
         Mock -ModuleName PRA.Collect Get-Mailbox { New-FakeMailbox -Sam ($Identity -replace 'CN=', '') }
@@ -640,7 +640,8 @@ Describe 'Collect: target groups' {
         $result.Groups[0].sam_account_name | Should -Be 'wave1'
         $result.Groups[0].primary_smtp_address | Should -Be 'wave1@contoso.com'
         $result.Groups[0].member_count | Should -Be 5
-        @($result.Warnings).Count | Should -Be 0
+        @($result.Warnings).Count | Should -Be 1
+        $result.Warnings[0] | Should -BeLike 'Target group *: 1 member(s) do not exist in Active Directory any more and are stored as Unknown, which a run skips (CN=Gone)*'
         $classes = @{}; foreach ($row in $result.Members) { $classes[$row.member_dn] = $row }
         $classes['CN=u1'].member_class | Should -Be 'User'
         $classes['CN=PC1'].member_class | Should -Be 'Computer'
@@ -661,8 +662,9 @@ Describe 'Collect: target groups' {
         $result = Get-PcmTargetGroup -Context (New-TestContext $config)
         @($result.Groups).Count | Should -Be 1
         $result.Groups[0].name | Should -Be 'PRA-Wave1'
-        @($result.Warnings).Count | Should -Be 1
+        @($result.Warnings).Count | Should -Be 2
         $result.Warnings[0] | Should -Match 'Missing Group not found in Active Directory'
+        $result.Warnings[1] | Should -Match 'CN=Gone'
     }
     It 'does not capture a group whose members cannot all be read, and says so' {
         $config = New-TestConfig
@@ -757,7 +759,7 @@ Describe 'Collect: shared mailbox permissions' {
         Mock -ModuleName PRA.Collect Get-Group {
             switch -Wildcard ($Identity) {
                 '*GRP-Compta*' { [pscustomobject]@{ Guid = 'g1'; Name = 'GRP-Compta'; DistinguishedName = 'CN=GRP-Compta,OU=PRA,DC=contoso,DC=com'; Members = @('CN=user03,OU=PRA,DC=contoso,DC=com') } }
-                default { throw 'not a group' }
+                default { throw "The operation couldn't be performed because object '$Identity' couldn't be found on 'dc01.contoso.com'." }
             }
         }
         Mock -ModuleName PRA.Collect Get-PcmDelegateListLink { @('CN=user01,OU=PRA,DC=contoso,DC=com') }
@@ -836,6 +838,7 @@ Describe 'Collect: end to end (synthetic Exchange, remote session)' {
         }
         $stubs = @'
 function global:Get-ExchangeServer { @([pscustomobject]@{ Name = $env:COMPUTERNAME; AdminDisplayVersion = 'Version 15.2 (Build 2562.17)' }) }
+function global:Set-ADServerSettings { param($ViewEntireForest) }
 function global:Get-Mailbox { param($Identity, $OrganizationalUnit, $ResultSize, $RecipientTypeDetails, $DomainController) $global:PraSyntheticCollect.Mailboxes }
 function global:Get-CalendarProcessing { param($Identity, $DomainController) $global:PraSyntheticCollect.Calendar }
 function global:Get-MailboxCalendarConfiguration {
@@ -898,6 +901,7 @@ exit `$result.ExitCode
         Set-Content -LiteralPath $configPath -Value (ConvertTo-Psd1 $config) -Encoding UTF8
         $stubs = @'
 function global:Get-ExchangeServer { ConvertTo-PcmDeserialized @([pscustomobject]@{ Name = 'ex1'; AdminDisplayVersion = 'Version 15.2 (Build 1748.10)' }) }
+function global:Set-ADServerSettings { param($ViewEntireForest) }
 function global:Get-Mailbox { param($Identity, $OrganizationalUnit, $ResultSize, $RecipientTypeDetails, $DomainController)
     $make = { param($sam, $type) [pscustomobject]@{ Guid = [guid]::NewGuid().ToString(); Identity = $sam; Name = $sam; DisplayName = $sam; Alias = $sam; SamAccountName = $sam
         UserPrincipalName = "$sam@contoso.com"; DistinguishedName = "CN=$sam,OU=PRA,DC=contoso,DC=com"; OrganizationalUnit = 'contoso.com/PRA'; PrimarySmtpAddress = "$sam@contoso.com"

@@ -105,6 +105,8 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
             param([ValidateSet('Check', 'Convert', 'Recover')][string]$Action, [string]$Mode = 'Apply', [string]$Batch = '', [string]$Identity = '', [string]$Scope = 'All', [Alias('IdentityPath')][string]$CsvPath = '',
                 [string]$SearchBase = '', [string]$Group = '', [int]$MaxObjects = 0, [string]$Expect = '', [switch]$Once, [switch]$ResolveOnly)
             Close-E2E
+            # The snapshot file is the one that a Collect left, with its hash file (a Convert or a Recover in Apply mode stops on a snapshot that has none).
+            if (Test-Path -LiteralPath $global:PraE2E.Db -PathType Leaf) { $null = Write-PcmHashFile -Path $global:PraE2E.Db }
             $config = Import-PcmConfiguration -Path $global:PraE2E.Config -Root $global:PraE2E.Root
             $run = @{ Root = $global:PraE2E.Root; Version = 'test'; RunId = [guid]::NewGuid().ToString('N'); StartTime = Get-Date; Action = $Action; Mode = $Mode; Phase = ''
                 CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; StepTotal = 7; Warnings = 0

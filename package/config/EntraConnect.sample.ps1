@@ -23,24 +23,40 @@
     (the file can only be read by the same Windows account on the same computer). The account needs to be
     a member of ADSyncAdmins on the Entra Connect server and allowed to use WinRM there.
 
+    The sample is signed and runs as it is: the tool gives it the server (EntraConnect.Server) and the credential
+    file (EntraConnect.CredentialPath, default .\config\EntraConnect.cred.xml) of the configuration, so there is
+    nothing to edit in it. A script of your own that declares -Server and -CredentialPath receives them too.
+
 .PARAMETER Operation
     Pause, Resume or Delta.
+
+.PARAMETER Server
+    The Entra Connect server (EntraConnect.Server of the configuration).
+
+.PARAMETER CredentialPath
+    The file written by Export-Clixml that holds the credential (EntraConnect.CredentialPath of the configuration).
+    Empty = EntraConnect.cred.xml beside this script.
 
 .NOTES
     Author  : Nicolas Fabert
     Version : 1.0.0
-    Part of : PRA Cloud Mailbox (sample, copy and adapt it)
+    Part of : PRA Cloud Mailbox (sample: signed, it runs as it is)
 #>
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'CredentialPath', Justification = 'The path of a file, not a secret.')]
 [CmdletBinding()]
-param([Parameter(Mandatory)][ValidateSet('Pause', 'Resume', 'Delta')][string]$Operation)
+param(
+    [Parameter(Mandatory)][ValidateSet('Pause', 'Resume', 'Delta')][string]$Operation,
+    [string]$Server = '',
+    [string]$CredentialPath = ''
+)
 $ErrorActionPreference = 'Stop'
 
-# ---- Adapt these two values ------------------------------------------------------------------------
-$server = 'aadc01.contoso.com'
-$credentialFile = Join-Path $PSScriptRoot 'EntraConnect.cred.xml'
-# ------------------------------------------------------------------------------------------------------
+$server = $Server.Trim()
+$credentialFile = if ($CredentialPath.Trim()) { $CredentialPath.Trim() } else { Join-Path $PSScriptRoot 'EntraConnect.cred.xml' }
 
 try {
+    if (-not $server) { throw 'EntraConnect.Server is empty: set it to the host name of the Entra Connect server in the configuration file.' }
+    if (-not (Test-Path -LiteralPath $credentialFile -PathType Leaf)) { throw "the credential file $credentialFile does not exist: create it with Get-Credential | Export-Clixml, or set EntraConnect.CredentialPath." }
     $credential = Import-Clixml -LiteralPath $credentialFile
     $state = Invoke-Command -ComputerName $server -Credential $credential -ScriptBlock {
         Import-Module ADSync -ErrorAction Stop

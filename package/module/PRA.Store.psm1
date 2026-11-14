@@ -123,7 +123,8 @@ $script:Tables = @('mailbox','permission','group_member','contact','distribution
 # Journal of the cloud actions (Convert, Recover): a separate file on the cloud admin server, so that a new
 # Collect copied over the snapshot database never erases a batch. Every step of every object is recorded:
 # a run interrupted (session cut, reboot) is resumed with the same -Batch.
-$script:JournalSchemaVersion = 2
+$script:JournalSchemaVersion = 3
+# Journal schema 3 adds snapshot_run_id and snapshot_hash to batch (the snapshot a batch was made from, by its run and by its content) and an index on batch_item (object_guid); older journals stay readable.
 $script:JournalSchema = @(
     'CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)'
     @'
@@ -131,7 +132,7 @@ CREATE TABLE IF NOT EXISTS batch (
     id TEXT PRIMARY KEY, action TEXT NOT NULL CHECK (action IN ('Convert','Recover')), convert_batch TEXT,
     status TEXT NOT NULL CHECK (status IN ('Running','Complete','Partial','Failed')),
     created_utc TEXT NOT NULL, updated_utc TEXT, snapshot_id INTEGER, environment TEXT, computer TEXT, account TEXT,
-    tool_version TEXT, scope_json TEXT, counts_json TEXT, note TEXT)
+    tool_version TEXT, scope_json TEXT, counts_json TEXT, note TEXT, snapshot_run_id TEXT, snapshot_hash TEXT)
 '@
     @'
 CREATE TABLE IF NOT EXISTS batch_item (
@@ -158,6 +159,7 @@ CREATE TABLE IF NOT EXISTS batch_run (
     status TEXT, exit_code INTEGER, done_count INTEGER, pending_count INTEGER, error_count INTEGER, skipped_count INTEGER, log_file TEXT)
 '@
     'CREATE INDEX IF NOT EXISTS ix_batch_event ON batch_event (batch_id, object_guid)'
+    'CREATE INDEX IF NOT EXISTS ix_batch_item_object ON batch_item (object_guid)'
 )
 
 function Import-PcmSqlite {
@@ -223,6 +225,11 @@ function Open-PcmStore {
                 $columns = @(Invoke-PcmSql $connection 'PRAGMA table_info(mailbox)' -As Rows)
                 if ('resource_settings_json' -notin @($columns | ForEach-Object { $_.name })) {
                     $null = Invoke-PcmSql $connection 'ALTER TABLE mailbox ADD COLUMN resource_settings_json TEXT'
+                }
+            } else {
+                $columns = @(Invoke-PcmSql $connection 'PRAGMA table_info(batch)' -As Rows | ForEach-Object { [string]$_.name })
+                foreach ($column in @('snapshot_run_id', 'snapshot_hash')) {
+                    if ($column -notin $columns) { $null = Invoke-PcmSql $connection ('ALTER TABLE batch ADD COLUMN {0} TEXT' -f $column) }
                 }
             }
             $null = Invoke-PcmSql $connection "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', @v)" @{ v = [string]$expected }
@@ -356,11 +363,12 @@ function Add-PcmRow {
 function Get-PcmSnapshot {
     <#
     .SYNOPSIS
-        One snapshot: by ID, or the last Complete one. Returns $null when there is none.
+        One snapshot: by run (the run that wrote it, letter case ignored), by ID, or the last Complete one. Returns $null when there is none.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][object]$Connection, [long]$Id = 0)
-    $rows = if ($Id -gt 0) { Invoke-PcmSql $Connection 'SELECT * FROM snapshot WHERE id = @id' @{ id = $Id } -As Rows }
+    param([Parameter(Mandatory)][object]$Connection, [long]$Id = 0, [string]$RunId = '')
+    $rows = if ($RunId) { Invoke-PcmSql $Connection 'SELECT * FROM snapshot WHERE run_id = @r COLLATE NOCASE ORDER BY id DESC LIMIT 1' @{ r = $RunId } -As Rows }
+        elseif ($Id -gt 0) { Invoke-PcmSql $Connection 'SELECT * FROM snapshot WHERE id = @id' @{ id = $Id } -As Rows }
         else { Invoke-PcmSql $Connection "SELECT * FROM snapshot WHERE status = 'Complete' ORDER BY id DESC LIMIT 1" -As Rows }
     $row = $rows | Select-Object -First 1
     if ($row) { return $row }
@@ -400,28 +408,136 @@ function Find-PcmTargetGroup {
     $key = ([string]$Value).Trim()
     $guid = [guid]::Empty
     if ([guid]::TryParse($key, [ref]$guid)) { $key = $guid.ToString() }
-    $groups = @(Invoke-PcmSql $Connection @'
-SELECT * FROM target_group WHERE snapshot_id = @id AND (
-    name = @v COLLATE NOCASE OR sam_account_name = @v COLLATE NOCASE OR distinguished_name = @v COLLATE NOCASE OR
-    primary_smtp_address = @v COLLATE NOCASE OR display_name = @v COLLATE NOCASE OR group_guid = @v COLLATE NOCASE)
-ORDER BY rowid
-'@ @{ id = $SnapshotId; v = $key } -As Rows)
+    $wanted = $key.Normalize([Text.NormalizationForm]::FormC)
+    $groups = @(Invoke-PcmSql $Connection 'SELECT * FROM target_group WHERE snapshot_id = @id ORDER BY rowid' @{ id = $SnapshotId } -As Rows | Where-Object {
+            $group = $_
+            foreach ($column in @('name', 'sam_account_name', 'distinguished_name', 'primary_smtp_address', 'display_name', 'group_guid')) {
+                $text = [string]$group.$column
+                if ($text -and [string]::Equals($text.Normalize([Text.NormalizationForm]::FormC), $wanted, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+            }
+            $false
+        })
     return [pscustomobject]@{ HasTables = $true; Groups = $groups }
 }
 
 function Remove-PcmOldSnapshot {
     <#
     .SYNOPSIS
-        Keeps the last Keep Complete snapshots (and anything newer); deletes the older ones and their rows.
+        Keeps the last Keep Complete snapshots (and anything newer); deletes the older ones and their rows, except the snapshots in -Protect.
+    .PARAMETER Protect
+        Snapshots that a batch not yet rolled back still needs (Get-PcmSnapshotInUse): each has SnapshotId and RunId. A snapshot is kept when its run is named or, for an entry without a run, its ID.
+    .PARAMETER Kept
+        Receives the IDs of the old snapshots that were kept because of -Protect.
     .OUTPUTS
         Number of snapshots deleted.
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
-    param([Parameter(Mandatory)][object]$Connection, [Parameter(Mandatory)][ValidateRange(1, 1000)][int]$Keep)
+    param([Parameter(Mandatory)][object]$Connection, [Parameter(Mandatory)][ValidateRange(1, 1000)][int]$Keep, [AllowEmptyCollection()][object[]]$Protect = @(), [ref]$Kept)
     $limit = Invoke-PcmSql $Connection "SELECT id FROM snapshot WHERE status = 'Complete' ORDER BY id DESC LIMIT 1 OFFSET @k" @{ k = ($Keep - 1) } -As Scalar
     if ($null -eq $limit -or $limit -is [DBNull]) { return 0 }
     if (-not $PSCmdlet.ShouldProcess('database', "Delete snapshots older than $limit")) { return 0 }
-    return [int](Invoke-PcmSql $Connection 'DELETE FROM snapshot WHERE id < @limit' @{ limit = [long]$limit })
+    $needed = [System.Collections.Generic.List[long]]::new()
+    foreach ($old in @(Invoke-PcmSql $Connection 'SELECT id, run_id FROM snapshot WHERE id < @limit ORDER BY id' @{ limit = [long]$limit } -As Rows)) {
+        foreach ($entry in @($Protect | Where-Object { $null -ne $_ })) {
+            $run = [string](Get-PcmStoreValue $entry 'RunId' '')
+            $id = [long](Get-PcmStoreValue $entry 'SnapshotId' 0)
+            if (($run -and [string]::Equals($run, [string]$old.run_id, [StringComparison]::OrdinalIgnoreCase)) -or (-not $run -and $id -eq [long]$old.id)) { $needed.Add([long]$old.id); break }
+        }
+    }
+    if ($null -ne $Kept) { $Kept.Value = $needed.ToArray() }
+    if (-not $needed.Count) { return [int](Invoke-PcmSql $Connection 'DELETE FROM snapshot WHERE id < @limit' @{ limit = [long]$limit }) }
+    $deleted = 0
+    foreach ($old in @(Invoke-PcmSql $Connection 'SELECT id FROM snapshot WHERE id < @limit ORDER BY id' @{ limit = [long]$limit } -As Rows)) {
+        if ([long]$old.id -in $needed) { continue }
+        $deleted += [int](Invoke-PcmSql $Connection 'DELETE FROM snapshot WHERE id = @id' @{ id = [long]$old.id })
+    }
+    return $deleted
+}
+
+function Get-PcmStoreValue {
+    <# One property of an object or one key of a dictionary, or the default when it is missing (a journal row of an older version lacks the newest columns). #>
+    param([AllowNull()][object]$Object, [Parameter(Mandatory)][string]$Name, [AllowNull()][object]$Default = $null)
+    if ($null -eq $Object) { return $Default }
+    if ($Object -is [System.Collections.IDictionary]) { if ($Object.Contains($Name)) { return $Object[$Name] } else { return $Default } }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($property -and $null -ne $property.Value -and $property.Value -isnot [DBNull]) { return $property.Value }
+    return $Default
+}
+
+function Test-PcmStoreColumn {
+    <# Does the table hold this column? A journal written by an older version has no snapshot_run_id and no snapshot_hash. #>
+    param([Parameter(Mandatory)][object]$Connection, [Parameter(Mandatory)][string]$Table, [Parameter(Mandatory)][string]$Column)
+    if ($Table -notmatch '^[a-z_]+\z') { throw "Invalid table name: $Table" }
+    return @(Invoke-PcmSql $Connection ('PRAGMA table_info({0})' -f $Table) -As Rows | Where-Object { [string]::Equals([string]$_.name, $Column, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+}
+
+function Get-PcmSnapshotDigest {
+    <#
+    .SYNOPSIS
+        SHA-256 of the content of one snapshot: the mailboxes, the permissions and the group members that Convert and Recover read, in the order of the database, without the snapshot number.
+    .DESCRIPTION
+        The hash of the database file changes with every Collect (the file holds several snapshots), so a batch keeps this digest instead: it proves that the snapshot found later is the one the batch was made from.
+    .OUTPUTS
+        64 lower-case hexadecimal characters.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowEmptyCollection()][object[]]$Mailbox = @(), [AllowEmptyCollection()][object[]]$Permission = @(), [AllowEmptyCollection()][object[]]$Member = @())
+    $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    try {
+        foreach ($set in @(@('mailbox', $Mailbox), @('permission', $Permission), @('group_member', $Member))) {
+            $hash.AppendData($utf8.GetBytes(('[{0}]{1}' -f $set[0], [char]10)))
+            $builder = [System.Text.StringBuilder]::new()
+            foreach ($row in @($set[1] | Where-Object { $null -ne $_ })) {
+                foreach ($property in $row.PSObject.Properties) {
+                    if ($property.Name -eq 'snapshot_id') { continue }
+                    $text = if ($null -eq $property.Value) { '' } else { [string]$property.Value }
+                    [void]$builder.Append($property.Name).Append('=').Append($text).Append([char]0x1F)
+                }
+                [void]$builder.Append([char]0x1E)
+                if ($builder.Length -gt 1MB) { $hash.AppendData($utf8.GetBytes($builder.ToString())); [void]$builder.Clear() }
+            }
+            $hash.AppendData($utf8.GetBytes($builder.ToString()))
+        }
+        return ([BitConverter]::ToString($hash.GetHashAndReset()) -replace '-', '').ToLowerInvariant()
+    } finally { $hash.Dispose() }
+}
+
+function Get-PcmSnapshotInUse {
+    <#
+    .SYNOPSIS
+        The snapshots that a Convert batch not yet rolled back still needs: Collect must not delete them.
+    .DESCRIPTION
+        A Convert batch is rolled back when every object that it converted has a Done item in a Recover batch of it. A Convert batch that is still running counts as not rolled back while it has no object yet or an object not finished (a resume reads the snapshot again).
+        The journal is opened read-only; there is no journal yet when no batch was ever made. Readable is $false, with the reason in Message, when the journal exists but cannot be read:
+        the caller must then delete nothing.
+    .OUTPUTS
+        Readable, Message, Items (SnapshotId, RunId, Batch).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$JournalPath, [Parameter(Mandatory)][string]$Root)
+    $result = [pscustomobject]@{ Readable = $true; Message = ''; Items = @() }
+    if (-not [IO.File]::Exists($JournalPath)) { return $result }
+    $connection = $null
+    try {
+        $connection = Open-PcmStore -Path $JournalPath -Root $Root -ReadOnly -Kind Journal
+        $run = if (Test-PcmStoreColumn $connection 'batch' 'snapshot_run_id') { 'b.snapshot_run_id' } else { 'NULL' }
+        $result.Items = @(Invoke-PcmSql $connection @"
+SELECT b.id AS batch, b.snapshot_id AS snapshot_id, $run AS run_id FROM batch b
+WHERE b.action = 'Convert' AND b.snapshot_id IS NOT NULL AND (
+    EXISTS (
+        SELECT 1 FROM batch_item i WHERE i.batch_id = b.id AND i.status <> 'Skipped' AND i.step IS NOT NULL AND i.step <> '' AND NOT EXISTS (
+            SELECT 1 FROM batch_item ri JOIN batch r ON r.id = ri.batch_id
+            WHERE r.action = 'Recover' AND r.convert_batch = b.id COLLATE NOCASE AND ri.object_guid = i.object_guid COLLATE NOCASE AND ri.status = 'Done'))
+    OR (b.status = 'Running' AND (NOT EXISTS (SELECT 1 FROM batch_item i WHERE i.batch_id = b.id)
+        OR EXISTS (SELECT 1 FROM batch_item i WHERE i.batch_id = b.id AND i.status NOT IN ('Done', 'Skipped')))))
+"@ -As Rows | ForEach-Object { [pscustomobject]@{ SnapshotId = [long]$_.snapshot_id; RunId = [string]$_.run_id; Batch = [string]$_.batch } })
+    } catch {
+        $result.Readable = $false
+        $result.Message = $_.Exception.Message
+    } finally { Close-PcmStore $connection }
+    return $result
 }
 
 function Backup-PcmStore {
@@ -431,7 +547,7 @@ function Backup-PcmStore {
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param([Parameter(Mandatory)][object]$Connection, [Parameter(Mandatory)][string]$Folder, [Parameter(Mandatory)][string]$Name)
-    if ($Name -notmatch '^[A-Za-z0-9_.-]+$') { throw "Invalid backup file name: $Name" }
+    if ($Name -notmatch '^[A-Za-z0-9_.-]+\z') { throw "Invalid backup file name: $Name" }
     $null = New-Item -ItemType Directory -Path $Folder -Force -WhatIf:$false -Confirm:$false
     $target = Join-Path $Folder $Name
     if (Test-Path -LiteralPath $target) { throw "Backup file already exists: $target" }
@@ -541,6 +657,41 @@ function Test-PcmSnapshotHash {
 }
 #endregion
 
+#region Lists written by a person ----------------------------------------------------------------
+
+function Read-PcmCsvText {
+    <#
+    .SYNOPSIS
+        The text of a list or CSV file written by a person: a byte order mark (UTF-8, UTF-16) is honoured, a file without one is read as strict UTF-8, and a file that is not valid UTF-8
+        (Excel "CSV", Notepad "ANSI") is read with the ANSI code page of this computer, so that accents are not lost.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][string]$Path)
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { return [Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3) }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { return [Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2) }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) { return [Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $bytes.Length - 2) }
+    try { return (New-Object Text.UTF8Encoding($false, $true)).GetString($bytes) }
+    catch [Text.DecoderFallbackException] {
+        try { $ansi = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage) }
+        catch { $ansi = [Text.Encoding]::GetEncoding(1252) }
+        return $ansi.GetString($bytes)
+    }
+}
+
+function Get-PcmCsvDelimiter {
+    <# The delimiter of a header line that holds the column Identity (comma or semicolon, the column anywhere, letter case and quotes ignored): ',' or ';'. '' when the line has no such column. #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()][AllowEmptyString()][string]$Header, [string]$Column = 'Identity')
+    $name = [regex]::Escape($Column)
+    if ($Header -match ('(?i)(^|,)\s*"?{0}"?\s*(,|\z)' -f $name)) { return ',' }
+    if ($Header -match ('(?i)(^|;)\s*"?{0}"?\s*(;|\z)' -f $name)) { return ';' }
+    return ''
+}
+#endregion
+
 #region Journal (cloud actions) -------------------------------------------------------------------
 
 function New-PcmBatchId {
@@ -558,11 +709,11 @@ function New-PcmBatch {
     $id = New-PcmBatchId
     if (-not $PSCmdlet.ShouldProcess("batch $id", "New $Action batch")) { return '' }
     $null = Invoke-PcmSql $Connection @'
-INSERT INTO batch (id, action, convert_batch, status, created_utc, updated_utc, snapshot_id, environment, computer, account, tool_version, scope_json)
-VALUES (@id, @action, @convert, 'Running', @now, @now, @snapshot, @environment, @computer, @account, @tool, @scope)
+INSERT INTO batch (id, action, convert_batch, status, created_utc, updated_utc, snapshot_id, environment, computer, account, tool_version, scope_json, snapshot_run_id, snapshot_hash)
+VALUES (@id, @action, @convert, 'Running', @now, @now, @snapshot, @environment, @computer, @account, @tool, @scope, @run, @hash)
 '@ @{ id = $id; action = $Action; convert = [string]$Info['ConvertBatch']; now = [datetime]::UtcNow; snapshot = $Info['SnapshotId']
         environment = [string]$Info['Environment']; computer = $env:COMPUTERNAME; account = [string]$Info['Account']; tool = [string]$Info['ToolVersion']
-        scope = [string]$Info['ScopeJson'] }
+        scope = [string]$Info['ScopeJson']; run = [string]$Info['SnapshotRunId']; hash = [string]$Info['SnapshotHash'] }
     return $id
 }
 
@@ -585,7 +736,7 @@ function Get-PcmBatch {
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Connection, [string]$Id, [ValidateSet('Convert','Recover')][string]$Action)
     if ($Id) {
-        if ($Id -notmatch '^[0-9a-fA-F]{4,8}$') { throw "Invalid batch ID: $Id (8 hexadecimal characters, printed at the end of Convert)." }
+        if ($Id -notmatch '^[0-9a-fA-F]{4,8}\z') { throw "Invalid batch ID: $Id (8 hexadecimal characters, printed at the end of Convert)." }
         $rows = @(Invoke-PcmSql $Connection 'SELECT * FROM batch WHERE id LIKE @p ORDER BY created_utc DESC' @{ p = ($Id.ToLowerInvariant() + '%') } -As Rows)
         if ($rows.Count -gt 1) { throw "Batch ID $Id is ambiguous: give more characters." }
         if ($rows.Count -eq 1) { return $rows[0] }
@@ -694,7 +845,8 @@ function Get-PcmBatchHistory {
 #endregion
 
 Export-ModuleMember -Function Import-PcmSqlite, Open-PcmStore, Close-PcmStore, Invoke-PcmSql, New-PcmSnapshot, Set-PcmSnapshotStatus,
-    Add-PcmRow, Get-PcmSnapshot, Get-PcmSnapshotList, Read-PcmTable, Test-PcmTable, Find-PcmTargetGroup, Remove-PcmOldSnapshot, Backup-PcmStore, Get-PcmFileHash, Write-PcmHashFile, Remove-PcmHashFile, Read-PcmHashFile, Test-PcmSnapshotHash,
+    Add-PcmRow, Get-PcmSnapshot, Get-PcmSnapshotList, Read-PcmTable, Test-PcmTable, Find-PcmTargetGroup, Remove-PcmOldSnapshot, Get-PcmSnapshotDigest, Get-PcmSnapshotInUse, Backup-PcmStore, Get-PcmFileHash, Write-PcmHashFile, Remove-PcmHashFile, Read-PcmHashFile, Test-PcmSnapshotHash,
+    Read-PcmCsvText, Get-PcmCsvDelimiter,
     New-PcmBatch, Set-PcmBatch, Get-PcmBatch, Set-PcmBatchItem, Get-PcmBatchItem, Add-PcmBatchEvent, Set-PcmTenantChange, Get-PcmTenantChange, Add-PcmBatchRun, Get-PcmBatchHistory
 
 # SIG # Begin signature block
