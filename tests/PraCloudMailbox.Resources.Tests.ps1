@@ -26,7 +26,7 @@ Describe 'Native resource safety rules' {
             Import-Module (Join-Path $root 'module\PRA.Collect.psm1') -Force
             Import-Module (Join-Path $root 'module\PRA.Store.psm1') -Force
             $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'Invoke-PraCloudMailbox.ps1'), [ref]$null, [ref]$null)
-            foreach ($function in @($ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -in @('Invoke-PcmCollect','Skip-PcmStep','New-PcmRow','Get-PcmCommandLine','ConvertTo-PcmLiteral') })) {
+            foreach ($function in @($ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -in @('Invoke-PcmCollect','Get-PcmCollectSizeProblem','Skip-PcmStep','New-PcmRow','Get-PcmCommandLine','ConvertTo-PcmLiteral') })) {
                 . ([scriptblock]::Create($function.Extent.Text))
             }
             function Start-ResourceCollectTest {

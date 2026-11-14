@@ -8,6 +8,7 @@
     "tests/PraCloudMailbox.Schedule.Tests.ps1",
     "tests/PraCloudMailbox.CallTimeout.Tests.ps1",
     "tests/PraCloudMailbox.Snapshot.Tests.ps1",
+    "tests/PraCloudMailbox.Data.Tests.ps1",
     "tests/PraCloudMailbox.Casing.Tests.ps1",
     "tests/PraCloudMailbox.EndToEnd.Tests.ps1",
     "tests/PraCloudMailbox.FollowUp.Tests.ps1",

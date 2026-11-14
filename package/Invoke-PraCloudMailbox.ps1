@@ -120,8 +120,9 @@
     Check, Convert and Recover. Snapshot check: every Collect writes a .sha256 file beside the snapshot file (and beside its backup copy), and these actions compare the snapshot
     file with it before they read it. When the file was changed after its last Collect, the run stops, with nothing changed: restore the file from your external backup. Give this
     switch only when you know why the file changed and accept it as it is: the run then goes on, says so in the banner, the log, the summary and the report, and the next steps
-    keep the switch. A snapshot without a .sha256 file (an old snapshot, or a copy made without it) is not stopped: the run warns that the tool cannot prove the file is the one
-    Collect wrote. The journal is written by Convert and Recover themselves and is not covered.
+    keep the switch. A snapshot without a .sha256 file (an old snapshot, or a copy made without it) stops a Convert or a Recover in Apply mode in the same way, because the tool
+    cannot prove the file is the one Collect wrote; a Preview and a Check only warn. A batch also keeps the run and the content of the snapshot it was made from: a snapshot that
+    is not that one stops the run too, and this switch accepts it. The journal is written by Convert and Recover themselves and is not covered.
 
 .PARAMETER Credential
     Schedule: the domain user account that runs the daily Collect, with its password (Get-Credential). Without it, a Preview does not test the account and an Apply asks for it,
@@ -409,13 +410,13 @@ function ConvertTo-PcmIdentityKey {
 
 function Read-PcmIdentityFile {
     <#
-    -CsvPath: one identity per line (# starts a comment, a blank line is ignored), or a CSV file with an Identity column (any letter case,
-    delimiter , or ;). The whole list is refused, with the line numbers, when an object is listed twice (letter case ignored) or when a line has no
+    -CsvPath: one identity per line (# starts a comment, a blank line is ignored), or a CSV file with an Identity column (any letter case, anywhere among the columns,
+    delimiter , or ;). A file saved by Excel or Notepad as "ANSI" is read with the ANSI code page of the computer, so that its accents are kept. The whole list is refused, with the line numbers, when an object is listed twice (letter case ignored) or when a line has no
     valid identity: the run must not start on a list that is not what the operator meant.
     #>
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "-CsvPath: file not found: $Path" }
-    $lines = @(Get-Content -LiteralPath $Path -Encoding UTF8)
+    $lines = @([string](Read-PcmCsvText -Path $Path) -split '\r?\n')
     $entries = [System.Collections.Generic.List[object]]::new()
     $problems = [System.Collections.Generic.List[string]]::new()
     $header = ''; $delimiter = ','
@@ -423,8 +424,8 @@ function Read-PcmIdentityFile {
         $text = ([string]$lines[$index]).Trim()
         if (-not $text -or $text.StartsWith('#')) { continue }
         $number = $index + 1
-        if (-not $header -and -not $entries.Count -and $text -match '^"?Identity"?\s*([,;]|$)') {
-            $header = $text; $delimiter = if ($text.Contains(';')) { ';' } else { ',' }
+        if (-not $header -and -not $entries.Count -and (Get-PcmCsvDelimiter $text)) {
+            $header = $text; $delimiter = Get-PcmCsvDelimiter $text
             continue
         }
         $value = $text
@@ -881,6 +882,51 @@ function Set-PcmRowStopped {
 # =================================================================================================
 # Collect - Exchange on-premises, before the disaster (remote session to Exchange.Server).
 # =================================================================================================
+function Get-PcmCollectSizeProblem {
+    <#
+    Before a snapshot is written: is its size acceptable? A snapshot without any mailbox is refused, and so is one that holds more than Collect.MaxDropPercent percent fewer
+    mailboxes than the last complete snapshot of the same scope (a full one, not a one-object snapshot): it would become the last complete snapshot and push the good ones out of
+    Store.KeepSnapshots. Collect.MaxDropPercent = 100 accepts any size. Returns the plain message for the operator, or '' when the size is acceptable.
+    #>
+    param([Parameter(Mandatory)][int]$Count, [Parameter(Mandatory)][string]$ScopeJson)
+    $config = $context.Config
+    $limit = [int](Get-PcmValue $config.Collect 'MaxDropPercent' 50)
+    if ($limit -ge 100) { return '' }
+    $previous = $null
+    if ([IO.File]::Exists($config.Store.Path)) {
+        $connection = $null
+        try {
+            $connection = Open-PcmStore -Path $config.Store.Path -Root $context.Root -ReadOnly
+            $now = $ScopeJson | ConvertFrom-Json
+            $oneObject = [bool][string](Get-PcmValue $now 'Identity' '')
+            foreach ($row in @(if (-not $oneObject) { Invoke-PcmSql $connection "SELECT id, scope_json, counts_json FROM snapshot WHERE status = 'Complete' ORDER BY id DESC LIMIT 50" -As Rows })) {
+                $then = $null; try { $then = [string]$row.scope_json | ConvertFrom-Json } catch { $then = $null }
+                if (-not $then -or [string](Get-PcmValue $then 'Identity' '')) { continue }
+                $same = $true
+                foreach ($name in @('Mode', 'SearchBase', 'GroupDN', 'CsvPath', 'Filter', 'IncludeUsers', 'IncludeShared', 'IncludeRoom', 'IncludeEquipment')) {
+                    if (-not (Test-PcmSameText ([string](Get-PcmValue $then $name '')) ([string](Get-PcmValue $now $name '')))) { $same = $false; break }
+                }
+                if (-not $same) { continue }
+                $mailboxes = [int](Get-PcmValue ([string]$row.counts_json | ConvertFrom-Json) 'mailbox' 0)
+                $previous = [pscustomobject]@{ Id = [long]$row.id; Count = $mailboxes }
+                break
+            }
+        } catch { $previous = $null }
+        finally { Close-PcmStore $connection }
+    }
+    $last = if ($previous) { "The last complete snapshot is snapshot $($previous.Id), with $($previous.Count) mailbox(es), and it stays the last complete one. " } else { '' }
+    if ($Count -eq 0) {
+        return ("Collect found no mailbox in the scope ({0}), so it wrote nothing: an empty snapshot would become the last complete snapshot and Check, Convert and Recover would have nothing to work from. {1}Check Exchange.Server, the scope in the configuration file (Scope.Mode and its SearchBase, GroupDN or CsvPath, and Scope.Include*) and that the account can read the mailboxes, then run Collect again. If the scope really holds no mailbox, set Collect.MaxDropPercent to 100 for this run." -f (Get-PcmScopeText $config), $last)
+    }
+    if ($previous -and $previous.Count -gt 0) {
+        $drop = ($previous.Count - $Count) * 100.0 / $previous.Count
+        if ($drop -gt $limit) {
+            return ("Collect found {0} mailbox(es), {1:0}% fewer than the last complete snapshot of the same scope (snapshot {2}, {3} mailbox(es)): more than Collect.MaxDropPercent ({4}%), so it wrote nothing and that snapshot stays the last complete one. If mailboxes were really moved or the scope was narrowed on purpose, set Collect.MaxDropPercent to a higher value in the configuration file (100 accepts any size) and run Collect again; otherwise find out why Exchange returned fewer mailboxes." -f $Count, $drop, $previous.Id, $previous.Count, $limit)
+        }
+    }
+    return ''
+}
+
 function Invoke-PcmCollect {
     $config = $context.Config
     $collect = $config.Collect
@@ -996,12 +1042,18 @@ function Invoke-PcmCollect {
 
     $counts = @{ mailbox = $records.Count; permission = $permissions.Count; group_member = $members.Count; contact = $contacts.Count
         distribution_group = @($groupResult.Groups).Count; dl_member = @($groupResult.Members).Count; target_group = @($targetGroups.Groups).Count; target_member = @($targetGroups.Members).Count; excluded = $context.Excluded.Count }
+    $scopeJson = @{ Mode = $config.Scope.Mode; SearchBase = $config.Scope.SearchBase; GroupDN = $config.Scope.GroupDN; CsvPath = $config.Scope.CsvPath
+        Identity = $Identity; Filter = $Scope; IncludeUsers = $config.Scope.IncludeUsers; IncludeShared = $config.Scope.IncludeShared
+        IncludeRoom = $config.Scope.IncludeRoom; IncludeEquipment = $config.Scope.IncludeEquipment } | ConvertTo-Json -Compress
+    $sizeProblem = Get-PcmCollectSizeProblem -Count $records.Count -ScopeJson $scopeJson
     if ($context.Mode -ne 'Apply') {
+        if ($sizeProblem) { Write-PcmLog -Context $context -Message ('In Apply mode this Collect would be refused: {0}' -f $sizeProblem) -Level Warning }
         Skip-PcmStep -Title 'Saving the snapshot' -Reason 'Preview: not written (add -Mode Apply).' -Icon Backup
         $context.NextSteps = @((Get-PcmCommandLine -ActionName 'Collect' -ModeName 'Apply' -KeepFilters))
         return
     }
     Write-PcmStep -Context $context -Title 'Saving the snapshot' -Icon Backup
+    if ($sizeProblem) { $context.NoChangeMade = $true; throw $sizeProblem }
     if ($Identity) {
         # A one-object snapshot becomes the last complete snapshot: Check and Convert would only see this object.
         if (-not $Force -and -not ($script:ConfirmBound -and (Test-PcmSameText $ConfirmPreference 'None'))) {
@@ -1016,13 +1068,13 @@ function Invoke-PcmCollect {
         Write-PcmLog -Context $context -Message 'Snapshot of ONE object (-Identity): Check and Convert use the last complete snapshot, so a full Collect must follow.' -Level Warning
     }
     $context.CurrentOperation = 'Write-Snapshot'
-    Remove-PcmHashFile -Path $config.Store.Path
+    # The hash file of the snapshot that is there now stays until the new one is written; when this Collect fails after it touched the database, the hash file is written again for
+    # the database as it is (the last complete snapshot is intact) provided that it matched the file before.
+    $hashedBefore = [IO.File]::Exists($config.Store.Path) -and (Test-PcmSameText (Test-PcmSnapshotHash -Path $config.Store.Path).State 'Verified')
     $connection = Open-PcmStore -Path $config.Store.Path -Root $context.Root
     $backup = ''
+    $finished = $false
     try {
-        $scopeJson = @{ Mode = $config.Scope.Mode; SearchBase = $config.Scope.SearchBase; GroupDN = $config.Scope.GroupDN; CsvPath = $config.Scope.CsvPath
-            Identity = $Identity; Filter = $Scope; IncludeUsers = $config.Scope.IncludeUsers; IncludeShared = $config.Scope.IncludeShared
-            IncludeRoom = $config.Scope.IncludeRoom; IncludeEquipment = $config.Scope.IncludeEquipment } | ConvertTo-Json -Compress
         $id = New-PcmSnapshot $connection @{ RunId = $context.RunId; Environment = $config.Environment; Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
             ToolVersion = $toolVersion; ExchangeServer = $context.Server; ScopeJson = $scopeJson }
         try {
@@ -1043,12 +1095,27 @@ function Invoke-PcmCollect {
         }
         $context.SnapshotLabel = '{0} {1} {2}' -f $id, $dot, (Get-Date -Format 'yyyy-MM-dd HH:mm')
         Write-PcmItem -Context $context -Status Ok -Icon Batch -Text ('Snapshot {0} written to {1}' -f $id, $config.Store.Path)
-        $pruned = Remove-PcmOldSnapshot $connection $config.Store.KeepSnapshots
+        $inUse = Get-PcmSnapshotInUse -JournalPath $config.Store.JournalPath -Root $context.Root
+        $pruned = 0
+        if ($inUse.Readable) {
+            $kept = @()
+            $pruned = Remove-PcmOldSnapshot $connection $config.Store.KeepSnapshots -Protect $inUse.Items -Kept ([ref]$kept)
+            if (@($kept).Count) { Write-PcmItem -Context $context -Status Info -Text ('{0} old snapshot(s) kept although older than Store.KeepSnapshots = {1}: a Convert batch that is not rolled back yet needs them (snapshot {2})' -f @($kept).Count, $config.Store.KeepSnapshots, (@($kept) -join ', ')) }
+        } else {
+            Write-PcmLog -Context $context -Message ('The journal {0} could not be read ({1}): no old snapshot is deleted in this run, because a batch may still need it.' -f $config.Store.JournalPath, $inUse.Message) -Level Warning
+        }
         if ($pruned) { Write-PcmItem -Context $context -Status Info -Text ('{0} old snapshot(s) deleted (Store.KeepSnapshots = {1})' -f $pruned, $config.Store.KeepSnapshots) }
         $backup = Backup-PcmStore $connection $config.Store.BackupFolder ('PraCloudMailbox_{0}_snapshot{1}_{2}.db' -f $config.Environment, $id, (Get-Date -Format 'yyyyMMdd-HHmmss'))
         [void]$context.BackupFiles.Add($backup)
         Write-PcmItem -Context $context -Status Ok -Icon Backup -Text "Copy of the database: $backup"
-    } finally { Close-PcmStore $connection }
+        $finished = $true
+    } finally {
+        Close-PcmStore $connection
+        if (-not $finished -and $hashedBefore) {
+            try { $null = Write-PcmHashFile -Path $config.Store.Path }
+            catch { try { Remove-PcmHashFile -Path $config.Store.Path } catch { $null = $_ } }
+        }
+    }
     $context.CurrentOperation = 'Write-SnapshotHash'
     foreach ($hashed in @($backup, $config.Store.Path) | Where-Object { $_ }) {
         try {
@@ -1192,7 +1259,7 @@ function Invoke-PcmSchedule {
 function Confirm-PcmSnapshotHash {
     <#
     Before the snapshot file is read: compares it with the .sha256 that Collect wrote beside it. A file changed after its Collect stops the run with nothing changed (unless
-    -AcceptUnverifiedSnapshot); a file without a .sha256 only warns. The journal is not covered: Convert and Recover write it themselves.
+    -AcceptUnverifiedSnapshot); a file without a .sha256 stops a Convert or a Recover in Apply mode in the same way, and only warns in a Preview, a Check or a Collect. The journal is not covered: Convert and Recover write it themselves.
     #>
     $config = $context.Config
     $path = $config.Store.Path
@@ -1206,6 +1273,10 @@ function Confirm-PcmSnapshotHash {
         }
         'NotVerifiable' {
             if (-not $accept) { $context.SnapshotCheck = 'not verifiable: no .sha256 beside the file' }
+            if (-not $accept -and (Test-PcmSameText $context.Mode 'Apply') -and ((Test-PcmSameText $context.Action 'Convert') -or (Test-PcmSameText $context.Action 'Recover'))) {
+                $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+                throw ($state.Message + ' Nothing was changed. If you know that this file is the one Collect wrote, run the same command again with -AcceptUnverifiedSnapshot.')
+            }
             Write-PcmLog -Context $context -Message $state.Message -Level Warning
         }
         default {
@@ -1226,16 +1297,24 @@ function Read-PcmSnapshotData {
     (or keeps -ObjectGuid only), prints the step. -Known gives the reason why an object of the batch is not left to do; -SkipConverted (a new Convert) leaves out the
     objects that an earlier batch converted.
     #>
-    param([long]$Id = 0, [string]$Verb = 'check', [switch]$All, [AllowEmptyCollection()][string[]]$ObjectGuid, [switch]$NoCount, [string]$Where = '', [hashtable]$Known = @{}, [switch]$SkipConverted)
+    param([long]$Id = 0, [string]$Verb = 'check', [switch]$All, [AllowEmptyCollection()][string[]]$ObjectGuid, [switch]$NoCount, [string]$Where = '', [hashtable]$Known = @{}, [switch]$SkipConverted, [AllowNull()][object]$Batch = $null)
     $config = $context.Config
     $dot = [char]0x00B7
     Write-PcmStep -Context $context -Title 'Collect snapshot' -Icon Batch
     $context.CurrentOperation = 'Read-Snapshot'
     Confirm-PcmSnapshotHash
+    $batchRun = [string](Get-PcmValue $Batch 'snapshot_run_id' '')
+    $batchHash = [string](Get-PcmValue $Batch 'snapshot_hash' '')
     $connection = Open-PcmStore -Path $config.Store.Path -Root $context.Root -ReadOnly
     try {
-        $snap = Get-PcmSnapshot $connection $Id
-        if (-not $snap) { throw $(if ($Id) { "Snapshot $Id not found in $($config.Store.Path)." } else { "No complete snapshot in $($config.Store.Path): run Collect -Mode Apply (it reads Exchange.Server) or copy the snapshot database here." }) }
+        $snap = if ($batchRun) { Get-PcmSnapshot $connection -RunId $batchRun } else { Get-PcmSnapshot $connection $Id }
+        if (-not $snap) {
+            $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+            $copies = "Every Collect also writes a copy of the database in Store.BackupFolder ($($config.Store.BackupFolder)), named PraCloudMailbox_<Environment>_snapshot<number>_<date>.db and kept as it is: copy the file of the snapshot you need over $($config.Store.Path) (with its .sha256 file) and run the same command again."
+            throw $(if ($Batch) { "Batch $(Get-PcmValue $Batch 'id' '') was made from snapshot $Id$(if ($batchRun) { " (Collect run $batchRun)" }), which is not in $($config.Store.Path): Collect keeps only the last Store.KeepSnapshots ($($config.Store.KeepSnapshots)) snapshots, or this database is another one. Nothing was changed. $copies" }
+                elseif ($Id) { "Snapshot $Id not found in $($config.Store.Path) (Collect keeps the last Store.KeepSnapshots = $($config.Store.KeepSnapshots) snapshots). $copies" }
+                else { "No complete snapshot in $($config.Store.Path): run Collect -Mode Apply (it reads Exchange.Server) or copy the snapshot database here." })
+        }
         if ($snap.status -ne 'Complete') { throw "Snapshot $($snap.id) is $($snap.status), not Complete." }
         $records = @(Read-PcmTable $connection mailbox $snap.id)
         $permissions = @(Read-PcmTable $connection permission $snap.id)
@@ -1249,6 +1328,17 @@ function Read-PcmSnapshotData {
         }
     } finally { Close-PcmStore $connection }
     $context.SnapshotId = [string]$snap.id
+    $context.SnapshotRunId = [string]$snap.run_id
+    $context.SnapshotHash = Get-PcmSnapshotDigest -Mailbox $records -Permission $permissions -Member $members
+    if ($Batch -and $batchHash -and -not (Test-PcmSameText $batchHash $context.SnapshotHash)) {
+        if (-not [bool](Get-PcmValue $context 'AcceptUnverifiedSnapshot' $false)) {
+            $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+            throw ("Snapshot {0} of {1} is not the snapshot that batch {2} was made from: the mailboxes, permissions or group members it holds are not the ones that Convert read (digest {3}, the journal says {4}). Nothing was changed. Restore the right database from Store.BackupFolder ({5}), or, if you know why it differs and accept it, run the same command again with -AcceptUnverifiedSnapshot." -f $snap.id, $config.Store.Path, (Get-PcmValue $Batch 'id' ''), $context.SnapshotHash, $batchHash, $config.Store.BackupFolder)
+        }
+        Write-PcmLog -Context $context -Message ('Snapshot {0} is not the snapshot that batch {1} was made from; the run goes on because of -AcceptUnverifiedSnapshot.' -f $snap.id, (Get-PcmValue $Batch 'id' '')) -Level Warning
+    } elseif ($Batch -and -not $batchHash) {
+        Write-PcmLog -Context $context -Message ('Batch {0} was made before batches kept the content of their snapshot: the tool cannot prove that snapshot {1} is the one it was made from.' -f (Get-PcmValue $Batch 'id' ''), $snap.id) -Level Warning
+    }
     $taken = [datetime]::Parse([string]$snap.finished_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
     $age = (Get-Date).ToUniversalTime() - $taken.ToUniversalTime()
     $context.SnapshotLabel = '{0} {1} {2:yyyy-MM-dd HH:mm} UTC {1} {3}' -f $snap.id, $dot, $taken.ToUniversalTime(), $snap.exchange_server
@@ -1420,7 +1510,7 @@ function Invoke-PcmCheckBatch {
         $items = @($items | Where-Object { [string]$_.object_guid -in $wanted })
     }
     Write-PcmItem -Context $context -Status Info -Icon Batch -Text ('{0} batch {1} of {2}: {3} object(s) in the journal, state expected: {4}{5}' -f $given.action, $given.id, (Format-PcmUtcText $given.created_utc), $items.Count, $expect, $(if ($Once) { ' (one look)' } else { '' }))
-    $data = Read-PcmSnapshotData -Id ([long]$convert.snapshot_id) -All -NoCount
+    $data = Read-PcmSnapshotData -Id ([long]$convert.snapshot_id) -All -NoCount -Batch $convert
     $byGuid = @{}; foreach ($record in $data.Records) { $byGuid[[string]$record.object_guid] = $record }
     $items = @(Select-PcmTarget -Items $items -Where "the objects of batch $($convert.id)" -AllRecords @($data.Records) -InBatch -RecordOf { param($t) $byGuid[[string]$t.object_guid] } -Keys {
             param($t) $r = $byGuid[[string]$t.object_guid]
@@ -2297,6 +2387,7 @@ function Invoke-PcmConvert {
         $resume = Get-PcmBatch $context.Journal -Id $Batch
         if (-not $resume -or $resume.action -ne 'Convert') { throw "Convert batch $Batch not found in $($config.Store.JournalPath)." }
         $snapshotId = [long]$resume.snapshot_id
+        $read.Batch = $resume
         $context.BatchId = [string]$resume.id
         foreach ($item in @(Get-PcmBatchItem $context.Journal $resume.id)) { $resumeItems[[string]$item.object_guid] = $item }
         $read.ObjectGuid = [string[]]@($resumeItems.Values | Where-Object { $_.status -notin @('Done','Skipped') } | ForEach-Object { [string]$_.object_guid })
@@ -2406,7 +2497,7 @@ function Invoke-PcmConvert {
     if (-not $plan.Count) { throw 'No object can be converted (see the reasons above).' }
     Confirm-PcmApply ('Convert {0} object(s) to Exchange Online ({1} user(s), {2} shared, {3} native resources)?' -f $plan.Count, $planUsers.Count, $planShared.Count, $planResources.Count)
     if (-not $resume) {
-        $context.BatchId = New-PcmBatch $context.Journal Convert @{ SnapshotId = [long]$data.Snapshot.id; Environment = $config.Environment; Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $context.BatchId = New-PcmBatch $context.Journal Convert @{ SnapshotId = [long]$data.Snapshot.id; SnapshotRunId = [string]$data.Snapshot.run_id; SnapshotHash = [string]$context.SnapshotHash; Environment = $config.Environment; Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
             ToolVersion = $toolVersion; ScopeJson = (@{ Identity = $Identity; CsvPath = $CsvPath; SearchBase = $SearchBase; Group = $Group; MaxObjects = $MaxObjects; Identities = @(Get-PcmIdentityList).Count; Scope = $Scope; UsersMode = $config.Licensing.Users.Mode } | ConvertTo-Json -Compress) }
         foreach ($entry in $plan) {
             if ($entry -in $planResources) {
@@ -3005,7 +3096,7 @@ function Invoke-PcmRecover {
     if ($resume) { $context.ResumeBatchId = [string]$resume.id }
     $finished = $existing | Where-Object { $_.status -eq 'Complete' } | Select-Object -First 1
     if (-not $resume -and $finished) { throw "Convert batch $($convert.id) was already rolled back by Recover batch $($finished.id) (complete): nothing to do. Check shows the current state of the objects." }
-    $data = Read-PcmSnapshotData -Id ([long]$convert.snapshot_id) -Verb 'roll back' -All -NoCount
+    $data = Read-PcmSnapshotData -Id ([long]$convert.snapshot_id) -Verb 'roll back' -All -NoCount -Batch $convert
     $byGuid = @{}; foreach ($record in $data.Records) { $byGuid[[string]$record.object_guid] = $record }
     $convertItems = @(Get-PcmBatchItem $context.Journal $convert.id | Where-Object { $_.status -ne 'Skipped' -and $_.step -and ($_.entra_id -or (Get-PcmResourceIntent -Item $_)) })
     $done = @{}; $previous = @{}
@@ -3150,7 +3241,7 @@ function Invoke-PcmRecover {
     Confirm-PcmApply (('Roll back {0} object(s) of Convert batch {1}?' -f $plan.Count, $convert.id) + $lossWarning)
     if ($resume) { $context.BatchId = [string]$resume.id }
     else {
-        $context.BatchId = New-PcmBatch $context.Journal Recover @{ ConvertBatch = $convert.id; SnapshotId = [long]$convert.snapshot_id; Environment = $config.Environment
+        $context.BatchId = New-PcmBatch $context.Journal Recover @{ ConvertBatch = $convert.id; SnapshotId = [long]$convert.snapshot_id; SnapshotRunId = [string]$context.SnapshotRunId; SnapshotHash = [string]$context.SnapshotHash; Environment = $config.Environment
             Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name; ToolVersion = $toolVersion; ScopeJson = (@{ Identity = $Identity; CsvPath = $CsvPath; SearchBase = $SearchBase; Group = $Group; MaxObjects = $MaxObjects; Identities = @(Get-PcmIdentityList).Count; Scope = $Scope } | ConvertTo-Json -Compress) }
     }
     foreach ($entry in $plan) {

@@ -38,7 +38,7 @@
         'ConvertTo-PcmGuidKey', 'New-PcmRecordIndex', 'Find-PcmRecord',
         # Snapshot and journal store (PRA.Store)
         'Import-PcmSqlite', 'Open-PcmStore', 'Close-PcmStore', 'Invoke-PcmSql', 'New-PcmSnapshot', 'Set-PcmSnapshotStatus', 'Add-PcmRow', 'Get-PcmSnapshot', 'Get-PcmSnapshotList',
-        'Read-PcmTable', 'Test-PcmTable', 'Find-PcmTargetGroup', 'Remove-PcmOldSnapshot', 'Backup-PcmStore', 'Get-PcmFileHash', 'Write-PcmHashFile', 'Remove-PcmHashFile', 'Read-PcmHashFile', 'Test-PcmSnapshotHash', 'New-PcmBatch', 'Set-PcmBatch', 'Get-PcmBatch', 'Set-PcmBatchItem',
+        'Read-PcmTable', 'Test-PcmTable', 'Find-PcmTargetGroup', 'Remove-PcmOldSnapshot', 'Get-PcmSnapshotDigest', 'Get-PcmSnapshotInUse', 'Read-PcmCsvText', 'Get-PcmCsvDelimiter', 'Backup-PcmStore', 'Get-PcmFileHash', 'Write-PcmHashFile', 'Remove-PcmHashFile', 'Read-PcmHashFile', 'Test-PcmSnapshotHash', 'New-PcmBatch', 'Set-PcmBatch', 'Get-PcmBatch', 'Set-PcmBatchItem',
         'Get-PcmBatchItem', 'Add-PcmBatchEvent', 'Set-PcmTenantChange', 'Get-PcmTenantChange', 'Add-PcmBatchRun', 'Get-PcmBatchHistory'
     )
     CmdletsToExport       = @()

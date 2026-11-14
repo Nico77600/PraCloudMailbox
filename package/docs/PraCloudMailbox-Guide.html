@@ -837,7 +837,7 @@ Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope AllUsers -
 </tr>
 <tr>
 <td><code>Collect</code></td>
-<td><code>SharedPermissions</code>, <code>ExpandGroupTrustees</code> (groups used as trustees: members stored and granted one by one), <code>ExcludeTrustees</code> (wildcards), <code>MailboxStatistics</code>, <code>Contacts</code>, <code>ContactsSearchBase</code>, <code>DistributionGroups</code>, <code>DistributionGroupsSearchBase</code>, <code>DynamicDistributionGroups</code>, <code>TargetGroups</code> (groups kept <strong>with all their members</strong>, nested groups, computers and contacts included, so that <code>-Group</code> works after the disaster; <code>Scope.GroupDN</code> is always kept too; a group that is not found is a warning)</td>
+<td><code>SharedPermissions</code>, <code>ExpandGroupTrustees</code> (groups used as trustees: members stored and granted one by one), <code>ExcludeTrustees</code> (wildcards), <code>MailboxStatistics</code>, <code>Contacts</code>, <code>ContactsSearchBase</code>, <code>DistributionGroups</code>, <code>DistributionGroupsSearchBase</code>, <code>DynamicDistributionGroups</code>, <code>TargetGroups</code> (groups kept <strong>with all their members</strong>, nested groups, computers and contacts included, so that <code>-Group</code> works after the disaster; <code>Scope.GroupDN</code> is always kept too; a group that is not found is a warning), <code>MaxDropPercent</code> (0 to 100, default 50: a Collect that finds no mailbox, or more than this percentage fewer than the last complete snapshot of the same scope, writes nothing and fails; 100 accepts any size)</td>
 </tr>
 <tr>
 <td><code>Store</code></td>
@@ -873,7 +873,7 @@ Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope AllUsers -
 </tr>
 <tr>
 <td><code>EntraConnect</code></td>
-<td><code>Mode</code> (<code>Remoting</code>, <code>Script</code>, <code>Manual</code>), <code>Server</code>, <code>ScriptPath</code>, <code>MinVersion</code> (chapter 6.1)</td>
+<td><code>Mode</code> (<code>Remoting</code>, <code>Script</code>, <code>Manual</code>), <code>Server</code>, <code>ScriptPath</code>, <code>CredentialPath</code> (<code>Script</code> mode: the credential file given to the script), <code>MinVersion</code> (chapter 6.1)</td>
 </tr>
 <tr>
 <td><code>Logging</code>, <code>Report</code></td>
@@ -930,7 +930,7 @@ Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope AllUsers -
 </tr>
 <tr>
 <td><code>Script</code></td>
-<td><code>&lt;ScriptPath&gt; -Operation Pause \| Resume \| Delta</code></td>
+<td><code>&lt;ScriptPath&gt; -Operation Pause \| Resume \| Delta</code>, plus <code>-Server &lt;EntraConnect.Server&gt;</code> and <code>-CredentialPath &lt;EntraConnect.CredentialPath&gt;</code> when the script declares those parameters</td>
 <td>any access path (another account, a jump host, Azure Run Command...). Output: one line of state, logged. <code>exit 0</code> = done, any other exit code or an exception = failed</td>
 </tr>
 <tr>
@@ -940,7 +940,15 @@ Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope AllUsers -
 </tr>
 </tbody>
 </table></div>
-<p><code>config\EntraConnect.sample.ps1</code> implements the <code>Script</code> contract with PowerShell remoting and a credential saved with <code>Export-Clixml</code>: copy it and adapt the server name.</p>
+<p><code>config\EntraConnect.sample.ps1</code> implements the <code>Script</code> contract with PowerShell remoting and a credential saved with <code>Export-Clixml</code>. It is signed and <strong>runs as it is</strong>: do not edit it, because an edited file no longer matches the package inventory and the tool refuses it (so does a copy of it in <code>config\</code>). Set the configuration instead:</p>
+<div class="code"><div class="code-head"><span>PowerShell</span><button type="button" class="copy"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></svg><span>Copy</span></button></div><pre><code>EntraConnect = @{
+    Mode           = 'Script'
+    ScriptPath     = '.\config\EntraConnect.sample.ps1'
+    Server         = 'aadc01.contoso.com'                 # given to the script as -Server
+    CredentialPath = '.\config\EntraConnect.cred.xml'     # given as -CredentialPath; empty = EntraConnect.cred.xml beside the script
+}
+</code></pre></div>
+<p>Create the credential file once, with the account that runs the tool: <code>Get-Credential CONTOSO\svc-pra-sync | Export-Clixml .\config\EntraConnect.cred.xml</code> (only that Windows account, on that computer, can read it back). A script of your own, outside the package, receives <code>-Server</code> and <code>-CredentialPath</code> only when it declares them; one that does not declare them is called with <code>-Operation</code> alone, as before.</p>
 <h3 id="unsynchronised-native-resource-lifecycle">6.2 Unsynchronised native resource lifecycle</h3>
 <p>This lifecycle is new in 2.0.0 and is <strong>off by default</strong>: the synchronised shared-mailbox path is unchanged.</p>
 <div class="table-wrap"><table>
@@ -999,6 +1007,8 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Collect -Mode Apply -Force      
 pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Collect -Identity compta@contoso.com   # one object (preview)
 </code></pre></div>
 <p>Steps: Exchange on-premises connection, mailboxes in scope, shared mailbox permissions, contacts and distribution groups, target groups, saving the snapshot. Collect reads Exchange through a <strong>remote session</strong> (<code>New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri http://&lt;Exchange.Server&gt;/PowerShell/ -Authentication Kerberos</code>, then <code>Import-PSSession</code> of the cmdlets it uses): every object is a deserialized copy, and the code reads sizes, multi-valued properties, AD identifiers and enums accordingly. A snapshot is written with the status <em>Running</em> and marked <em>Complete</em> at the end: an interrupted Collect never replaces the last good snapshot. A snapshot of one object (<code>-Identity -Mode Apply</code>) asks for a confirmation, because it becomes the last snapshot.</p>
+<p><strong>A Collect that lost its mailboxes is refused.</strong> A Collect that finds no mailbox, or more than <code>Collect.MaxDropPercent</code> (default 50) percent fewer than the last complete snapshot of the same scope, writes nothing and ends with <code>RESULT: FAIL</code> (exit code 1): the last good snapshot stays the last complete one and is never pushed out by <code>Store.KeepSnapshots</code>. A Preview shows the same refusal as a warning. When the drop is expected (mailboxes moved, scope narrowed), raise <code>Collect.MaxDropPercent</code> for the run (100 accepts any size). Collect also stops when it cannot set <code>ViewEntireForest</code> on the Exchange session (without it only the home domain would be read), and when a read of Exchange fails in the middle of a group (a member that cannot be read is never taken for a member without mailbox). A group member that does not exist any more in Active Directory is kept as <em>Unknown</em>, counted as a warning of the Collect and listed in the issues of the snapshot.</p>
+<p><strong>Which snapshots are kept.</strong> After a successful Collect the oldest snapshots beyond <code>Store.KeepSnapshots</code> are deleted, <strong>except</strong> the snapshot of a Convert batch that is not rolled back yet (when the journal <code>Store.JournalPath</code> is on the same computer): the run says which ones it kept. If the journal cannot be read, nothing is deleted. A computer that collects without the journal cannot know: keep <code>Store.KeepSnapshots</code> high enough, and remember that <code>Store.BackupFolder</code> keeps a copy of every snapshot written.</p>
 <p><strong>Target groups.</strong> Groups named in <code>Collect.TargetGroups</code> (a name, a sAMAccountName, a distinguished name or an SMTP address) and the group of <code>Scope.GroupDN</code> are stored with <strong>every member</strong>: nested groups are followed (a cycle is safe), and users, computers, contacts and groups are all kept with their class (tables <code>target_group</code> and <code>target_member</code>). After the disaster this is what lets <code>-Group</code> select a wave when AD is gone, and tells <strong>why</strong> a member is skipped. A configured group that is not found is a warning; the rest of the Collect goes on. With <code>Scope.Mode = 'Group'</code>, the members that are not mailboxes are reported as excluded, with their reason.</p>
 <h3 id="scheduling">Scheduling</h3>
 <p>One command registers the daily task. Open <strong>PowerShell 7 as administrator</strong> on the computer that runs Collect, in the folder of the tool. Preview first, then apply:</p>
@@ -1110,7 +1120,7 @@ Register-ScheduledTask -TaskName 'PRA Collect' -Action $action -Trigger $trigger
 <tr>
 <td><strong>Not verifiable</strong></td>
 <td>no <code>.sha256</code> beside the file (an old snapshot, or a copy made without it)</td>
-<td>a <strong>warning</strong> only: the tool cannot prove the file is the one written by Collect</td>
+<td>a Preview and a Check only <strong>warn</strong>; a <strong>Convert or a Recover in Apply mode stops, nothing changed</strong>: the tool cannot prove the file is the one written by Collect. Copy the <code>.sha256</code> with the file, or give <code>-AcceptUnverifiedSnapshot</code> when you know the file is the right one</td>
 </tr>
 <tr>
 <td><strong>Changed</strong></td>
@@ -1119,7 +1129,8 @@ Register-ScheduledTask -TaskName 'PRA Collect' -Action $action -Trigger $trigger
 </tr>
 </tbody>
 </table></div>
-<p>With <code>-AcceptUnverifiedSnapshot</code> (Check, Convert, Recover) the run goes on although the snapshot changed. Use it only when you know why the file changed and accept it as it is. The run says so in the banner, the log, the summary and the report, and the next steps keep the switch. The console shows the light <strong>Snapshot</strong> as Verified, Not verifiable or Changed (red).</p>
+<p>With <code>-AcceptUnverifiedSnapshot</code> (Check, Convert, Recover) the run goes on although the snapshot changed or has no <code>.sha256</code>. Use it only when you know why and accept the file as it is. The run says so in the banner, the log, the summary and the report, and the next steps keep the switch. The console shows the light <strong>Snapshot</strong> as Verified, Not verifiable or Changed (red). Collect keeps the previous <code>.sha256</code> until the new one is written, and writes it again for the database as it is when a Collect fails after it opened the database, so a failed Collect does not leave the good snapshot without its hash.</p>
+<p><strong>A batch is tied to its snapshot.</strong> Convert records, in the journal, the run of Collect and a digest of the content (mailboxes, permissions, group members) of the snapshot it was made from; Recover and <code>Check -Batch</code> use the same snapshot, found by its run and not by its number, and <strong>stop, nothing changed</strong>, when the snapshot is missing or its content is not the one the batch was made from (<code>-AcceptUnverifiedSnapshot</code> accepts a different content). When it is missing, the message points to <code>Store.BackupFolder</code>: every Collect writes a copy named <code>PraCloudMailbox_&lt;Environment&gt;_snapshot&lt;number&gt;_&lt;date&gt;.db</code> there, which is never deleted; copy it over <code>Store.Path</code> with its <code>.sha256</code> and run the command again. A batch made before this version has no record: the tool uses the number written in the journal and warns that it cannot prove the snapshot.</p>
 </div></section><section class="section" id="check"><div class="section-head"><div class="section-icon"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></svg></div><div><div class="section-eyebrow">Chapter 8</div><h2>Check</h2></div></div><div class="section-body">
 <div class="code"><div class="code-head"><span>PowerShell</span><button type="button" class="copy"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></svg><span>Copy</span></button></div><pre><code># PowerShell 7 on the cloud admin server
 pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Check
@@ -1606,7 +1617,7 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Recover -Batch 5b21030d -Mode Ap
 </tr>
 <tr>
 <td><code>module\PRA.Store.psm1</code></td>
-<td>SQLite (System.Data.SQLite in <code>lib\sqlite</code>): snapshot schema 3, journal schema 2; older stores remain readable; the <code>.sha256</code> helpers</td>
+<td>SQLite (System.Data.SQLite in <code>lib\sqlite</code>): snapshot schema 3, journal schema 3; older stores remain readable; the <code>.sha256</code> helpers</td>
 </tr>
 <tr>
 <td><code>module\PRA.Collect.psm1</code></td>
@@ -1702,7 +1713,7 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Recover -Batch 5b21030d -Mode Ap
 <h3 id="coexistence-with-pra-remote-mailbox">13.2 Coexistence with PRA Remote Mailbox</h3>
 <p>Every command of this tool has the noun prefix <code>Pcm</code>; PRA Remote Mailbox uses <code>Pra</code>. The two tools can be imported in the same PowerShell session without either replacing a command of the other. A test compares the functions that this tool defines and exports with the frozen list of the commands of PRA Remote Mailbox 3.1.3 (<code>tests\fixtures\PraRemoteMailbox-3.1.3-commands.json</code>); a live test imports both manifests when <code>PRA_REMOTE_MAILBOX_PACKAGE</code> names a package folder of PRA Remote Mailbox.</p>
 </div></section><section class="section" id="the-databases"><div class="section-head"><div class="section-icon"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="8" ry="3"/><path d="M4 5.5v13c0 1.7 3.6 3 8 3s8-1.3 8-3v-13"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg></div><div><div class="section-eyebrow">Chapter 14</div><h2>The databases</h2></div></div><div class="section-body">
-<p>Two SQLite files, never mixed up: each one records its kind and the tool refuses the other. The snapshot uses <strong>schema 3</strong> and the journal <strong>schema 2</strong>; snapshots of schema 1 and 2 and the journal of schema 1 remain readable without modification (they are upgraded only when a command that writes opens them), and a snapshot without the target-group tables sends <code>-Group</code> straight to Microsoft Entra ID. Old rows do not acquire invented values.</p>
+<p>Two SQLite files, never mixed up: each one records its kind and the tool refuses the other. The snapshot uses <strong>schema 3</strong> and the journal <strong>schema 3</strong> (the journal of schema 3 adds the run and the content digest of the snapshot to each batch, and an index on <code>batch_item.object_guid</code>); snapshots of schema 1 and 2 and the journals of schema 1 and 2 remain readable without modification (they are upgraded only when a command that writes opens them), and a snapshot without the target-group tables sends <code>-Group</code> straight to Microsoft Entra ID. Old rows do not acquire invented values.</p>
 <p><strong>Snapshots</strong> (<code>Store.Path</code>, written by Collect): <code>snapshot</code> (one row per Collect: status, dates, server, scope, counters), <code>mailbox</code>, <code>permission</code>, <code>group_member</code> (members of the groups used as trustees), <code>contact</code>, <code>distribution_group</code>, <code>dl_member</code>, <code>collect_issue</code>, <code>target_group</code> (the groups kept by Collect: name, sAMAccountName, distinguished name, SMTP address, display name, member count) and <code>target_member</code> (every member, with its class, its UPN, SMTP address, DN, the group it came through and its depth). Every data row carries its <code>snapshot_id</code>; deleting a snapshot deletes its rows. The <code>.sha256</code> beside the file is the only integrity record of the snapshot.</p>
 <p><strong>Journal</strong> (<code>Store.JournalPath</code>, cloud side, written by Convert and Recover; a new copy of the snapshot file never touches it; <strong>not covered by a hash</strong>): <code>batch</code> (one row per Convert or Recover: action, snapshot, linked Convert batch, status, account, counters), <code>batch_item</code> (one row per object: Entra ID object, original state, last step, status, message), <code>batch_event</code> (every step with its time and outcome), <code>tenant_change</code> (licence group switched to the cloud, and when it was given back), <code>batch_run</code> (every run on a batch: who, when, which source and settings, how it ended: the input of the global report).</p>
 <div class="code"><div class="code-head"><span>PowerShell</span><button type="button" class="copy"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></svg><span>Copy</span></button></div><pre><code>Import-Module .\module\PRA.Store.psm1
@@ -1781,7 +1792,15 @@ Close-PcmStore $journal
 </tr>
 <tr>
 <td><em>… cannot prove it is the file written by Collect</em></td>
-<td>No <code>.sha256</code> beside the snapshot. A warning: copy the <code>.sha256</code> file with the snapshot next time</td>
+<td>No <code>.sha256</code> beside the snapshot. A Preview and a Check warn; a Convert or a Recover in Apply mode stops: copy the <code>.sha256</code> file with the snapshot, or <code>-AcceptUnverifiedSnapshot</code> when you know the file is the right one</td>
+</tr>
+<tr>
+<td><em>Batch … was made from snapshot …, which is not in …</em> or <em>… is not the snapshot that batch … was made from</em></td>
+<td>The snapshot of the batch was deleted by Collect (beyond <code>Store.KeepSnapshots</code>) or the database was replaced. Copy the file of that snapshot from <code>Store.BackupFolder</code> over <code>Store.Path</code>, with its <code>.sha256</code>, and run the command again</td>
+</tr>
+<tr>
+<td><em>Collect found no mailbox …</em> or <em>… fewer than the last complete snapshot …</em></td>
+<td>Collect refused to write a snapshot that lost its mailboxes (<code>Collect.MaxDropPercent</code>). Find out why Exchange returned fewer mailboxes, or raise the setting when the drop is expected</td>
 </tr>
 <tr>
 <td><em>Choose one way to say which objects</em></td>
@@ -1945,7 +1964,7 @@ Close-PcmStore $journal
 </div></section><section class="section" id="appendix-d-versions"><div class="section-head"><div class="section-icon"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12V4h8l10 10-8 8z"/><circle cx="7.5" cy="8" r="1.5"/></svg></div><div><div class="section-eyebrow">Start here</div><h2>Appendix D - Versions</h2></div></div><div class="section-body">
 <p>MAJOR.MINOR.PATCH: MAJOR for an incompatible change of the configuration, of the databases or of the procedure, MINOR for a feature, PATCH for a fix. See <code>CHANGELOG.md</code>.</p>
 </div></section>
-<footer>PRA Cloud Mailbox 2.0.0 · Nicolas Fabert · generated 2026-11-13 19:35 from PraCloudMailbox-Guide.md</footer></main>
+<footer>PRA Cloud Mailbox 2.0.0 · Nicolas Fabert · generated 2026-11-14 20:47 from PraCloudMailbox-Guide.md</footer></main>
 <button type="button" id="to-top" title="Back to top"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 14 6-6 6 6"/></svg></button>
 <dialog id="zoom"></dialog>
 <script>

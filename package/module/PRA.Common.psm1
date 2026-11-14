@@ -889,7 +889,7 @@ function Get-PcmDefaultConfiguration {
         Collect = @{
             SharedPermissions=$true; ExpandGroupTrustees=$true; ExcludeTrustees=@(); MailboxStatistics=$false
             Contacts=$false; ContactsSearchBase=''; DistributionGroups=$false; DistributionGroupsSearchBase=''; DynamicDistributionGroups=$false
-            TargetGroups=@()
+            TargetGroups=@(); MaxDropPercent=50
             Schedule=@{ TaskName='PraCloudMailbox Collect'; At='02:00' }
         }
         Store = @{ Path='.\data\PraCloudMailbox.db'; KeepSnapshots=10; BackupFolder='.\data\backup'; MaxSnapshotAgeDays=7; JournalPath='.\data\PraCloudMailbox-journal.db' }
@@ -903,7 +903,7 @@ function Get-PcmDefaultConfiguration {
         Recover = @{ WaveSize=0 }
         Retention = @{ TagAttribute='CustomAttribute1'; TagValue='Converted'; HoldPolicy=''; HoldPolicyLimit=1000 }
         Resources = @{ LicensingGroupId=''; OnPremisesRoutingDomain=''; OnPremisesReady=$false; AllowUnprotectedDeletion=$false; Parallel=100 }
-        EntraConnect = @{ Mode='Remoting'; Server=''; ScriptPath=''; MinVersion='2.5.76.0' }
+        EntraConnect = @{ Mode='Remoting'; Server=''; ScriptPath=''; CredentialPath=''; MinVersion='2.5.76.0' }
         Logging = @{ Folder='.\logs' }
         Report = @{ Enabled=$true; Folder='.\reports' }
     }
@@ -1100,6 +1100,7 @@ function Import-PcmConfiguration {
     if ($store.KeepSnapshots -lt 1 -or $store.KeepSnapshots -gt 1000) { throw 'Configuration: Store.KeepSnapshots must be between 1 and 1000.' }
     if ($store.MaxSnapshotAgeDays -lt 1 -or $store.MaxSnapshotAgeDays -gt 365) { throw 'Configuration: Store.MaxSnapshotAgeDays must be between 1 and 365.' }
     if (-not $store.Path) { throw 'Configuration: Store.Path is empty (SQLite database file).' }
+    if ($config.Collect.MaxDropPercent -lt 0 -or $config.Collect.MaxDropPercent -gt 100) { throw 'Configuration: Collect.MaxDropPercent must be a whole number between 0 and 100 (a Collect that finds more than this percentage fewer mailboxes than the last complete snapshot, or none, is refused; 100 accepts any size).' }
     $targetGroups = [System.Collections.Generic.List[string]]::new()
     foreach ($entry in @($config.Collect.TargetGroups)) {
         $text = ([string]$entry).Trim()
@@ -1163,6 +1164,7 @@ function Import-PcmConfiguration {
     $config.Store.BackupFolder = Resolve-PcmPath $config.Store.BackupFolder 'Store.BackupFolder' $Root
     $config.Store.JournalPath = Resolve-PcmPath $config.Store.JournalPath 'Store.JournalPath' $Root
     if ($config.EntraConnect.ScriptPath) { $config.EntraConnect.ScriptPath = Resolve-PcmPath $config.EntraConnect.ScriptPath 'EntraConnect.ScriptPath' $Root }
+    if ($config.EntraConnect.CredentialPath) { $config.EntraConnect.CredentialPath = Resolve-PcmPath $config.EntraConnect.CredentialPath 'EntraConnect.CredentialPath' $Root }
     $config.Logging.Folder = Resolve-PcmPath $config.Logging.Folder 'Logging.Folder' $Root
     $config.Report.Folder = Resolve-PcmPath $config.Report.Folder 'Report.Folder' $Root
     $config.Store.Path = Assert-PcmOutputFolder $config.Store.Path 'Store.Path' 'data' $Root

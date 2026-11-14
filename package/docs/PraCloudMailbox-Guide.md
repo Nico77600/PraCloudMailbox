@@ -323,7 +323,7 @@ There is no unsigned mode, switch or environment bypass. **Not covered, by desig
 | `Environment` | Label used in the backup file names; a batch only continues in its own environment |
 | `Exchange` | `Server` (host name of an Exchange server, **required by Collect**), `DomainController` (the same DC for every read of a run). `ConnectionMode` of 1.x is gone: `Local` is refused with a migration message, `Remote` is ignored |
 | `Scope` | `Mode` (`Auto`, `OU`, `Group`, `Csv`), `SearchBase`, `GroupDN`, `CsvPath` (column `Identity`: UPN, SMTP, sAMAccountName, DN or GUID), `IncludeUsers`, `IncludeShared`, `IncludeRoom`, `IncludeEquipment`, `ExcludeSamAccountNames`, `ConvertRooms` (default `$false`), `ResourceMode` (`SynchronizedShared`, default, or `CloudResource` for unsynchronised native resources) |
-| `Collect` | `SharedPermissions`, `ExpandGroupTrustees` (groups used as trustees: members stored and granted one by one), `ExcludeTrustees` (wildcards), `MailboxStatistics`, `Contacts`, `ContactsSearchBase`, `DistributionGroups`, `DistributionGroupsSearchBase`, `DynamicDistributionGroups`, `TargetGroups` (groups kept **with all their members**, nested groups, computers and contacts included, so that `-Group` works after the disaster; `Scope.GroupDN` is always kept too; a group that is not found is a warning) |
+| `Collect` | `SharedPermissions`, `ExpandGroupTrustees` (groups used as trustees: members stored and granted one by one), `ExcludeTrustees` (wildcards), `MailboxStatistics`, `Contacts`, `ContactsSearchBase`, `DistributionGroups`, `DistributionGroupsSearchBase`, `DynamicDistributionGroups`, `TargetGroups` (groups kept **with all their members**, nested groups, computers and contacts included, so that `-Group` works after the disaster; `Scope.GroupDN` is always kept too; a group that is not found is a warning), `MaxDropPercent` (0 to 100, default 50: a Collect that finds no mailbox, or more than this percentage fewer than the last complete snapshot of the same scope, writes nothing and fails; 100 accepts any size) |
 | `Store` | `Path` (snapshots), `KeepSnapshots`, `BackupFolder` (a consistent copy and its `.sha256` after each Collect), `MaxSnapshotAgeDays` (Check warns beyond), `JournalPath` (journal of Convert and Recover, cloud side) |
 | `Cloud` | `SignIn` (`Certificate` or `Interactive`), `UserPrincipalName` (the administrator proposed at an interactive sign-in), `TenantId`, `Organization`, `AppId`, `CertificateThumbprint`, `DefaultUsageLocation` (two letters, for the objects without usageLocation) |
 | `Exo` | `MinModuleVersion` (default `3.10.1`, the run stops before any change when the module is older; it cannot go under the built-in minimum) |
@@ -332,7 +332,7 @@ There is no unsigned mode, switch or environment bypass. **Not covered, by desig
 | `Recover` | `WaveSize` (shared mailboxes rolled back together, 1 to 1000; 0 or absent = the value of `Licensing.Shared.Parallel`; Recover uses no licence unit) |
 | `Retention` | `TagAttribute`, `TagValue` (written on the shared mailboxes), `HoldPolicy` (case hold policy of Recover), `HoldPolicyLimit` (mailboxes per policy before a sibling is created, 1 to 1000, default 1000) |
 | `Resources` | `LicensingGroupId` (old protected native journals only; unused for new resources), `OnPremisesRoutingDomain` (destination domain of the rebuilt native resources), `OnPremisesReady` (explicit operator assertion, default `$false`), `AllowUnprotectedDeletion` (explicit cloud-bookings/messages loss acknowledgement, default `$false`), `Parallel` (native resource waves, 1 to 1000, default 100) |
-| `EntraConnect` | `Mode` (`Remoting`, `Script`, `Manual`), `Server`, `ScriptPath`, `MinVersion` (chapter 6.1) |
+| `EntraConnect` | `Mode` (`Remoting`, `Script`, `Manual`), `Server`, `ScriptPath`, `CredentialPath` (`Script` mode: the credential file given to the script), `MinVersion` (chapter 6.1) |
 | `Logging`, `Report` | Folders; `Report.Enabled` |
 
 System mailboxes (HealthMailbox, SystemMailbox, DiscoverySearchMailbox...) and system or administration trustees (NT AUTHORITY, SIDs, Exchange and domain admin groups) are always excluded.
@@ -358,10 +358,21 @@ Recover needs, on the rebuilt Entra Connect server: delta cycles, and the schedu
 | `EntraConnect.Mode` | How | Requirements |
 |---|---|---|
 | `Remoting` | `Invoke-Command -ComputerName <Server>` with the current account, ADSync cmdlets | WinRM to the server, account in `ADSyncAdmins` |
-| `Script` | `<ScriptPath> -Operation Pause \| Resume \| Delta` | any access path (another account, a jump host, Azure Run Command...). Output: one line of state, logged. `exit 0` = done, any other exit code or an exception = failed |
+| `Script` | `<ScriptPath> -Operation Pause \| Resume \| Delta`, plus `-Server <EntraConnect.Server>` and `-CredentialPath <EntraConnect.CredentialPath>` when the script declares those parameters | any access path (another account, a jump host, Azure Run Command...). Output: one line of state, logged. `exit 0` = done, any other exit code or an exception = failed |
 | `Manual` | the tool asks the operator, who confirms | interactive console (not with `-Force`) |
 
-`config\EntraConnect.sample.ps1` implements the `Script` contract with PowerShell remoting and a credential saved with `Export-Clixml`: copy it and adapt the server name.
+`config\EntraConnect.sample.ps1` implements the `Script` contract with PowerShell remoting and a credential saved with `Export-Clixml`. It is signed and **runs as it is**: do not edit it, because an edited file no longer matches the package inventory and the tool refuses it (so does a copy of it in `config\`). Set the configuration instead:
+
+```powershell
+EntraConnect = @{
+    Mode           = 'Script'
+    ScriptPath     = '.\config\EntraConnect.sample.ps1'
+    Server         = 'aadc01.contoso.com'                 # given to the script as -Server
+    CredentialPath = '.\config\EntraConnect.cred.xml'     # given as -CredentialPath; empty = EntraConnect.cred.xml beside the script
+}
+```
+
+Create the credential file once, with the account that runs the tool: `Get-Credential CONTOSO\svc-pra-sync | Export-Clixml .\config\EntraConnect.cred.xml` (only that Windows account, on that computer, can read it back). A script of your own, outside the package, receives `-Server` and `-CredentialPath` only when it declares them; one that does not declare them is called with `-Operation` alone, as before.
 
 ### 6.2 Unsynchronised native resource lifecycle
 
@@ -431,6 +442,10 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Collect -Identity compta@contoso
 
 Steps: Exchange on-premises connection, mailboxes in scope, shared mailbox permissions, contacts and distribution groups, target groups, saving the snapshot. Collect reads Exchange through a **remote session** (`New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri http://<Exchange.Server>/PowerShell/ -Authentication Kerberos`, then `Import-PSSession` of the cmdlets it uses): every object is a deserialized copy, and the code reads sizes, multi-valued properties, AD identifiers and enums accordingly. A snapshot is written with the status *Running* and marked *Complete* at the end: an interrupted Collect never replaces the last good snapshot. A snapshot of one object (`-Identity -Mode Apply`) asks for a confirmation, because it becomes the last snapshot.
 
+**A Collect that lost its mailboxes is refused.** A Collect that finds no mailbox, or more than `Collect.MaxDropPercent` (default 50) percent fewer than the last complete snapshot of the same scope, writes nothing and ends with `RESULT: FAIL` (exit code 1): the last good snapshot stays the last complete one and is never pushed out by `Store.KeepSnapshots`. A Preview shows the same refusal as a warning. When the drop is expected (mailboxes moved, scope narrowed), raise `Collect.MaxDropPercent` for the run (100 accepts any size). Collect also stops when it cannot set `ViewEntireForest` on the Exchange session (without it only the home domain would be read), and when a read of Exchange fails in the middle of a group (a member that cannot be read is never taken for a member without mailbox). A group member that does not exist any more in Active Directory is kept as *Unknown*, counted as a warning of the Collect and listed in the issues of the snapshot.
+
+**Which snapshots are kept.** After a successful Collect the oldest snapshots beyond `Store.KeepSnapshots` are deleted, **except** the snapshot of a Convert batch that is not rolled back yet (when the journal `Store.JournalPath` is on the same computer): the run says which ones it kept. If the journal cannot be read, nothing is deleted. A computer that collects without the journal cannot know: keep `Store.KeepSnapshots` high enough, and remember that `Store.BackupFolder` keeps a copy of every snapshot written.
+
 **Target groups.** Groups named in `Collect.TargetGroups` (a name, a sAMAccountName, a distinguished name or an SMTP address) and the group of `Scope.GroupDN` are stored with **every member**: nested groups are followed (a cycle is safe), and users, computers, contacts and groups are all kept with their class (tables `target_group` and `target_member`). After the disaster this is what lets `-Group` select a wave when AD is gone, and tells **why** a member is skipped. A configured group that is not found is a warning; the rest of the Collect goes on. With `Scope.Mode = 'Group'`, the members that are not mailboxes are reported as excluded, with their reason.
 
 ### Scheduling
@@ -489,10 +504,12 @@ What the verification does:
 | State | Meaning | What the tool does |
 |---|---|---|
 | **Verified** | the hash of the file is the one of the `.sha256` | goes on: *Snapshot file verified: it matches the .sha256 written by Collect.* |
-| **Not verifiable** | no `.sha256` beside the file (an old snapshot, or a copy made without it) | a **warning** only: the tool cannot prove the file is the one written by Collect |
+| **Not verifiable** | no `.sha256` beside the file (an old snapshot, or a copy made without it) | a Preview and a Check only **warn**; a **Convert or a Recover in Apply mode stops, nothing changed**: the tool cannot prove the file is the one written by Collect. Copy the `.sha256` with the file, or give `-AcceptUnverifiedSnapshot` when you know the file is the right one |
 | **Changed** | the hash differs, or the `.sha256` holds no hash | **stops, nothing changed**: restore the snapshot from the external backup |
 
-With `-AcceptUnverifiedSnapshot` (Check, Convert, Recover) the run goes on although the snapshot changed. Use it only when you know why the file changed and accept it as it is. The run says so in the banner, the log, the summary and the report, and the next steps keep the switch. The console shows the light **Snapshot** as Verified, Not verifiable or Changed (red).
+With `-AcceptUnverifiedSnapshot` (Check, Convert, Recover) the run goes on although the snapshot changed or has no `.sha256`. Use it only when you know why and accept the file as it is. The run says so in the banner, the log, the summary and the report, and the next steps keep the switch. The console shows the light **Snapshot** as Verified, Not verifiable or Changed (red). Collect keeps the previous `.sha256` until the new one is written, and writes it again for the database as it is when a Collect fails after it opened the database, so a failed Collect does not leave the good snapshot without its hash.
+
+**A batch is tied to its snapshot.** Convert records, in the journal, the run of Collect and a digest of the content (mailboxes, permissions, group members) of the snapshot it was made from; Recover and `Check -Batch` use the same snapshot, found by its run and not by its number, and **stop, nothing changed**, when the snapshot is missing or its content is not the one the batch was made from (`-AcceptUnverifiedSnapshot` accepts a different content). When it is missing, the message points to `Store.BackupFolder`: every Collect writes a copy named `PraCloudMailbox_<Environment>_snapshot<number>_<date>.db` there, which is never deleted; copy it over `Store.Path` with its `.sha256` and run the command again. A batch made before this version has no record: the tool uses the number written in the journal and warns that it cannot prove the snapshot.
 
 <!-- icon: check -->
 ## 8. Check
@@ -700,7 +717,7 @@ Exit codes: `0` done, `1` failed (or an object is not ready for Check), `2` done
 | `Invoke-PraCloudMailbox.ps1` | entry script: parameters, edition check, the package integrity bootstrap, the run context, the four actions (`Invoke-PcmCollect`, `Invoke-PcmCheck`, `Invoke-PcmCheckBatch`, `Invoke-PcmConvert`, `Invoke-PcmRecover`) and their helpers (targets, licence need, assessment of the current state, journal) |
 | `PraCloudMailbox.psd1`, `PraCloudMailbox.psm1` | the manifest (the single source of the tool version, read by `Get-PcmToolVersion`) and the root module that loads `PRA.Common` and `PRA.Store` |
 | `module\PRA.Common.psm1` | console theme, banner, steps, summary card, log, configuration (`Import-PcmConfiguration`), audit (log + transcript), results and reports (`Complete-PcmRun`), the global report, the cloud module report |
-| `module\PRA.Store.psm1` | SQLite (System.Data.SQLite in `lib\sqlite`): snapshot schema 3, journal schema 2; older stores remain readable; the `.sha256` helpers |
+| `module\PRA.Store.psm1` | SQLite (System.Data.SQLite in `lib\sqlite`): snapshot schema 3, journal schema 3; older stores remain readable; the `.sha256` helpers |
 | `module\PRA.Collect.psm1` | Collect (remote Exchange session): scope, mailboxes, permissions, groups expanded, contacts and distribution groups, target groups |
 | `module\PRA.Cloud.psm1` | cloud: connections (certificate or interactive), Graph with retries, tenant facts, readiness rules (`Get-PcmReadiness`, pure functions), the follow-up of a batch, source of authority, licences, permissions, case hold, Entra Connect operations |
 | `module\PRA.Gui.psm1`, `PRA.Gui.*.ps1`, `PRA.Gui.xaml` | the console (`-Gui`): the five pages, the state read from the files, the runs in a child process (chapter 13.1) |
@@ -750,7 +767,7 @@ Every command of this tool has the noun prefix `Pcm`; PRA Remote Mailbox uses `P
 <!-- icon: database -->
 ## 14. The databases
 
-Two SQLite files, never mixed up: each one records its kind and the tool refuses the other. The snapshot uses **schema 3** and the journal **schema 2**; snapshots of schema 1 and 2 and the journal of schema 1 remain readable without modification (they are upgraded only when a command that writes opens them), and a snapshot without the target-group tables sends `-Group` straight to Microsoft Entra ID. Old rows do not acquire invented values.
+Two SQLite files, never mixed up: each one records its kind and the tool refuses the other. The snapshot uses **schema 3** and the journal **schema 3** (the journal of schema 3 adds the run and the content digest of the snapshot to each batch, and an index on `batch_item.object_guid`); snapshots of schema 1 and 2 and the journals of schema 1 and 2 remain readable without modification (they are upgraded only when a command that writes opens them), and a snapshot without the target-group tables sends `-Group` straight to Microsoft Entra ID. Old rows do not acquire invented values.
 
 **Snapshots** (`Store.Path`, written by Collect): `snapshot` (one row per Collect: status, dates, server, scope, counters), `mailbox`, `permission`, `group_member` (members of the groups used as trustees), `contact`, `distribution_group`, `dl_member`, `collect_issue`, `target_group` (the groups kept by Collect: name, sAMAccountName, distinguished name, SMTP address, display name, member count) and `target_member` (every member, with its class, its UPN, SMTP address, DN, the group it came through and its depth). Every data row carries its `snapshot_id`; deleting a snapshot deletes its rows. The `.sha256` beside the file is the only integrity record of the snapshot.
 
@@ -819,7 +836,9 @@ The repository tools (not in the package, PowerShell 7.5 and Microsoft Edge):
 | *Certificate … not found in Cert:\CurrentUser\My nor Cert:\LocalMachine\My.* | The certificate of the app is not on this computer, or has no private key. Import it, or use `Cloud.SignIn = 'Interactive'` |
 | *… needs a window where you can sign in, and this PowerShell was started with -NonInteractive* | An interactive sign-in cannot run in a scheduled task or a `-NonInteractive` process. Use the certificate, or open PowerShell 7 normally |
 | *… was changed after its last Collect* | The snapshot does not match its `.sha256`. Restore it from the external backup. `-AcceptUnverifiedSnapshot` only when you know why |
-| *… cannot prove it is the file written by Collect* | No `.sha256` beside the snapshot. A warning: copy the `.sha256` file with the snapshot next time |
+| *… cannot prove it is the file written by Collect* | No `.sha256` beside the snapshot. A Preview and a Check warn; a Convert or a Recover in Apply mode stops: copy the `.sha256` file with the snapshot, or `-AcceptUnverifiedSnapshot` when you know the file is the right one |
+| *Batch … was made from snapshot …, which is not in …* or *… is not the snapshot that batch … was made from* | The snapshot of the batch was deleted by Collect (beyond `Store.KeepSnapshots`) or the database was replaced. Copy the file of that snapshot from `Store.BackupFolder` over `Store.Path`, with its `.sha256`, and run the command again |
+| *Collect found no mailbox …* or *… fewer than the last complete snapshot …* | Collect refused to write a snapshot that lost its mailboxes (`Collect.MaxDropPercent`). Find out why Exchange returned fewer mailboxes, or raise the setting when the drop is expected |
 | *Choose one way to say which objects* | Two of `-Identity`, `-CsvPath`, `-SearchBase`, `-Group` were given |
 | *Group … is not in snapshot … nor in Microsoft Entra.* | Check the name; add the group to `Collect.TargetGroups` and collect again; or give the object ID |
 | *This sign-in cannot read groups in Microsoft Entra ID* | None of the group-read permissions is granted: grant `GroupMember.Read.All`, or capture the group with Collect |
