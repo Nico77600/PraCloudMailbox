@@ -33,7 +33,7 @@ In a hybrid organisation, a mailbox hosted on-premises is only a *mail user* for
 
 Done by hand, giving each user a cloud mailbox means changing the source of authority of every identity, licensing it in the right order, recreating the shared mailboxes with their permissions — which can no longer be read on-premises — and, months later, undoing all of it **without deleting the mails received in the cloud**. This tool collects what it needs before the disaster, then does the conversion and the rollback in the order proven against a real tenant, verified at each step and journaled.
 
-**Author:** Nicolas Fabert · **Version:** 2.0.0 ([changelog](CHANGELOG.md)).
+**Author:** Nicolas Fabert · **Version:** 2.1.0 ([changelog](CHANGELOG.md)).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-principles-dark.png">
@@ -147,12 +147,12 @@ Every run also writes a log, a PowerShell transcript, a CSV and an HTML report; 
 
 Do these steps in order. Each one is explained, with pictures, in the [user guide](package/docs/PraCloudMailbox-UserGuide.md).
 
-1. **Download the release, not the source.** On the [releases page](https://github.com/Nico77600/PraCloudMailbox/releases) take `PraCloudMailbox-2.0.0.zip` and its `.sha256` file from the **Assets** list. The "Source code" archives are not the tool.
+1. **Download the release, not the source.** On the [releases page](https://github.com/Nico77600/PraCloudMailbox/releases) take `PraCloudMailbox-2.1.0.zip` and its `.sha256` file from the **Assets** list. The "Source code" archives are not the tool.
 2. **Verify the download.** Compare the hash of the zip with the one in the `.sha256` file, then check the signature of the verifier:
 
    ```powershell
-   (Get-FileHash .\PraCloudMailbox-2.0.0.zip -Algorithm SHA256).Hash
-   Get-Content .\PraCloudMailbox-2.0.0.zip.sha256
+   (Get-FileHash .\PraCloudMailbox-2.1.0.zip -Algorithm SHA256).Hash
+   Get-Content .\PraCloudMailbox-2.1.0.zip.sha256
    Get-AuthenticodeSignature .\module\Test-PackageIntegrity.ps1 | Format-List Status, SignerCertificate    # in the extracted folder: Status must be Valid
    ```
 

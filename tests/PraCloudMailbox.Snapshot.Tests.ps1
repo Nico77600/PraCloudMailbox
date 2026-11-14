@@ -4,7 +4,7 @@
     Check, Convert and Recover make before they read the snapshot. No Exchange and no cloud: Collect runs in a child process against synthetic Exchange commands.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0
+    Version : 2.1.0
 #>
 #Requires -Version 7.5
 

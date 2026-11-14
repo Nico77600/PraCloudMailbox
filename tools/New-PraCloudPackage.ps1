@@ -33,11 +33,11 @@
 
 .EXAMPLE
     .\tools\New-PraCloudPackage.ps1 -Zip
-    Creates ..\package\PraCloudMailbox-2.0.0, ..\package\PraCloudMailbox-2.0.0.zip and ..\package\PraCloudMailbox-2.0.0.zip.sha256.
+    Creates ..\package\PraCloudMailbox-2.1.0, ..\package\PraCloudMailbox-2.1.0.zip and ..\package\PraCloudMailbox-2.1.0.zip.sha256.
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0
+    Version : 2.1.0
     Part of : PRA Cloud Mailbox (repository tool, not in the package)
 #>
 [CmdletBinding()]

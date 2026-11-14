@@ -134,7 +134,7 @@ Describe 'Case: helpers' {
         Resolve-PcmOfficialValue 'users' @('All', 'UsersOnly') | Should -BeNullOrEmpty
     }
     It 'reads the tool version in one place' {
-        Get-PcmToolVersion | Should -Be '2.0.0'
+        Get-PcmToolVersion | Should -Be '2.1.0'
         $script:EntrySource | Should -Match '(?m)^\$toolVersion = Get-PcmToolVersion'
         $script:EntrySource | Should -Not -Match "(?m)^\`$toolVersion = '"
     }

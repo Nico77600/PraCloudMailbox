@@ -201,7 +201,7 @@
 
 .NOTES
     Author     : Nicolas Fabert
-    Version    : 2.0.0
+    Version    : 2.1.0
     Requires   : PowerShell 7.5 or later for every action and for the window.
                  Collect: a domain-joined computer that reaches Exchange.Server with Kerberos.
                  Schedule: the same computer, in an elevated window.

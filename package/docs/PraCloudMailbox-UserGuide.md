@@ -1,7 +1,7 @@
 ﻿---
 title: PRA Cloud Mailbox
 subtitle: User guide
-version: 2.0.0
+version: 2.1.0
 author: Nicolas Fabert
 updated: 2026-11-12
 runtime: PowerShell 7.5+ (engine and console)
@@ -150,12 +150,12 @@ You do this part **one time**. It is best to do it **before** the disaster, as a
 
 **Do:**
 
-1. Download `PraCloudMailbox-2.0.0.zip` and its `.sha256` file from the release page of the project. Take the two files named in the **Assets** list. Do **not** take the "Source code" archives: they are not the tool.
+1. Download `PraCloudMailbox-2.1.0.zip` and its `.sha256` file from the release page of the project. Take the two files named in the **Assets** list. Do **not** take the "Source code" archives: they are not the tool.
 2. Check the checksum. Open **PowerShell 7** (Start button, type `PowerShell 7`). Run these two lines in the folder of the download:
 
 ```powershell
-(Get-FileHash .\PraCloudMailbox-2.0.0.zip -Algorithm SHA256).Hash
-Get-Content .\PraCloudMailbox-2.0.0.zip.sha256
+(Get-FileHash .\PraCloudMailbox-2.1.0.zip -Algorithm SHA256).Hash
+Get-Content .\PraCloudMailbox-2.1.0.zip.sha256
 ```
 
 3. Compare the two values. The text file holds the hash, two spaces, and the file name. The letters can be capital or small. The hash must be the same.

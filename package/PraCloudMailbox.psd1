@@ -19,7 +19,7 @@
 #
 @{
     RootModule            = 'PraCloudMailbox.psm1'
-    ModuleVersion         = '2.0.0'
+    ModuleVersion         = '2.1.0'
     GUID                  = 'a26c3290-5d5e-4c64-8d21-da399dbc964f'
     Author                = 'Nicolas Fabert'
     Description           = 'PRA Cloud Mailbox: disaster-recovery tool for an Exchange environment whose Active Directory, Exchange and Entra Connect are lost. Collect reads Exchange before the disaster; Convert gives users and shared mailboxes a mailbox in Exchange Online; Recover rolls everything back when the infrastructure is rebuilt.'
@@ -39,7 +39,7 @@
         'Initialize-PcmPrivateFolder', 'ConvertTo-PcmCsvCell', 'ConvertTo-PcmCsvRow', 'Read-PcmCsvText',
         # Snapshot and journal store (PRA.Store)
         'Import-PcmSqlite', 'Open-PcmStore', 'Close-PcmStore', 'Invoke-PcmSql', 'New-PcmSnapshot', 'Set-PcmSnapshotStatus', 'Add-PcmRow', 'Get-PcmSnapshot', 'Get-PcmSnapshotList',
-        'Read-PcmTable', 'Test-PcmTable', 'Find-PcmTargetGroup', 'Remove-PcmOldSnapshot', 'Get-PcmSnapshotDigest', 'Get-PcmSnapshotInUse', 'Read-PcmCsvText', 'Get-PcmCsvDelimiter', 'Backup-PcmStore', 'Get-PcmFileHash', 'Write-PcmHashFile', 'Remove-PcmHashFile', 'Read-PcmHashFile', 'Test-PcmSnapshotHash', 'New-PcmBatch', 'Set-PcmBatch', 'Get-PcmBatch', 'Set-PcmBatchItem',
+        'Read-PcmTable', 'Test-PcmTable', 'Find-PcmTargetGroup', 'Remove-PcmOldSnapshot', 'Get-PcmSnapshotDigest', 'Get-PcmSnapshotInUse', 'Get-PcmCsvDelimiter', 'Backup-PcmStore', 'Get-PcmFileHash', 'Write-PcmHashFile', 'Remove-PcmHashFile', 'Read-PcmHashFile', 'Test-PcmSnapshotHash', 'New-PcmBatch', 'Set-PcmBatch', 'Get-PcmBatch', 'Set-PcmBatchItem',
         'Get-PcmBatchItem', 'Add-PcmBatchEvent', 'Set-PcmTenantChange', 'Get-PcmTenantChange', 'Add-PcmBatchRun', 'Get-PcmBatchHistory'
     )
     CmdletsToExport       = @()

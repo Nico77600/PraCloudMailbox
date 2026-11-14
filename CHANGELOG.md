@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.1.0 - 2026-11-15
+
+Highlights, in plain words:
+
+- **Check -Batch tells the truth.** It follows every object of the batch, also the ones Convert never started or that failed at their first step, and no longer says "every object is provisioned" while the batch is not Complete.
+- **No wrong object.** A user found in Microsoft Entra ID by its UPN only, with another mailbox GUID, is an error (`ENTRA_WRONG_OBJECT`) and is not converted.
+- **An interrupted run is a failed run.** Ctrl+C or a closed window ends with `RESULT: FAIL` and the command to resume; the batch becomes Partial. A Convert is no longer resumed once a Recover rolled it back.
+- **A batch stays tied to its snapshot.** Convert keeps the run and the content digest of its snapshot; Recover and Check stop when it is missing or different, and Collect never deletes the snapshot of a batch that is not rolled back.
+- **A Collect that lost its mailboxes is refused** (`Collect.MaxDropPercent`, 50 by default), so the good snapshots stay. Convert and Recover in Apply mode need the `.sha256` file of the snapshot (or `-AcceptUnverifiedSnapshot`).
+- **Recover follows the batch.** It uses the licence mode of the Convert batch, journals the deletion of a shared mailbox identity before it waits, and reads the recycle bin without taking an error for a purge.
+- **Shared mailbox waves** no longer fail an object that needs no licence unit, and wait once for the units the previous wave gave back.
+- **Global report with no limit.** Every object and every step is in the page and in two CSV files, one for the objects and one for the events.
+- **Console.** Continuing a rollback stays on its wave, a preview is only good for the files it was made on, and a preview of thousands of objects no longer freezes the window.
+- **Entra Connect script mode.** The server and the credential file come from the configuration (`EntraConnect.CredentialPath`), so the signed sample runs as it is.
+- **Safer folders and lists.** The data, log, report and backup folders are created private. Lists in ANSI or UTF-8, with the Identity column anywhere, are read. A group name in non-ASCII letters is matched whatever its case.
+- **Guides.** What the tool does not recreate (contacts, distribution groups, Microsoft 365 groups) is now said plainly.
+
 ## 2.0.0 - 2026-11-14
 
 Highlights, in plain words:

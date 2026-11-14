@@ -4,7 +4,7 @@
     read by Collect, and the Script mode of Entra Connect (Pester 5+). No Exchange, no cloud: Collect runs in a child process against synthetic Exchange commands.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0
+    Version : 2.1.0
 #>
 #Requires -Version 7.5
 

@@ -10,7 +10,7 @@
     $global:PcmRemoteStubs is the text of the commands of a test runner that has no Exchange: a remote session that opens and the round trip, to be pasted into a runner script.
 .NOTES
     Author : Nicolas Fabert
-    Version: 2.0.0
+    Version: 2.1.0
 #>
 #Requires -Version 7.5
 
