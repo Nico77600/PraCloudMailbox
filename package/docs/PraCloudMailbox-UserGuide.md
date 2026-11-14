@@ -257,7 +257,7 @@ This is the most important part of the preparation. Read it twice.
 3. **Protect who can read it.** The snapshot holds names, e-mail addresses, GUIDs and permissions. Give the folder and the backups a **restricted access list**: the administrators of the tool and the backup account only. Never share the folder with **Domain Users**.
 4. **Copy the `.sha256` file with it.** Collect writes `PraCloudMailbox.db.sha256` beside the snapshot, and one beside each backup. The tool checks the snapshot against this file **before** it reads it, in Check, Convert and Recover.
 5. **If the check says the file changed, restore it from the external backup.** The message says *Nothing was changed.* and *Restore the file from your external backup*. Use `-AcceptUnverifiedSnapshot` **only** when you know why the file changed and you accept it as it is. A snapshot with **no** `.sha256` file gives a warning in a Preview and in a Check. A **Convert or a Recover in Apply mode stops** and changes nothing: copy the `.sha256` file with the snapshot, or add `-AcceptUnverifiedSnapshot` when you know the file is the right one.
-6. **A Collect that lost its mailboxes is refused.** If Collect finds no mailbox, or more than half fewer than the last good snapshot (`Collect.MaxDropPercent`, 50 by default), it writes nothing and ends with `RESULT: FAIL`. The last good snapshot stays. Find out why Exchange returned fewer mailboxes. Raise the setting only if the drop is expected.
+6. **A Collect that lost its mailboxes is refused.** Collect refuses to write a snapshot that has no mailbox. It also refuses one that has far fewer than the last good snapshot (`Collect.MaxDropPercent`, 50 by default). It writes nothing and ends with `RESULT: FAIL`. The last good snapshot stays. Find out why Exchange returned fewer mailboxes. Raise the setting only if the drop is expected.
 7. **A batch keeps its snapshot.** Convert remembers which snapshot it was made from. Recover and the follow-up of a batch use **that** snapshot, and stop, changing nothing, if it is missing or not the same. Collect never deletes the snapshot of a batch that is not rolled back yet. If the tool says the snapshot of a batch is missing, copy that file from `data\backup` over `data\PraCloudMailbox.db`, with its `.sha256` file.
 8. **Back up the journal too.** The journal is `data\PraCloudMailbox-journal.db`. It is written by Convert and Recover themselves, so the checksum does **not** cover it. It is the record of every change and the only input of the rollback. Copy it off-site **during** the operations, not only after.
 
@@ -388,7 +388,7 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Convert -Identity adele.vance@co
 
 **If not:** a red number such as **1 blocking** means the tool refuses this object. Click the line and read the reason. Do not go on. Stop and ask.
 
-A preview is only good for the files it was made on. If you change the settings file, the list of objects, the tool itself or the snapshot after the preview, the console refuses the next step (*The run is refused: the task, the objects or the settings changed since the preview. Preview again.*). Press **Preview** again.
+A preview is only good for the files it was made on. Change the settings file, the list of objects, the tool or the snapshot after the preview, and the console refuses the next step. It says *The run is refused: the task, the objects or the settings changed since the preview. Preview again.* Press **Preview** again.
 
 One reason in red deserves a stop: **ENTRA_WRONG_OBJECT**. The tool found an account in Microsoft Entra ID by the sign-in name only, and its mailbox is not the one of the snapshot. It is probably another person's account. The tool changes nothing on it and does not convert the object. Do not force it. Ask your administrator to fix the account or the sign-in name in Entra ID, or leave the object out.
 
@@ -512,7 +512,7 @@ Choose **Everything in the snapshot**, or leave out every source option. The too
 - **`Licensing.Shared.Parallel`** is the largest wave (100 by default).
 - **`Licensing.Shared.KeepFree`** is the number of units of that licence that Convert **never uses**. Use it to keep a few units for something else. **0** keeps none.
 
-A shared mailbox that needs **no** new unit (it is already a shared mailbox, or already holds the temporary licence) is never refused for a missing unit. If a wave finds no free unit, the tool waits **once**, up to 5 minutes, for the units that the previous wave gave back. If none comes, the shared mailboxes that need a unit are marked as failed (*not started: no free unit … nothing was changed on this object*), the others go on, and the batch is **partial**. Free a unit, then continue the batch.
+A shared mailbox that needs **no** new unit is never refused for a missing unit. This is a mailbox that is already shared, or already holds the temporary licence. If a wave finds no free unit, the tool waits **once**, up to 5 minutes, for the units that the previous wave gave back. If none comes, the shared mailboxes that need a unit are marked as failed (*not started: no free unit … nothing was changed on this object*), the others go on, and the batch is **partial**. Free a unit, then continue the batch.
 
 In the console, both numbers are in **Settings for this run only**.
 
@@ -577,7 +577,7 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Recover -Mode Apply -Batch 1a2b3
 
 The question is *Roll back … object(s) of Convert batch …?*
 
-The rollback uses the **licence mode of the batch**. If `Licensing.Users.Mode` in the settings file is not the one Convert used, the run stops before any change: *Convert batch … gave the Exchange plan of its users with Licensing.Users.Mode = … and the configuration now says …* Put the old value back in the settings file (with the same `GroupId` or `SkuPartNumber`), then run again.
+The rollback uses the **licence mode of the batch**. If `Licensing.Users.Mode` in the settings file is not the one Convert used, the run stops before any change: *Convert batch … gave the Exchange plan of its users with Licensing.Users.Mode = … and the configuration now says …* Put the old value back in the settings file. Keep the same `GroupId` or `SkuPartNumber`. Then run again.
 
 ### 3 · Wait
 
@@ -663,7 +663,7 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Check -Batch 1a2b3c4d -Expect Re
 
 Without `-Once`, the check **waits**, with the waiting times of the settings, until every object is as expected or the time is over. With `-Once`, it looks one time. If an object is not as expected, the exit code is 1 and the next steps say what to do.
 
-The check follows **every object of the batch**, also the ones that Convert never started (no free licence unit, a stop, an error at the first step). They are listed as *not converted: Convert never started this object, nothing was changed on it*. The tool never says that every object is provisioned while the batch is **not complete**: it ends with exit code 1 and tells you to continue the batch first.
+The check follows **every object of the batch**. This includes the ones that Convert never started, for example for lack of a free licence unit. They are listed as *not converted: Convert never started this object, nothing was changed on it*. The tool never says that every object is provisioned while the batch is **not complete**: it ends with exit code 1 and tells you to continue the batch first.
 
 ![The console of a follow-up: every object of the batch is provisioned](images/cli-follow-light.png)
 
