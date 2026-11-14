@@ -175,6 +175,7 @@ $finish = {
     if ($s.Extra) { $lines += @($s.Extra) }
     $lines += 'Next steps:'
     foreach ($step in @($s.NextSteps)) { $lines += ('  ' + $step) }
+    $lines += 'RESULT: FAIL'
     $text = ($lines -join [Environment]::NewLine)
     try { [Console]::Error.WriteLine($text) } catch { $null = $_ }
     try { $log = [string]$s.Context['LogFile']; if ($log) { [IO.File]::AppendAllText($log, $text + [Environment]::NewLine) } } catch { $null = $_ }
@@ -1065,12 +1066,12 @@ function Test-PcmTenantReadiness {
             elseif (-not $Tenant.LicenceGroup) { & $add 'Error' 'LICENCE_GROUP' "Licence group $($licensing.Users.GroupId) not found in Entra ID." }
             else {
                 $group = $Tenant.LicenceGroup
-                $plans = @(); $free = 0; $names = @(); $drawsShared = $false
+                $plans = @(); $free = $null; $names = @(); $drawsShared = $false
                 foreach ($assigned in @($group.assignedLicenses)) {
                     $sku = $skuById[[string]$assigned.skuId]
                     if (-not $sku) { continue }
                     $exchange = @(Get-PcmSkuExchangePlan -Sku $sku -DisabledPlanIds @($assigned.disabledPlans | ForEach-Object { [string]$_ }))
-                    if ($exchange.Count) { $plans += $exchange; $free += (Get-PcmFreeUnit $sku); $names += [string]$sku.skuPartNumber; if ($sharedSkuId -and [string]$sku.skuId -eq $sharedSkuId) { $drawsShared = $true } }
+                    if ($exchange.Count) { $plans += $exchange; $free = if ($null -eq $free) { Get-PcmFreeUnit $sku } else { [Math]::Min($free, (Get-PcmFreeUnit $sku)) }; $names += [string]$sku.skuPartNumber; if ($sharedSkuId -and [string]$sku.skuId -eq $sharedSkuId) { $drawsShared = $true } }
                 }
                 if (-not $plans.Count) { & $add 'Error' 'LICENCE_GROUP' "Group $($group.displayName) assigns no licence with an Exchange plan enabled." }
                 else {
@@ -1237,6 +1238,22 @@ function Get-PcmExoStateSet {
     return $result
 }
 
+function Get-PcmRetryAfterSecond {
+    <# The Retry-After (seconds) that Microsoft Graph gave in the answer of one request of a batch: 0 when there is none, never more than two minutes. #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([AllowNull()][object]$Response)
+    $headers = Get-PcmValue $Response 'headers' $null
+    if ($null -eq $headers) { return 0 }
+    $names = if ($headers -is [System.Collections.IDictionary]) { @($headers.Keys) } else { @($headers.PSObject.Properties.Name) }
+    foreach ($name in $names) {
+        if (-not [string]::Equals([string]$name, 'Retry-After', [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $seconds = 0
+        if ([int]::TryParse([string](Get-PcmValue $headers ([string]$name) ''), [ref]$seconds) -and $seconds -gt 0) { return [Math]::Min($seconds, 120) }
+    }
+    return 0
+}
+
 function Invoke-PcmGraphBatch {
     <#
     .SYNOPSIS
@@ -1266,6 +1283,7 @@ function Invoke-PcmGraphBatch {
     }
     for ($round = 1; $round -le 3 -and $pending.Count; $round++) {
         $again = [System.Collections.Generic.List[int]]::new()
+        $retryAfter = 0
         for ($start = 0; $start -lt $pending.Count; $start += $script:GraphBatchSize) {
             $chunk = @($pending.GetRange($start, [Math]::Min($script:GraphBatchSize, $pending.Count - $start)))
             $batch = @(foreach ($index in $chunk) {
@@ -1279,12 +1297,12 @@ function Invoke-PcmGraphBatch {
             foreach ($response in @($answer.responses)) {
                 $index = [int]$response.id; $seen[$index] = $true
                 $status = [int]$response.status
-                if ($status -eq 429 -or $status -ge 500) { $again.Add($index) } else { $results[$index] = & $toResult $status (Get-PcmValue $response 'body' $null) }
+                if ($status -eq 429 -or $status -ge 500) { $again.Add($index); $retryAfter = [Math]::Max($retryAfter, (Get-PcmRetryAfterSecond -Response $response)) } else { $results[$index] = & $toResult $status (Get-PcmValue $response 'body' $null) }
             }
             foreach ($index in $chunk) { if (-not $seen.ContainsKey($index)) { $again.Add($index) } }
         }
         $pending = $again
-        if ($pending.Count -and $round -lt 3) { Start-Sleep -Seconds (5 * $round) }
+        if ($pending.Count -and $round -lt 3) { Start-Sleep -Seconds ([Math]::Max((5 * $round), $retryAfter)) }
     }
     foreach ($index in $pending) {
         $request = $Requests[$index]
@@ -2484,7 +2502,10 @@ function Get-PcmReadiness {
     elseif ($type -eq 'MailUser') {
         if ([string]$State.ExchangeGuid -eq $onPremGuid) { & $add 'Ok' 'ExchangeOnline' 'EXO_MAILUSER' 'MailUser with the on-premises ExchangeGuid.' }
         elseif ([string]$State.ExchangeGuid -eq [guid]::Empty.ToString()) { & $add 'Warn' 'ExchangeOnline' 'GUID_CLEARED' 'MailUser with an empty ExchangeGuid: Convert already started for this object.' }
-        else { & $add 'Warn' 'ExchangeOnline' 'GUID_MISMATCH' ("MailUser ExchangeGuid {0} differs from the on-premises mailbox {1}." -f $State.ExchangeGuid, $onPremGuid) }
+        else {
+            & $add 'Warn' 'ExchangeOnline' 'GUID_MISMATCH' ("MailUser ExchangeGuid {0} differs from the on-premises mailbox {1}." -f $State.ExchangeGuid, $onPremGuid)
+            if ($State.MatchedBy -eq 'UPN') { & $add 'Error' 'Entra' 'ENTRA_WRONG_OBJECT' ("The Entra ID account with this UPN is probably not this person: it was found by UPN only (its onPremisesImmutableId is '{0}', not the one of the snapshot) and its mailbox GUID {1} differs from the on-premises mailbox {2}. Nothing is changed on it. Fix the source anchor or the UPN in Entra ID, or leave this object out." -f $user.onPremisesImmutableId, $State.ExchangeGuid, $onPremGuid) }
+        }
     } elseif ($type -match 'Mailbox$') {
         & $add 'Error' 'ExchangeOnline' 'ALREADY_CLOUD_MAILBOX' ("Already a cloud mailbox ($type): converted already, or migrated to Exchange Online (then it is outside the scenario).")
     } else { & $add 'Error' 'ExchangeOnline' 'EXO_UNEXPECTED_TYPE' "Unexpected Exchange Online recipient type $type." }

@@ -13,7 +13,9 @@
     CaseHoldDeployError (Set-CaseHoldPolicy records the change but reports 'failed to be deployed'),
     CaseHoldFails (Set-CaseHoldPolicy refuses every change),
     StopAfter (@{ Pattern; Path }: the stop file of the window is created after the first call that matches),
-    BatchThrottle (number of requests of a Graph batch answered 429 before the next ones succeed), ExoFilterFails (the
+    BatchThrottle (number of requests of a Graph batch answered 429 before the next ones succeed), BatchThrottleRetryAfter (seconds given in the Retry-After header of those answers),
+    SoaFails (user IDs whose source of authority cannot be moved to the cloud), NeverBack (user IDs that Exchange Online never switches back to a MailUser), RecycleReadFails (the
+    recycle bin cannot be read), ReleaseLagReads (a licence unit given back keeps showing as used for that many reads of the licences), ExoFilterFails (the
     filtered Exchange Online reads fail: the tool reads one object at a time). PageSize: users per page of /users.
     Microsoft Entra groups (Add-PraFakeEntraGroup): /groups by display name, e-mail address or mail nickname (the letter case ignored, as Graph does), /groups/{id}
     and /groups/{id}/transitiveMembers with paging (GroupPageSize members per page); the fault GroupReadDenied refuses them.
@@ -83,6 +85,9 @@ function global:New-PraFakeTenant {
     }
     $global:PraFake.CasePolicy = @{ Name = 'PRA-HOLD'; Guid = '22222222-2222-2222-2222-222222222222'; CaseId = 'case-pra'; Locations = [System.Collections.Generic.List[string]]::new() }
     $global:PraFake.CasePolicies.Add($global:PraFake.CasePolicy)
+    $global:PraFake.Releasing = [System.Collections.Generic.List[hashtable]]::new()
+    $global:PraFake.Faults.BatchThrottleRetryAfter = 0; $global:PraFake.Faults.SoaFails = @(); $global:PraFake.Faults.NeverBack = @()
+    $global:PraFake.Faults.RecycleReadFails = $false; $global:PraFake.Faults.ReleaseLagReads = 0
 }
 
 function global:Get-PraFakeHoldTag {
@@ -175,6 +180,8 @@ function global:Step-PraFake {
             # The Teams storage (ComponentShared) becomes the primary mailbox when there is one.
             $user.Type = 'UserMailbox'; $user.ExchangeGuid = $(if ($user.Component) { $user.Component } else { [guid]::NewGuid().ToString() }); $user.Component = $null
             Write-PraFakeCall "Mailbox $($user.Upn) $($user.ExchangeGuid)"
+        } elseif ($user.Type -eq 'UserMailbox' -and -not $plan -and $user.DirSynced -and $fake.Faults.NeverBack -contains $user.Id) {
+            # Exchange Online does not switch this mailbox back.
         } elseif ($user.Type -eq 'UserMailbox' -and -not $plan -and $user.DirSynced -and $user.Holds.Count) {
             # Exchange cannot disable a mailbox on hold: the switch back is blocked.
             if (-not $user.ContainsKey('Blocked')) { $user['Blocked'] = $true; Write-PraFakeCall "BlockedByHold $($user.Upn)" }
@@ -427,9 +434,11 @@ function global:Invoke-MgGraphRequest {
             $skus = foreach ($id in $fake.Skus.Keys) {
                 $sku = $fake.Skus[$id]
                 $used = @($fake.Users.Values | Where-Object { $user = $_; @($user.Direct | Where-Object { $_.skuId -eq $id }).Count -or ($fake.Group.Members.Contains($user.Id) -and @($fake.Group.Licences | Where-Object { $_.skuId -eq $id }).Count) }).Count
+                $used += @($fake.Releasing | Where-Object { $_.SkuId -eq $id }).Count
                 [pscustomobject]@{ skuId = $id; skuPartNumber = $sku.Part; consumedUnits = $used; prepaidUnits = [pscustomobject]@{ enabled = $sku.Enabled }
                     servicePlans = @($sku.Plans | ForEach-Object { [pscustomobject]@{ servicePlanName = $_.Name; servicePlanId = $_.Id; appliesTo = $_.AppliesTo } }) }
             }
+            foreach ($releasing in @($fake.Releasing)) { $releasing.Reads--; if ($releasing.Reads -le 0) { [void]$fake.Releasing.Remove($releasing) } }
             return [pscustomobject]@{ value = @($skus) }
         }
         '^organization$' { return [pscustomobject]@{ value = @([pscustomobject]@{ id = 'org'; displayName = 'Contoso'; onPremisesSyncEnabled = $true; onPremisesLastSyncDateTime = '2026-10-07T08:00:00Z' }) } }
@@ -505,7 +514,11 @@ function global:Invoke-MgGraphRequest {
         }
         '^\$batch$' {
             $responses = foreach ($request in @($data.requests)) {
-                if ($fake.Faults.BatchThrottle -gt 0) { $fake.Faults.BatchThrottle--; [pscustomobject]@{ id = $request.id; status = 429; body = $null }; continue }
+                if ($fake.Faults.BatchThrottle -gt 0) {
+                    $fake.Faults.BatchThrottle--
+                    [pscustomobject]@{ id = $request.id; status = 429; body = $null; headers = $(if ($fake.Faults.BatchThrottleRetryAfter -gt 0) { @{ 'Retry-After' = [string]$fake.Faults.BatchThrottleRetryAfter } } else { $null }) }
+                    continue
+                }
                 $call = @{ Method = $request.method; Uri = ('v1.0' + $request.url) }
                 if ($request.ContainsKey('body') -and $null -ne $request.body) { $call.Body = ($request.body | ConvertTo-Json -Depth 8 -Compress) }
                 try { [pscustomobject]@{ id = $request.id; status = 200; body = (Invoke-MgGraphRequest @call) } }
@@ -563,7 +576,10 @@ function global:Invoke-MgGraphRequest {
         '^users/[^/]+/onPremisesSyncBehavior$' {
             $user = Resolve-PraFakeUser $parts[1]
             if (-not $user) { Stop-PraFakeGraph 404 'Request_ResourceNotFound' 'User not found.' }
-            if ($Method -eq 'PATCH') { $user.CloudManaged = [bool]$data.isCloudManaged; return $null }
+            if ($Method -eq 'PATCH') {
+                if ($data.isCloudManaged -and $fake.Faults.SoaFails -contains $user.Id) { Stop-PraFakeGraph 403 'Authorization_RequestDenied' 'The source of authority of this object cannot be changed.' }
+                $user.CloudManaged = [bool]$data.isCloudManaged; return $null
+            }
             return [pscustomobject]@{ isCloudManaged = $user.CloudManaged }
         }
         '^users/[^/]+/checkMemberGroups$' {
@@ -579,11 +595,16 @@ function global:Invoke-MgGraphRequest {
                     $user.Direct.Add(@{ skuId = [string]$licence.skuId; disabledPlans = @($licence.disabledPlans) })
                 }
             }
-            foreach ($skuId in @($data.removeLicenses)) { @($user.Direct | Where-Object { $_.skuId -eq $skuId }) | ForEach-Object { [void]$user.Direct.Remove($_) } }
+            foreach ($skuId in @($data.removeLicenses)) {
+                $held = @($user.Direct | Where-Object { $_.skuId -eq $skuId })
+                $held | ForEach-Object { [void]$user.Direct.Remove($_) }
+                if ($held.Count -and $fake.Faults.ReleaseLagReads -gt 0) { $fake.Releasing.Add(@{ SkuId = [string]$skuId; Reads = [int]$fake.Faults.ReleaseLagReads }) }
+            }
             return $null
         }
         '^directory/deletedItems/[^/]+$' {
             if ($parts[2] -eq 'microsoft.graph.user') { return Get-PraFakeGraphPage -Path $path -Query ([string]$query) -Headers $Headers }
+            if ($Method -eq 'GET' -and $fake.Faults.RecycleReadFails) { Stop-PraFakeGraph 403 'Authorization_RequestDenied' 'The recycle bin cannot be read.' }
             if (-not $fake.Recycle.Contains($parts[2])) { Stop-PraFakeGraph 404 'Request_ResourceNotFound' 'Deleted item not found.' }
             if ($Method -eq 'DELETE') { $fake.Recycle.Remove($parts[2]); return $null }
             return ConvertTo-PraFakeGraphUser $fake.Recycle[$parts[2]]
