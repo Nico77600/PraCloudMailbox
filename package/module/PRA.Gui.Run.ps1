@@ -65,14 +65,46 @@ function Get-PcmGuiPlanTitle {
 #endregion
 
 #region Run model: steps, objects, messages
+$script:GuiLogLines = 2000
+
+function Set-PcmGuiLogHeader {
+    <# The activity log only shows the last lines of a run: its header says where the complete log is. #>
+    param([string]$Path)
+    $g = $script:Gui
+    if (-not $g -or -not $g.Controls -or -not $g.Controls.ContainsKey('LogExpander')) { return }
+    if (-not $Path) { $g.Controls.LogExpander.Header = 'Activity log'; return }
+    $header = New-Object Windows.Controls.TextBlock
+    $header.Text = 'Activity log: the last {0} lines. The complete log is in {1}' -f $script:GuiLogLines, $Path
+    $header.TextWrapping = 'Wrap'
+    $g.Controls.LogExpander.Header = $header
+}
+
 function Add-PcmGuiLine {
     param([string]$Text, [string]$Status = 'Info')
     $g = $script:Gui
     if (-not $g -or -not $g.Form) { return }
     $key = switch ($Status) { 'Fail' { 'PraCritical' } 'Warn' { 'PraCaution' } 'Ok' { 'PraSuccess' } default { 'TextFillColorSecondaryBrush' } }
     $g.Lines.Add([pscustomobject]@{ Text = $Text; Brush = $g.Form.TryFindResource($key) })
-    while ($g.Lines.Count -gt 2000) { $g.Lines.RemoveAt(0) }
+    while ($g.Lines.Count -gt $script:GuiLogLines) { $g.Lines.RemoveAt(0) }
     if ($g.Controls.LogExpander.IsExpanded -and $g.Lines.Count) { $g.Controls.ActivityLog.ScrollIntoView($g.Lines[$g.Lines.Count - 1]) }
+}
+
+function Get-PcmGuiModelObject {
+    <# The row of an object in the list of a step (the name is the identity the engine gave, letter case ignored), or $null. One dictionary per step: the lookup does not read the list. #>
+    param([Parameter(Mandatory)]$Model, [Parameter(Mandatory)][string]$StepId, [Parameter(Mandatory)][AllowEmptyString()][string]$Identity)
+    if (-not $Model.ObjectIndex.ContainsKey($StepId)) { return $null }
+    $row = $null
+    if ($Model.ObjectIndex[$StepId].TryGetValue($Identity, [ref]$row)) { return $row }
+    return $null
+}
+
+function Add-PcmGuiModelObject {
+    <# Adds the row of an object to the list of a step and to the dictionary that finds it again. #>
+    param([Parameter(Mandatory)]$Model, [Parameter(Mandatory)][string]$StepId, [Parameter(Mandatory)]$Row)
+    if (-not $Model.Objects.ContainsKey($StepId)) { $Model.Objects[$StepId] = New-Object 'Collections.ObjectModel.ObservableCollection[object]' }
+    if (-not $Model.ObjectIndex.ContainsKey($StepId)) { $Model.ObjectIndex[$StepId] = New-Object 'Collections.Generic.Dictionary[string,object]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase) }
+    $Model.Objects[$StepId].Add($Row)
+    $Model.ObjectIndex[$StepId][[string]$Row.Name] = $Row
 }
 
 function ConvertTo-PcmGuiStatus {
@@ -106,7 +138,7 @@ function Initialize-PcmGuiRunModel {
     param($Request)
     $g = $script:Gui; $c = $g.Controls
     $steps = New-Object 'Collections.ObjectModel.ObservableCollection[object]'
-    $model = @{ Steps = $steps; ById = @{}; Objects = @{}; Messages = @{}; Raw = @{}; Current = ''; CurrentObject = ''; Follow = $true; Dirty = $true; Selected = $null; Info = @{}; BatchId = ''; Names = @{} }
+    $model = @{ Steps = $steps; ById = @{}; Objects = @{}; ObjectIndex = @{}; Messages = @{}; Raw = @{}; Current = ''; CurrentObject = ''; Follow = $true; Dirty = $true; Selected = $null; Info = @{}; BatchId = ''; Names = @{} }
     $titles = @(Get-PcmGuiPlanTitle -Action $Request.Action -Follow:($Request.Action -eq 'Check' -and [bool]$Request.Batch))
     for ($i = 0; $i -lt $titles.Count; $i++) {
         $row = New-PcmGuiStepRow ('s' + ($i + 1)) ($i + 1) $titles[$i]
@@ -253,16 +285,14 @@ function Invoke-PcmGuiItemEvent {
         $id = [string]$row.Id
         if ($identity -and -not $isSub) {
             $m.CurrentObject = $identity
-            if (-not $m.Objects.ContainsKey($id)) { $m.Objects[$id] = New-Object 'Collections.ObjectModel.ObservableCollection[object]' }
-            $existing = $null
-            foreach ($candidate in $m.Objects[$id]) { if (Test-PcmGuiOrdinal $candidate.Name $identity) { $existing = $candidate; break } }
+            $existing = Get-PcmGuiModelObject -Model $m -StepId $id -Identity $identity
             $shown = if ($status -eq 'Info') { 'Running' } else { $status }
             $priority = @{ Pending = 0; Info = 0; Running = 1; Ok = 2; Skip = 2; Warn = 3; Fail = 4; Wait = 1 }
             if ($existing) {
                 $keep = [int]$priority[[string]$existing.Status] -gt [int]$priority[$shown] -or ([string]$existing.Status -eq 'Fail')
                 Set-PcmGuiRow $existing @{ Result = $text; Status = $(if ($keep) { [string]$existing.Status } else { $shown }) }
             }
-            else { $m.Objects[$id].Add((New-PcmGuiRow @{ Name = $identity; Upn = ''; Result = $text; Status = $shown; Identity = $identity })) }
+            else { Add-PcmGuiModelObject -Model $m -StepId $id -Row (New-PcmGuiRow @{ Name = $identity; Upn = ''; Result = $text; Status = $shown; Identity = $identity }) }
             $count = $m.Objects[$id].Count
             if ([int]$row.Expected -gt 0) { Set-PcmGuiRow $row @{ Counter = ('{0} / {1} objects' -f $count, $row.Expected); Progress = [double][Math]::Min(1.0, $count / [double]$row.Expected) } }
             else { Set-PcmGuiRow $row @{ Counter = (ConvertTo-PcmGuiPlural $count 'object' 'objects') } }
@@ -432,7 +462,7 @@ function Show-PcmGuiObjectCard {
     foreach ($step in $m.Steps) {
         $id = [string]$step.Id
         $mine = $null
-        if ($m.Objects.ContainsKey($id)) { foreach ($candidate in $m.Objects[$id]) { if (Test-PcmGuiOrdinal $candidate.Name $identity) { $mine = $candidate; break } } }
+        $mine = Get-PcmGuiModelObject -Model $m -StepId $id -Identity $identity
         if (-not $mine) {
             # A step that works on the whole batch (connection, readiness, plan) is part of every object's journey.
             if ((-not $m.Objects.ContainsKey($id) -or -not $m.Objects[$id].Count) -and -not (Test-PcmGuiOrdinal $step.Status 'Skip')) {
@@ -546,13 +576,20 @@ function Add-PcmGuiEngineOutput {
     if ($Run.Hidden -gt 0 -and ($added -lt 60 -or $Final)) { Add-PcmGuiLine ('engine · {0} output line(s) not shown; the full text is in the .stdout.txt file' -f $Run.Hidden) 'Info'; $Run.Hidden = 0 }
 }
 
+function Remove-PcmGuiCsvGuard {
+    <# The report puts an apostrophe before a text that starts with = + - @ TAB or CR (a spreadsheet would read it as a formula): the shown value is the text without it. A value without a guard is unchanged. #>
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+    if ($null -ne $Value -and $Value -match "^'[=+\-@\t\r]") { return $Value.Substring(1) }
+    return $Value
+}
+
 function Read-PcmGuiReport {
-    <# The CSV report of a run (delimiter ;), with the guard the report puts before a formula (an apostrophe) removed from the shown values. #>
+    <# The CSV report of a run (delimiter ;, UTF-8 with or without a byte order mark), with the guard the report puts before a formula removed from the shown values. #>
     param([string]$Path)
     $rows = @(Import-Csv -LiteralPath $Path -Delimiter ';' -Encoding UTF8 -ErrorAction Stop)
     foreach ($row in $rows) {
         foreach ($property in @($row.PSObject.Properties)) {
-            if ($property.Value -is [string] -and $property.Value -match "^'[=+\-@\t\r]") { $property.Value = $property.Value.Substring(1) }
+            if ($property.Value -is [string]) { $property.Value = Remove-PcmGuiCsvGuard $property.Value }
         }
     }
     return $rows
@@ -574,7 +611,8 @@ function ConvertTo-PcmGuiObjectRow {
     }
     $identity = [string](Get-PcmGuiValue $Row 'Identity' '')
     $guid = [string](Get-PcmGuiValue $Row 'ObjectGuid' '')
-    $match = if ($guid -and $g.State.Objects) { @($g.State.Objects | Where-Object { Test-PcmGuiOrdinal $_.object_guid $guid }) | Select-Object -First 1 } else { $null }
+    $match = $null
+    if ($guid -and $g.State.Objects) { [void](Get-PcmGuiObjectIndex -State $g.State).TryGetValue($guid, [ref]$match) }
     $name = if ($match -and $match.display_name) { [string]$match.display_name } elseif ($identity) { ($identity -split '@')[0] } else { '(run)' }
     $type = if (Test-PcmGuiOrdinal $kind 'User') { 'User' } elseif (Test-PcmGuiOrdinal $kind 'Shared') { 'Shared' } elseif ($kind) { $kind } else { 'Object' }
     return New-PcmGuiRow @{ Status = $status; Name = $name; Upn = $identity; Type = $type; Result = $result; Plain = $(if ($status -eq 'Ok') { '' } else { [string]$detail + $(if ($warnings) { "`r`n" + $warnings } else { '' }) }) }
@@ -614,6 +652,7 @@ function Start-PcmGuiRun {
     if ($blocker) { throw $blocker }
     $request = if ($Schedule) { New-PcmGuiRequest -Action Schedule -Mode Apply } else { Get-PcmGuiWindowRequest $Mode }
     $word = $script:GuiActionWord[$request.Action]
+    $key = ''
     if ($Mode -eq 'Apply' -and -not $Schedule) {
         if (-not $g.Pending -or -not (Test-PcmGuiConfirmation -Typed ([string]$c.ConfirmBox.Text) -Word $word)) {
             Reset-PcmGuiPreview; Update-PcmGuiView
@@ -626,7 +665,8 @@ function Start-PcmGuiRun {
     $engine = Get-PcmGuiEngine
     if (-not $engine.Ok) { throw $engine.Problem }
     $pending = $g.Pending
-    $previewKey = Get-PcmGuiRunKey -Request $request -Config $config
+    $previewKey = if ($key) { $key } else { Get-PcmGuiRunKey -Request $request -Config $config }
+    $request = Set-PcmGuiSnapshotPin -Request $request -Pending $(if ($Mode -eq 'Apply' -and -not $Schedule) { $pending } else { $null })
     Reset-PcmGuiPreview
     $folder = Join-Path (Join-Path $g.Root 'logs') 'gui'
     Initialize-PcmGuiFolder (Join-Path $g.Root 'logs'); Initialize-PcmGuiFolder $folder
@@ -641,6 +681,7 @@ function Start-PcmGuiRun {
         Counts = @{ Ok = 0; Warn = 0; Fail = 0 }; Partial = ''; Seen = (New-Object 'Collections.Generic.List[string]'); Hidden = 0; Asked = (New-Object 'Collections.Generic.HashSet[int]')
     }
     $g.LastResult = $null; $g.LastRun = $null; $g.Lines.Clear(); $g.PreviewError = ''
+    Set-PcmGuiLogHeader ($base + '.stdout.txt')
     if ($Purpose -eq 'Preview') { $g.VerRows.Clear(); $g.Previewed = $false }
     Initialize-PcmGuiRunModel $request
     $c.RunTitle.Text = '{0}{1}' -f $script:GuiActionTitle[$request.Action], $(if ($request.Batch -and $request.Action -ne 'Check') { ' · batch ' + $request.Batch } else { '' })
@@ -668,14 +709,75 @@ function Start-PcmGuiSchedule {
     Show-PcmGuiPage 4
 }
 
+function Get-PcmGuiLatestSnapshotId {
+    <# The ID of the last complete snapshot of the snapshot file, read now: 0 when there is none or the file cannot be read. #>
+    $g = $script:Gui
+    try {
+        $path = [string]$g.State.Config.Store.Path
+        if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return [long]0 }
+        $connection = Open-PcmStore -Path $path -Root $g.Root -ReadOnly
+        try {
+            $latest = Get-PcmSnapshot $connection
+            return $(if ($latest) { [long]$latest.id } else { [long]0 })
+        } finally { Close-PcmStore $connection }
+    } catch { return [long]0 }
+}
+
+function Set-PcmGuiSnapshotPin {
+    <#
+        A Check or a Convert of new objects reads one snapshot. The run is given its ID (-Snapshot): the preview reads the last complete snapshot as it is now, and the Apply that follows
+        reads the one the preview read, never a snapshot written in between. A request that names a snapshot or a batch is returned as it is.
+    #>
+    param($Request, $Pending = $null)
+    if (-not (Test-PcmGuiOrdinalIn $Request.Action @('Check', 'Convert')) -or $Request.Batch -or [long]$Request.Snapshot -gt 0) { return $Request }
+    $id = if ($Pending) { [long]$Pending.Request.Snapshot } else { Get-PcmGuiLatestSnapshotId }
+    if ($id -le 0) { return $Request }
+    $pinned = [ordered]@{}
+    foreach ($key in $Request.Keys) { $pinned[$key] = $Request[$key] }
+    $pinned.Snapshot = $id
+    return $pinned
+}
+
+function Get-PcmGuiGuardedFile {
+    <#
+        The files a preview and the run that follows it must find unchanged: the configuration file of the run (the copy made for it, and the file it was made from), the engine, the modules,
+        the CSV file that lists the objects, and, for the actions that read it, the snapshot file and its .sha256 file. Full paths, once each, in a fixed order.
+    #>
+    param($Request, $Config)
+    $g = $script:Gui
+    $paths = [Collections.Generic.List[string]]::new()
+    $paths.Add([string]$Config.Path); $paths.Add([string]$Config.Base)
+    $paths.Add((Join-Path $g.Root 'Invoke-PraCloudMailbox.ps1'))
+    $moduleFolder = Join-Path $g.Root 'module'
+    if (Test-Path -LiteralPath $moduleFolder -PathType Container) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $moduleFolder -Recurse -File -ErrorAction SilentlyContinue | Where-Object { Test-PcmGuiOrdinalIn $_.Extension @('.psm1', '.psd1', '.ps1', '.dll', '.xaml') })) { $paths.Add($file.FullName) }
+    }
+    $paths.Add([string]$Request.CsvPath)
+    $settings = if ($g.State) { $g.State.Config } else { $null }
+    if ($settings) {
+        if (Test-PcmGuiOrdinal $Request.Action 'Collect') { $paths.Add([string]$settings.Scope.CsvPath) }
+        elseif (Test-PcmGuiOrdinalIn $Request.Action @('Check', 'Convert', 'Recover')) { $paths.Add([string]$settings.Store.Path); $paths.Add([string]$settings.Store.Path + '.sha256') }
+    }
+    $seen = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+    $files = [Collections.Generic.List[string]]::new()
+    foreach ($path in $paths) {
+        if (-not $path) { continue }
+        $full = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($path)) { $path } else { Join-Path $g.Root $path }))
+        if ($seen.Add($full)) { $files.Add($full) }
+    }
+    $sorted = $files.ToArray()
+    [Array]::Sort($sorted, [StringComparer]::OrdinalIgnoreCase)
+    return $sorted
+}
+
 function Get-PcmGuiRunKey {
-    <# What a preview and the run that follows it must share: the request, the files it reads and the configuration it uses. #>
+    <# What a preview and the run that follows it must share: the request, the configuration it uses and the content of every file it reads (see Get-PcmGuiGuardedFile). #>
     param($Request, $Config)
     $parts = [Collections.Generic.List[string]]::new()
     foreach ($key in @($Request.Keys | Where-Object { -not (Test-PcmGuiOrdinal $_ 'Mode') } | Sort-Object)) { $parts.Add(('{0}={1}' -f $key, $Request[$key])) }
     $parts.Add('config=' + [string]$Config.Path); $parts.Add('base=' + [string]$Config.Base); $parts.Add('hash=' + [string]$Config.Hash)
-    foreach ($file in @([string]$Request.CsvPath)) {
-        if ($file -and (Test-Path -LiteralPath $file -PathType Leaf)) { $parts.Add('csv=' + (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash) }
+    foreach ($file in @(Get-PcmGuiGuardedFile -Request $Request -Config $Config)) {
+        $parts.Add($(if (Test-Path -LiteralPath $file -PathType Leaf) { 'file={0}={1}' -f $file.ToLowerInvariant(), (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash } else { 'missing=' + $file.ToLowerInvariant() }))
     }
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($parts -join "`n")))) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
@@ -743,6 +845,8 @@ function Complete-PcmGuiRun {
     $g.LastRun = [pscustomobject]@{ Request = $run.Request; Result = $result; Valid = $outcome.Valid; Level = $outcome.Level; ExitCode = $exitCode; Base = $run.Base; Seconds = $seconds; Issue = $outcome.Issue; Purpose = $run.Purpose
         Config = $run.Config; StartedAt = $run.StartedAt; Stopped = [bool]$run.StopAsked; Counts = $run.Counts; BatchId = $g.Model.BatchId }
     $g.PreviewResult = $result
+    $logFile = [string](Get-PcmGuiValue $result 'logFile' '')
+    if ($logFile) { Set-PcmGuiLogHeader $logFile }
     if ($run.Purpose -eq 'Preview') {
         $g.VerRows.Clear()
         # What needs attention first (blocked, warnings, skipped), then the users, then the shared mailboxes; the order of the report inside each group.
@@ -762,7 +866,7 @@ function Complete-PcmGuiRun {
         $g.PreviewError = if ($usablePreview) { '' } else { $outcome.Issue }
         $c.TargetText.Text = [string]$run.TargetText
         if ($usablePreview) {
-            $g.Pending = @{ Key = (Get-PcmGuiRunKey -Request $run.Request -Config $run.Config); Config = $run.Config; Request = $run.Request }
+            $g.Pending = @{ Key = $run.Key; Config = $run.Config; Request = $run.Request }
         }
     }
     Set-PcmGuiBusy $false
@@ -801,6 +905,27 @@ function Get-PcmGuiNextCommand {
     if (-not $BatchId) { return '' }
     $request = New-PcmGuiRequest -Action $Action -Mode $Mode -Batch $BatchId
     return (Get-PcmGuiCommand -Root $g.Root -ConfigPath $g.ConfigPath -Request $request).Display
+}
+
+function Get-PcmGuiRollbackCarry {
+    <#
+        What the command that continues a rollback carries so that it stays on the objects of the wave: the objects of the interrupted rollback still to roll back, as a CSV file written for
+        the command, or else the way the run picked its objects. Nothing when the rollback covers the whole batch.
+    #>
+    param($Request, [string]$BatchId)
+    $g = $script:Gui
+    $carry = @{}
+    $summary = @(Get-PcmGuiBatchSummary -State $g.State | Where-Object { Test-PcmGuiOrdinal $_.Id $BatchId }) | Select-Object -First 1
+    if ($summary -and @($summary.Wave).Count) {
+        $folder = Join-Path (Join-Path $g.Root 'logs') 'gui'
+        Initialize-PcmGuiFolder (Join-Path $g.Root 'logs'); Initialize-PcmGuiFolder $folder
+        $carry.CsvPath = Write-PcmGuiWave -Folder $folder -Name $BatchId -Rows @($summary.Wave)
+        return $carry
+    }
+    if ($summary -and [int]$summary.Undone) { return $carry }
+    foreach ($name in @('CsvPath', 'Identity', 'SearchBase', 'Group')) { if ($Request.Contains($name) -and $Request[$name]) { $carry[$name] = [string]$Request[$name] } }
+    if ($Request.Contains('Scope') -and $Request.Scope -and -not (Test-PcmGuiOrdinal $Request.Scope 'All')) { $carry.Scope = [string]$Request.Scope }
+    return $carry
 }
 
 function Get-PcmGuiReportSplit {
@@ -922,7 +1047,9 @@ function Update-PcmGuiNext {
     if (($pending -gt 0 -or -not $last.Valid) -and $action -in @('Convert', 'Recover') -and $batchId) {
         $continueAction = $action
         $convertBatch = $batchId
-        $c.ContinueCmd.Text = (Get-PcmGuiCommand -Root $g.Root -ConfigPath $g.ConfigPath -Request (New-PcmGuiRequest -Action $continueAction -Mode 'Preview' -Batch $convertBatch) -Engine 'pwsh.exe').Display
+        $continueOptions = @{ Action = $continueAction; Mode = 'Preview'; Batch = $convertBatch }
+        if ($continueAction -eq 'Recover') { foreach ($pair in (Get-PcmGuiRollbackCarry -Request $request -BatchId $convertBatch).GetEnumerator()) { $continueOptions[$pair.Key] = $pair.Value } }
+        $c.ContinueCmd.Text = (Get-PcmGuiCommand -Root $g.Root -ConfigPath $g.ConfigPath -Request (New-PcmGuiRequest @continueOptions) -Engine 'pwsh.exe').Display
         $c.ContinueCmdBox.Visibility = 'Visible'
     }
     if ($action -in @('Convert', 'Recover') -and $batchId) {

@@ -119,14 +119,24 @@ function Get-PcmGuiPrerequisite {
         else { & $light 'Journal' 'Ok' ('{0} found. {1}.' -f $journal.Path, $(if ([int]$journal.Batches -eq 1) { '1 batch recorded' } else { '{0} batches recorded' -f [int]$journal.Batches })) }
     }
     $task = & $get 'Task' $null
-    if ($null -eq $task) { $task = Get-PcmGuiCollectTask }
+    if ($null -eq $task) { $task = Get-PcmGuiCollectTask -Refresh:$refresh }
     if ($task -and $task.Found) { & $light 'Daily Collect' 'Ok' ([string]$task.Text) }
     else { & $light 'Daily Collect' 'Info' 'No scheduled task of Collect found on this computer. Run Collect often (every day is best): after the disaster nothing on-premises can be read.' }
     return [pscustomobject]@{ Lights = $lights.ToArray(); CanCollect = ($coreOk -and [bool]$exchangeServer); CanCloudEngine = $coreOk; CanCloudBase = $cloudBase; ExchangeServer = $exchangeServer; Net = ''; Role = 'None' }
 }
 
+$script:GuiTaskCache = $null
+
 function Get-PcmGuiCollectTask {
-    <# The scheduled task that runs Collect (best effort): Found and Text. #>
+    <# The scheduled task that runs Collect (best effort): Found and Text. Listing the tasks of the computer takes a while: the answer is kept for a minute, or until -Refresh. #>
+    param([switch]$Refresh)
+    if (-not $Refresh -and $script:GuiTaskCache -and ([datetime]::UtcNow - $script:GuiTaskCache.At).TotalSeconds -lt 60) { return $script:GuiTaskCache.Answer }
+    $answer = Find-PcmGuiCollectTask
+    $script:GuiTaskCache = @{ At = [datetime]::UtcNow; Answer = $answer }
+    return $answer
+}
+
+function Find-PcmGuiCollectTask {
     $none = [pscustomobject]@{ Found = $false; Text = '' }
     if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) { return $none }
     try {

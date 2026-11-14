@@ -281,6 +281,17 @@ function Read-PcmGuiState {
     return $state
 }
 
+$script:GuiIntegrityCache = $null
+
+function Get-PcmGuiFileStamp {
+    <# Where each file is, how long it is and when it was last written (a file that is not there is named as missing): what tells that a file changed without reading it. #>
+    param([Parameter(Mandatory)][string[]]$Path)
+    return (@($Path | ForEach-Object {
+                $file = [IO.FileInfo]::new($_)
+                if ($file.Exists) { '{0}:{1}:{2}' -f $file.FullName, $file.Length, $file.LastWriteTimeUtc.Ticks } else { $_ + ':missing' }
+            }) -join '|')
+}
+
 function Get-PcmGuiSnapshotInfo {
     <#
         What the Setup page says about the snapshot file: Path, Exists, Id, Taken, AgeHours, MaxAgeDays, Error, and Integrity (Verified, Not verifiable or Changed: the file against the
@@ -291,11 +302,20 @@ function Get-PcmGuiSnapshotInfo {
     $info = [ordered]@{ Path = [string]$State.Config.Store.Path; Exists = [bool]$State.SnapshotExists; Id = 0; Taken = ''; AgeHours = 0.0; MaxAgeDays = [int]$State.Config.Store.MaxSnapshotAgeDays; Error = [string]$State.SnapshotError
         Integrity = ''; IntegrityDetail = '' }
     if ($info.Exists) {
-        try {
-            $check = Test-PcmSnapshotHash -Path $info.Path -BackupFolder ([string]$State.Config.Store.BackupFolder)
-            $info.Integrity = switch ($check.State) { 'Verified' { 'Verified' } 'Changed' { 'Changed' } default { 'Not verifiable' } }
-            $info.IntegrityDetail = [string]$check.Message
-        } catch { $info.Integrity = ''; $info.IntegrityDetail = '' }
+        # The file is hashed once, then again only when its length or its time of last write (or those of its .sha256 file) change: the window asks for this at every keystroke.
+        $backupFolder = [string]$State.Config.Store.BackupFolder
+        $stamp = '{0}|{1}' -f $backupFolder, (Get-PcmGuiFileStamp -Path @($info.Path, ($info.Path + '.sha256')))
+        if ($script:GuiIntegrityCache -and [string]::Equals($script:GuiIntegrityCache.Stamp, $stamp, [StringComparison]::Ordinal)) {
+            $info.Integrity = $script:GuiIntegrityCache.Integrity; $info.IntegrityDetail = $script:GuiIntegrityCache.Detail
+        }
+        else {
+            try {
+                $check = Test-PcmSnapshotHash -Path $info.Path -BackupFolder $backupFolder
+                $info.Integrity = switch ($check.State) { 'Verified' { 'Verified' } 'Changed' { 'Changed' } default { 'Not verifiable' } }
+                $info.IntegrityDetail = [string]$check.Message
+            } catch { $info.Integrity = ''; $info.IntegrityDetail = '' }
+            $script:GuiIntegrityCache = @{ Stamp = $stamp; Integrity = $info.Integrity; Detail = $info.IntegrityDetail }
+        }
     }
     if ($State.Snapshot) {
         $info.Id = [long]$State.Snapshot.id
@@ -331,6 +351,18 @@ function Get-PcmGuiBatchSummary {
         }
         $converted = @($items | Where-Object { $_.step -and $_.status -ne 'Skipped' })
         $waiting = @($converted | Where-Object { -not $back.Contains([string]$_.object_guid) })
+        # A rollback is interrupted when it did not end or failed, or when it ended with objects of its own that are not back yet. One that ended with all its objects back is a wave that finished.
+        $openRecovers = [Collections.Generic.List[object]]::new(); $undone = [Collections.Generic.List[object]]::new()
+        $undoneSeen = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($recover in $recovers) {
+            $rid = ([string]$recover.id).ToLowerInvariant()
+            $own = @(if ($itemsByBatch.ContainsKey($rid)) { $itemsByBatch[$rid] | Where-Object { $_.status -notin @('Done', 'Skipped') -and -not $back.Contains([string]$_.object_guid) } })
+            if ($recover.status -in @('Running', 'Failed') -or ($recover.status -eq 'Partial' -and $own.Count)) {
+                $openRecovers.Add($recover)
+                foreach ($item in $own) { if ($undoneSeen.Add([string]$item.object_guid)) { $undone.Add($item) } }
+            }
+        }
+        $wave = @(if ($undone.Count -and $undone.Count -lt $waiting.Count) { foreach ($item in $undone) { [pscustomobject]@{ Guid = [string]$item.object_guid; Name = [string]$item.identity } } })
         $left = @($items | Where-Object { $_.status -in @('Planned', 'Running', 'Failed') })
         $recover = if (-not $recovers.Count) { if ($converted.Count) { 'Not started' } else { '-' } }
             elseif (@($recovers | Where-Object { $_.status -eq 'Complete' }).Count -and -not $waiting.Count) { 'Complete' }
@@ -340,7 +372,7 @@ function Get-PcmGuiBatchSummary {
                 Status = [string]$batch.status; Objects = $items.Count; Users = @($items | Where-Object { $_.kind -eq 'User' }).Count
                 Shared = @($items | Where-Object { $_.kind -ne 'User' }).Count; Converted = $converted.Count; Waiting = $waiting.Count; Left = $left.Count
                 Recover = $recover; Tone = $tone; Items = $items; Back = $back; Account = [string]$batch.account; Environment = [string](Get-PcmGuiValue $batch 'environment' '')
-                SnapshotId = [string](Get-PcmGuiValue $batch 'snapshot_id' ''); Recovers = $recovers })
+                SnapshotId = [string](Get-PcmGuiValue $batch 'snapshot_id' ''); Recovers = $recovers; OpenRecovers = $openRecovers.ToArray(); Undone = $undone.Count; Wave = $wave })
     }
     return $summary.ToArray()
 }
@@ -355,17 +387,19 @@ function Get-PcmGuiBatchEntry {
     param([Parameter(Mandatory)][object]$State, [Parameter(Mandatory)][ValidateSet('ContinueConvert', 'Rollback', 'ContinueRollback', 'Follow')][string]$Kind)
     $rows = [Collections.Generic.List[object]]::new()
     $row = {
-        param($Title, $Sub, $State_, $Level, $Selectable, $Glyph, $BatchId, $Environment, $Action)
+        param($Title, $Sub, $State_, $Level, $Selectable, $Glyph, $BatchId, $Environment, $Action, $Wave = @())
         [Dynamic.ExpandoObject]$object = [Dynamic.ExpandoObject]::new()
-        foreach ($pair in @{ Title = $Title; Sub = $Sub; State = $State_; Level = $Level; Selectable = $Selectable; Glyph = $Glyph; BatchId = $BatchId; Environment = $Environment; Action = $Action }.GetEnumerator()) { $object.($pair.Key) = $pair.Value }
+        foreach ($pair in @{ Title = $Title; Sub = $Sub; State = $State_; Level = $Level; Selectable = $Selectable; Glyph = $Glyph; BatchId = $BatchId; Environment = $Environment; Action = $Action; Wave = @($Wave) }.GetEnumerator()) { $object.($pair.Key) = $pair.Value }
         return , $object
     }
     $convertGlyph = [string][char]0xE753; $recoverGlyph = [string][char]0xE7A7
-    $summary = @(Get-PcmGuiBatchSummary -State $State)
+    $summary = if ($Kind -eq 'Follow') { @() } else { @(Get-PcmGuiBatchSummary -State $State) }
     if ($Kind -eq 'Follow') {
+        $objectCount = New-Object 'Collections.Generic.Dictionary[string,int]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($item in @($State.Items)) { $objectCount[[string]$item.batch_id] = 1 + $(if ($objectCount.ContainsKey([string]$item.batch_id)) { $objectCount[[string]$item.batch_id] } else { 0 }) }
         foreach ($entry in @($State.Batches | Sort-Object { [string]$_.created_utc } -Descending)) {
             $isRecover = $entry.action -eq 'Recover'
-            $own = @($State.Items | Where-Object { Test-PcmGuiOrdinal $_.batch_id $entry.id })
+            $own = [pscustomobject]@{ Count = $(if ($objectCount.ContainsKey([string]$entry.id)) { $objectCount[[string]$entry.id] } else { 0 }) }
             $sub = 'Batch {0} · snapshot #{1} · {2}' -f $entry.id, (Get-PcmGuiValue $entry 'snapshot_id' '?'), (ConvertTo-PcmGuiPlural $own.Count 'object' 'objects')
             if ($isRecover -and $entry.convert_batch) { $sub += ' · rolls back {0}' -f $entry.convert_batch }
             $level = switch ([string]$entry.status) { 'Complete' { 'Ok' } 'Failed' { 'Fail' } default { 'Warn' } }
@@ -392,11 +426,11 @@ function Get-PcmGuiBatchEntry {
                 $rows.Add((& $row ('Convert · ' + (Format-PcmGuiDate $batch.CreatedUtc)) $sub $state_ $level $selectable $recoverGlyph $batch.Id $batch.Environment 'Convert'))
             }
             'ContinueRollback' {
-                $open = @($batch.Recovers | Where-Object { $_.status -in @('Partial', 'Running', 'Failed') })
+                $open = @($batch.OpenRecovers)
                 if (-not $open.Count) { continue }
                 $reason = switch ([string]$open[0].status) { 'Failed' { 'it failed' } 'Running' { 'it did not end' } default { 'it stopped' } }
-                $sub = '{0} · {1} still in the cloud ({2})' -f $subBase, $batch.Waiting, $reason
-                $rows.Add((& $row ('Rollback · ' + (Format-PcmGuiDate ([string]$open[0].created_utc))) $sub 'Can be continued' 'Warn' ($batch.Waiting -gt 0) $recoverGlyph $batch.Id $batch.Environment 'Recover'))
+                $sub = if ($batch.Wave.Count) { '{0} · {1} of the interrupted wave still in the cloud ({2})' -f $subBase, $batch.Wave.Count, $reason } else { '{0} · {1} still in the cloud ({2})' -f $subBase, $batch.Waiting, $reason }
+                $rows.Add((& $row ('Rollback · ' + (Format-PcmGuiDate ([string]$open[0].created_utc))) $sub 'Can be continued' 'Warn' ($batch.Waiting -gt 0) $recoverGlyph $batch.Id $batch.Environment 'Recover' $batch.Wave))
             }
         }
     }
@@ -434,6 +468,45 @@ function Write-PcmGuiWave {
 #endregion
 
 #region Lookups made in the snapshot (no engine, no cloud)
+$script:GuiObjectIndex = $null
+
+function Get-PcmGuiObjectCache {
+    <#
+        The mailboxes of the snapshot arranged for lookups, built once for each state that is read: ByGuid (by object ID), ByName (every text that names a mailbox: sign-in name, e-mail address,
+        account name, name, display name, object ID; a list of mailboxes each), and the organizational unit and distinguished name of each mailbox. Letter case is ignored.
+    #>
+    param([Parameter(Mandatory)][object]$State)
+    if ($script:GuiObjectIndex -and [object]::ReferenceEquals($script:GuiObjectIndex.State, $State)) { return $script:GuiObjectIndex }
+    $comparer = [StringComparer]::OrdinalIgnoreCase
+    $byGuid = New-Object 'Collections.Generic.Dictionary[string,object]' -ArgumentList $comparer
+    $byName = New-Object 'Collections.Generic.Dictionary[string,Collections.Generic.List[object]]' -ArgumentList $comparer
+    $objects = @($State.Objects)
+    $units = [string[]]::new($objects.Count); $names = [string[]]::new($objects.Count)
+    for ($i = 0; $i -lt $objects.Count; $i++) {
+        $object = $objects[$i]
+        $guid = [string]$object.object_guid
+        if ($guid -and -not $byGuid.ContainsKey($guid)) { $byGuid[$guid] = $object }
+        foreach ($field in 'object_guid', 'user_principal_name', 'primary_smtp_address', 'sam_account_name', 'name', 'display_name') {
+            $property = $object.PSObject.Properties[$field]
+            if (-not $property) { continue }
+            $text = [string]$property.Value
+            if (-not $text) { continue }
+            if (-not $byName.ContainsKey($text)) { $byName[$text] = [Collections.Generic.List[object]]::new() }
+            if (-not $byName[$text].Contains($object)) { $byName[$text].Add($object) }
+        }
+        $units[$i] = [string](Get-PcmGuiValue $object 'organizational_unit' '')
+        $names[$i] = [string](Get-PcmGuiValue $object 'distinguished_name' '')
+    }
+    $script:GuiObjectIndex = @{ State = $State; Objects = $objects; ByGuid = $byGuid; ByName = $byName; Unit = $units; Dn = $names }
+    return $script:GuiObjectIndex
+}
+
+function Get-PcmGuiObjectIndex {
+    <# The mailboxes of the snapshot by object ID, letter case ignored. #>
+    param([Parameter(Mandatory)][object]$State)
+    return (Get-PcmGuiObjectCache -State $State).ByGuid
+}
+
 function Find-PcmGuiMailbox {
     <# The mailboxes of the snapshot that a text names: sign-in name, e-mail address, account name, name, display name or ID, letter case ignored. #>
     param([Parameter(Mandatory)][object]$State, [AllowEmptyString()][string]$Text)
@@ -441,12 +514,9 @@ function Find-PcmGuiMailbox {
     if (-not $key) { return @() }
     $guid = [guid]::Empty
     if ([guid]::TryParse($key, [ref]$guid)) { $key = $guid.ToString() }
-    return @($State.Objects | Where-Object {
-            foreach ($field in 'object_guid', 'user_principal_name', 'primary_smtp_address', 'sam_account_name', 'name', 'display_name') {
-                if ($_.PSObject.Properties[$field] -and (Test-PcmGuiOrdinal ([string]$_.$field) $key)) { return $true }
-            }
-            return $false
-        })
+    $list = $null
+    if ((Get-PcmGuiObjectCache -State $State).ByName.TryGetValue($key, [ref]$list)) { return $list.ToArray() }
+    return @()
 }
 
 function Get-PcmGuiOuList {
@@ -471,14 +541,19 @@ function Get-PcmGuiOuMatch {
     $key = $Text.Trim().TrimEnd('/')
     if (-not $key) { return @() }
     $isDn = $key -match '^(OU|DC|CN)\s*=' -and $key.Contains('=')
-    return @($State.Objects | Where-Object {
-            if ($isDn) {
-                $dn = [string](Get-PcmGuiValue $_ 'distinguished_name' '')
-                return $dn.EndsWith(',' + $key, [StringComparison]::OrdinalIgnoreCase) -or (Test-PcmGuiOrdinal $dn $key)
-            }
-            $ou = [string](Get-PcmGuiValue $_ 'organizational_unit' '')
-            return (Test-PcmGuiOrdinal $ou $key) -or $ou.StartsWith($key + '/', [StringComparison]::OrdinalIgnoreCase)
-        })
+    $cache = Get-PcmGuiObjectCache -State $State
+    $found = [Collections.Generic.List[object]]::new()
+    $suffix = ',' + $key; $prefix = $key + '/'
+    for ($i = 0; $i -lt $cache.Objects.Count; $i++) {
+        if ($isDn) {
+            $dn = $cache.Dn[$i]
+            if ($dn.EndsWith($suffix, [StringComparison]::OrdinalIgnoreCase) -or [string]::Equals($dn, $key, [StringComparison]::OrdinalIgnoreCase)) { $found.Add($cache.Objects[$i]) }
+            continue
+        }
+        $ou = $cache.Unit[$i]
+        if ([string]::Equals($ou, $key, [StringComparison]::OrdinalIgnoreCase) -or $ou.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $found.Add($cache.Objects[$i]) }
+    }
+    return $found.ToArray()
 }
 
 function Get-PcmGuiGroupInSnapshot {
