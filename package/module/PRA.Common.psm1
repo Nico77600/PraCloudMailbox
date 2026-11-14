@@ -1296,11 +1296,17 @@ function Get-PcmOutcome {
     $errorIdentities = @{}
     # Errors of the run itself (a stop, a failed read), apart from the objects found in error or not in the expected state.
     $runErrors = 0
+    # In a Convert or Recover that has started to change things (its batch exists), an object still Planned when the run ends was not done: it is Pending, never counted as a success.
+    $appliesChanges = (Get-PcmValue $Context 'Mode' '') -eq 'Apply' -and (Get-PcmValue $Context 'Action' '') -in @('Convert', 'Recover') -and [string](Get-PcmValue $Context 'BatchId' '') -ne ''
     foreach ($row in $Context.Rows.ToArray()) {
         $copy = [ordered]@{}
         foreach ($field in $script:RowFields) { $copy[$field] = Get-PcmValue $row $field }
         if ($copy.FinalStatus -notin $script:FinalStatuses) {
             $copy.Detail = 'Final status missing or invalid: {0}. {1}' -f $copy.FinalStatus, $copy.Detail; $copy.FinalStatus = 'Error'
+        }
+        elseif ($appliesChanges -and $copy.FinalStatus -eq 'Planned') {
+            $copy.FinalStatus = 'Pending'
+            if (-not $copy.Detail) { $copy.Detail = 'not finished: the run ended before this object was done; run the command of the next steps to go on' }
         }
         if ($copy.FinalStatus -eq 'Error') {
             foreach ($field in @('ObjectGuid','Identity','PrimarySmtpAddress')) { if ($copy[$field]) { $errorIdentities[[string]$copy[$field]] = $true } }

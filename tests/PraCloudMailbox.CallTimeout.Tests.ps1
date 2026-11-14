@@ -332,6 +332,10 @@ Describe 'Call time limit: a real run in its own process' {
         $script:Journal = if ($script:BatchId) { Get-ChildJournal -Work $script:WriteWork -BatchId $script:BatchId }
         $script:Resume = if ($script:BatchId) { Invoke-Child -Scenario 'WriteDone' -Work $script:WriteWork -Arguments @('-Action', 'Convert', '-Mode', 'Apply', '-Batch', $script:BatchId, '-Force') }
         $script:ResumedJournal = if ($script:BatchId) { Get-ChildJournal -Work $script:WriteWork -BatchId $script:BatchId }
+        $script:InterruptWork = New-ChildWork
+        $script:Interrupted = Invoke-Child -Scenario 'Interrupt' -Work $script:InterruptWork -Arguments @('-Action', 'Convert', '-Mode', 'Apply', '-Force') -TimeoutSeconds 90
+        $script:InterruptBatch = [regex]::Match($script:Interrupted.Out, '(?m)^ *\S+ +Batch +(?<id>[0-9a-f]{8})\s*$').Groups['id'].Value
+        $script:InterruptJournal = if ($script:InterruptBatch) { Get-ChildJournal -Work $script:InterruptWork -BatchId $script:InterruptBatch }
     }
 
     It 'changes nothing for a run whose calls all answer: a Check and a Convert go through the guard and end as before' {
@@ -375,6 +379,10 @@ Describe 'Call time limit: a real run in its own process' {
         $script:Stuck.Err | Should -Match '(?s)Next steps:\s+Check only reads: nothing was changed\..*-Action Check'
         (Get-Content -LiteralPath @(Get-ChildItem -LiteralPath (Join-Path $script:StuckWork 'logs') -Filter '*.log')[0].FullName -Raw) | Should -Match 'The call could not be interrupted'
     }
+    It 'ends the text of a process that is ended at once with a RESULT line, on the console and in the log' {
+        $script:Stuck.Err | Should -Match '(?m)^RESULT: FAIL\s*$'
+        (Get-Content -LiteralPath @(Get-ChildItem -LiteralPath (Join-Path $script:StuckWork 'logs') -Filter '*.log')[0].FullName -Raw) | Should -Match '(?m)^RESULT: FAIL\s*$'
+    }
     It 'ends a Convert whose change never answers with the batch kept in the journal, and says that the change is unknown' {
         $script:Write.Finished | Should -BeTrue
         $script:Write.Exit | Should -Be 1 -Because $script:Write.Out
@@ -383,13 +391,29 @@ Describe 'Call time limit: a real run in its own process' {
         $script:Write.Out | Should -Match ('-Action Convert -Mode Apply -Batch {0} -ConfigPath' -f $script:BatchId)
         $script:Write.Out | Should -Match '(?m)^\s*RESULT: FAIL\s*$'
     }
-    It 'leaves the journal as a crash would: the batch open, no object done or failed, the stop written, no step recorded for the change that did not answer' {
+    It 'leaves the journal as a crash would, but not open for ever: the batch partial, no object done or failed, the stop written, no step recorded for the change that did not answer' {
         $script:BatchId | Should -Match '^[0-9a-f]{8}$'
-        $script:Journal.Batch.status | Should -Be 'Running'
+        $script:Journal.Batch.status | Should -Be 'Partial'
+        $script:Journal.Batch.note | Should -Match 'ended before it finished'
         @($script:Journal.Items).Count | Should -Be 2
         @($script:Journal.Items | Where-Object { $_.status -in @('Done', 'Failed') }).Count | Should -Be 0
         @($script:Journal.Events | Where-Object { $_.step -eq 'MicrosoftTimeout' -and $_.outcome -eq 'Fail' }).Count | Should -Be 1
         @($script:Journal.Events | Where-Object { $_.step -eq 'GuidCleared' }).Count | Should -Be 0
+    }
+    It 'ends a run that is stopped from outside (Ctrl+C) with exit code 1, FAIL and the command that continues the batch, never PASS' {
+        $script:Interrupted.Finished | Should -BeTrue
+        $script:Interrupted.Exit | Should -Be 1 -Because $script:Interrupted.Out
+        $script:Interrupted.Out | Should -Match '(?m)^\s*RESULT: FAIL\s*$'
+        $script:Interrupted.Out | Should -Not -Match '(?m)^\s*RESULT: PASS\s*$'
+        $script:Interrupted.Out | Should -Not -Match 'Convert finished'
+        $script:Interrupted.Out | Should -Match 'the run was interrupted before it finished'
+        $script:Interrupted.Out | Should -Match ('-Action Convert -Mode Apply -Batch {0} -ConfigPath' -f $script:InterruptBatch)
+    }
+    It 'counts the objects of an interrupted Convert as pending and leaves the batch partial, not running and not complete' {
+        $script:InterruptBatch | Should -Match '^[0-9a-f]{8}$'
+        $script:InterruptJournal.Batch.status | Should -Be 'Partial'
+        @($script:InterruptJournal.Items | Where-Object { $_.status -eq 'Done' }).Count | Should -Be 0
+        $script:Interrupted.Out | Should -Match '0 done .{1,3} 2 pending .{1,3} 1 error'
     }
     It 'is continued by the command of the next steps: the same batch ends complete, every object done once' {
         $script:Resume.Exit | Should -Be 0 -Because $script:Resume.Out
