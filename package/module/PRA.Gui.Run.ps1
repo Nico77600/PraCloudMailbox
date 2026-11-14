@@ -95,7 +95,7 @@ function Get-PcmGuiModelObject {
     param([Parameter(Mandatory)]$Model, [Parameter(Mandatory)][string]$StepId, [Parameter(Mandatory)][AllowEmptyString()][string]$Identity)
     if (-not $Model.ObjectIndex.ContainsKey($StepId)) { return $null }
     $row = $null
-    if ($Model.ObjectIndex[$StepId].TryGetValue($Identity, [ref]$row)) { return $row }
+    if ($Model.ObjectIndex[$StepId].TryGetValue($Identity, [ref]$row)) { return , $row }
     return $null
 }
 

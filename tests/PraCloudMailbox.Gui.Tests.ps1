@@ -1607,6 +1607,15 @@ Describe 'Console: a big preview does not freeze the window (2,500 objects, no w
         $script:Built[1233].Name | Should -Be 'User 1234'
         $time.TotalSeconds | Should -BeLessThan 20
     }
+    It 'returns the row itself, with its values, not the pairs of its properties' {
+        $row = & $script:Gui {
+            $model = @{ Objects = @{}; ObjectIndex = @{} }
+            Add-PcmGuiModelObject -Model $model -StepId 's5' -Row (New-PcmGuiRow @{ Name = 'user1@contoso.com'; Result = 'mailbox ready'; Status = 'Ok' })
+            Get-PcmGuiModelObject -Model $model -StepId 's5' -Identity 'USER1@contoso.com'
+        }
+        $row.Result | Should -Be 'mailbox ready'
+        $row.Status | Should -Be 'Ok'
+    }
     It 'finds the row of an object of a step by its identity without reading the list' {
         $time = Measure-Command {
             $found = & $script:Gui {
