@@ -69,6 +69,7 @@ $script:GuiLogLines = 2000
 
 function Set-PcmGuiLogHeader {
     <# The activity log only shows the last lines of a run: its header says where the complete log is. #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Sets the text of a control of the window, nothing else.')]
     param([string]$Path)
     $g = $script:Gui
     if (-not $g -or -not $g.Controls -or -not $g.Controls.ContainsKey('LogExpander')) { return }
@@ -578,6 +579,7 @@ function Add-PcmGuiEngineOutput {
 
 function Remove-PcmGuiCsvGuard {
     <# The report puts an apostrophe before a text that starts with = + - @ TAB or CR (a spreadsheet would read it as a formula): the shown value is the text without it. A value without a guard is unchanged. #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Returns a text, changes nothing.')]
     param([AllowNull()][AllowEmptyString()][string]$Value)
     if ($null -ne $Value -and $Value -match "^'[=+\-@\t\r]") { return $Value.Substring(1) }
     return $Value
@@ -728,6 +730,7 @@ function Set-PcmGuiSnapshotPin {
         A Check or a Convert of new objects reads one snapshot. The run is given its ID (-Snapshot): the preview reads the last complete snapshot as it is now, and the Apply that follows
         reads the one the preview read, never a snapshot written in between. A request that names a snapshot or a batch is returned as it is.
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Returns a request, changes nothing.')]
     param($Request, $Pending = $null)
     if (-not (Test-PcmGuiOrdinalIn $Request.Action @('Check', 'Convert')) -or $Request.Batch -or [long]$Request.Snapshot -gt 0) { return $Request }
     $id = if ($Pending) { [long]$Pending.Request.Snapshot } else { Get-PcmGuiLatestSnapshotId }

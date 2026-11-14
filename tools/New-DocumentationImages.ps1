@@ -66,11 +66,17 @@ function Save-Screenshot([string]$Html, [string]$Png, [int]$Width, [int]$Height)
     if (-not (Test-Path $Png)) { throw "Screenshot not written: $Png" }
 }
 
+function Read-SharedText([string]$Path) {
+    $stream = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+    try { return [IO.StreamReader]::new($stream).ReadToEnd() } finally { $stream.Dispose() }
+}
+
 function Get-PageHeight([string]$Html, [int]$Width) {
-    # The page writes its height in body[data-h]; Edge returns the DOM with --dump-dom. A headless Edge that exits without an answer is started again (up to three times).
+    # The page writes its height in body[data-h]; Edge returns the DOM with --dump-dom. A headless Edge that exits without an answer is started again (up to five times, a few seconds apart).
     $url = 'file:///' + ($Html -replace '\\', '/')
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        $dom = Join-Path $work ('dom-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.html')
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        if ($attempt -gt 1) { Start-Sleep -Seconds 3 }
+        $dom =Join-Path $work ('dom-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.html')
         $edgeArgs = @('--headless=new', '--disable-gpu', '--hide-scrollbars', '--no-first-run', "--user-data-dir=`"$(Join-Path $work 'edge-profile')`"", "--window-size=$Width,2000", '--virtual-time-budget=3000', '--dump-dom', "`"$url`"")
         $proc = Start-Process -FilePath $edge -ArgumentList $edgeArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $dom
         if (-not $proc.WaitForExit(45000)) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
@@ -355,8 +361,9 @@ foreach ($job in @(foreach ($scenario in 'cloud', 'collect', 'problems') { forea
 }
 foreach ($r in $running) {
     $null = $r.Process.WaitForExit()
-    $text = [IO.File]::ReadAllText($r.Log)
-    if ($text -notmatch 'SHOTS-OK') { throw "Console harness failed ($($r.Job.Scenario), $($r.Job.Theme)):`n$text`n$([IO.File]::ReadAllText($r.Log + '.err'))" }
+    # A helper process of the child can still hold the redirected file: read it in shared mode.
+    $text = Read-SharedText $r.Log
+    if ($text -notmatch 'SHOTS-OK') { throw "Console harness failed ($($r.Job.Scenario), $($r.Job.Theme)):`n$text`n$(Read-SharedText ($r.Log + '.err'))" }
 }
 Get-ChildItem -LiteralPath $shots -Filter 'console-*.png' | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $OutputFolder $_.Name) -Force }
 Write-Host ('  {0} console pictures' -f @(Get-ChildItem -LiteralPath $shots -Filter 'console-*.png').Count)

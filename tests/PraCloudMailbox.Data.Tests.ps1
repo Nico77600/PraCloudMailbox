@@ -905,9 +905,10 @@ Describe 'Entra Connect Script mode: the signed sample runs as it is' {
     BeforeAll {
         $script:sample = Join-Path $script:Root 'config\EntraConnect.sample.ps1'
         $script:invoked = New-Object 'Collections.Generic.List[object]'
-        function global:Import-Clixml { param([string]$LiteralPath) $script:invoked.Add(@('Import-Clixml', $LiteralPath)); [pscredential]::new('CONTOSO\svc-pra-sync', (ConvertTo-SecureString 'x' -AsPlainText -Force)) }
-        function global:Invoke-Command { param($ComputerName, $Credential, $ScriptBlock) $script:invoked.Add(@('Invoke-Command', $ComputerName, $Credential.UserName)); 'SyncCycleEnabled=True InProgress=False' }
+        function global:Import-Clixml { param([string]$LiteralPath) $script:invoked.Add(@('Import-Clixml', $LiteralPath)); [pscredential]::new('CONTOSO\svc-pra-sync', (New-Object Security.SecureString)) }
+        function global:Invoke-Command { param($ComputerName, [pscredential]$Credential, $ScriptBlock) $script:invoked.Add(@('Invoke-Command', $ComputerName, $Credential.UserName)); 'SyncCycleEnabled=True InProgress=False' }
         function script:New-EntraContext {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'CredentialPath', Justification = 'The path of a file, not a secret.')]
             param([string]$ScriptPath, [string]$Server = '', [string]$CredentialPath = '')
             @{ Config = @{ EntraConnect = @{ Mode = 'Script'; Server = $Server; ScriptPath = $ScriptPath; CredentialPath = $CredentialPath; MinVersion = '2.5.76.0' } }; ConvertBatchId = '' }
         }
