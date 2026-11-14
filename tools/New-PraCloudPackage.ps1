@@ -1,39 +1,43 @@
-﻿#Requires -Version 7.4
+﻿#Requires -Version 7.5
 <#
 .SYNOPSIS
-    Copies the files needed to run PRA Cloud Mailbox into a separate folder, ready to be zipped.
+    Copies the files needed to run PRA Cloud Mailbox into a separate folder, ready to be zipped, and optionally writes the release ZIP and its .sha256 file.
 
 .DESCRIPTION
-    The package contains only what Invoke-PraCloudMailbox.ps1 needs at run time, plus the HTML guides:
-        Invoke-PraCloudMailbox.ps1, module\*.psm1, lib\sqlite\, templates\, config\ (configuration and samples),
-        docs\PraCloudMailbox-UserGuide.html, docs\PraCloudMailbox-Guide.html,
-        README.md, CHANGELOG.md, LICENSE, THIRD-PARTY-NOTICES.md
-    The HTML guides are rebuilt first from their Markdown sources (tools\Build-Documentation.ps1): they are
-    self-contained (images inline), so the Markdown sources and the images are not copied.
-    It never copies data\ (snapshots and journal: names, GUIDs, permissions), logs\, reports\, tests\ or tools\,
-    nor a saved credential (config\*.cred.xml).
+    The runtime lives in the package\ folder of the repository; the package keeps the same paths as the folder that is extracted from the
+    release ZIP (Invoke-PraCloudMailbox.ps1 at its root, module\, config\, templates\, lib\, docs\). The distribution contains the files of the
+    signed inventory of package\PackageIntegrity.psd1, that file itself, and CHANGELOG.md (copied from the repository root):
+        Invoke-PraCloudMailbox.ps1, PraCloudMailbox.psd1, PraCloudMailbox.psm1, PackageIntegrity.psd1, README.md, LICENSE, THIRD-PARTY-NOTICES.md,
+        CHANGELOG.md, module\ (modules, console, verifier and XAML), templates\, config\ (configuration and samples), lib\sqlite\,
+        docs\ (user guide and administrator guide, Markdown and self-contained HTML, with images)
+    It never copies data\, logs\, reports\, tests\ or tools\: the snapshots and the journal hold names, GUIDs and permissions.
 
-    The configuration is copied with the environment values emptied (Exchange server and domain controller,
-    scope, tenant, app registration, licences, case hold policy, Entra Connect): the administrator fills them
-    in (developer guide, chapter 6). The script then checks that none of these values appears in the package.
+    The package source and the finished package must pass the owner-signed integrity check (module\Test-PackageIntegrity.ps1 and
+    PackageIntegrity.psd1: exact SHA256 of every stable file). A source that is unsigned or changed is refused before anything is written: there is
+    no unsigned mode. The guides (HTML) are not rebuilt here: they are part of the signed inventory (tools\Build-Documentation.ps1 runs before signing).
+
+    The configuration file is copied with the environment values emptied (Exchange server and domain controller, scope, tenant, app registration,
+    licences, case hold policy, Entra Connect): the administrator fills them in (administrator guide, chapter 6). The script then checks that none of
+    these values appears in the package. The configuration is data outside the integrity manifest.
 
 .PARAMETER Destination
-    Package folder. Default: package\PraCloudMailbox-<version>, next to the tool folder.
+    Package folder. Default: package\PraCloudMailbox-<version>, next to the repository folder.
 
 .PARAMETER Zip
-    Also writes <Destination>.zip, with the package folder at its root (the zip of a release).
+    Also writes <Destination>.zip, with the package folder at its root (the zip of a release), and <Destination>.zip.sha256 (the line
+    '<sha256>  <file name>', the same format as the transfer packages of the PRA tools).
 
 .PARAMETER Force
-    Replace the destination folder (and zip) if they already exist. A folder that contains data\, logs\ or
-    reports\ (a package that has been run) is never replaced.
+    Replace the destination folder (and zip) if they already exist. A folder that contains data\, logs\ or reports\ (a package that has been run)
+    is never replaced.
 
 .EXAMPLE
     .\tools\New-PraCloudPackage.ps1 -Zip
-    Creates ..\package\PraCloudMailbox-1.1.0 and ..\package\PraCloudMailbox-1.1.0.zip.
+    Creates ..\package\PraCloudMailbox-2.0.0, ..\package\PraCloudMailbox-2.0.0.zip and ..\package\PraCloudMailbox-2.0.0.zip.sha256.
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.0.0  (from PRA Remote Mailbox 2.0.1 and Web Services Client for Exchange 1.0.0)
+    Version : 2.0.0
     Part of : PRA Cloud Mailbox (repository tool, not in the package)
 #>
 [CmdletBinding()]
@@ -56,13 +60,45 @@ function Reset-PraPackageConsent {
     return $Text
 }
 
+function Assert-AuthenticatedPackage([string]$Path, [switch]$Distribution) {
+    $verifier = Join-Path $Path 'module\Test-PackageIntegrity.ps1'
+    $cursor = [IO.Path]::GetFullPath($verifier)
+    while ($cursor) {
+        $item = Microsoft.PowerShell.Management\Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Package integrity: reparse point: $cursor" }
+        $cursor = [IO.Path]::GetDirectoryName($cursor)
+    }
+    $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $verifier -ErrorAction Stop
+    if (-not [string]::Equals([string]$signature.Status, 'Valid', [StringComparison]::Ordinal) -or $null -eq $signature.SignerCertificate -or
+        -not [string]::Equals([string]$signature.SignerCertificate.Thumbprint, '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6', [StringComparison]::Ordinal) -or
+        $null -eq $signature.TimeStamperCertificate) {
+        throw 'Package integrity: verifier must have the trusted, timestamped owner signature.'
+    }
+    if ($Distribution) { & $verifier -Root $Path -Distribution } else { & $verifier -Root $Path }
+}
+
+# Ordinal comparisons throughout: on .NET with ICU the culture comparison (-eq, -in, Select-Object -Unique) ignores zero-weight characters.
+function Test-OrdinalIn([string]$Value, [string[]]$Set, [switch]$IgnoreCase) {
+    $comparison = if ($IgnoreCase) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    foreach ($item in $Set) { if ([string]::Equals($Value, $item, $comparison)) { return $true } }
+    return $false
+}
+function New-OrdinalSet([string[]]$Items) { $set = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::Ordinal); foreach ($item in $Items) { [void]$set.Add($item) }; , $set }
+
 $root = Split-Path $PSScriptRoot -Parent
-$entry = Join-Path $root 'Invoke-PraCloudMailbox.ps1'
-$version = ([regex]::Match([IO.File]::ReadAllText($entry), "(?m)^\`$toolVersion = '([0-9.]+)'")).Groups[1].Value
-if (-not $version) { throw 'Version not found in Invoke-PraCloudMailbox.ps1.' }
+$packageRoot = Join-Path $root 'package'
+# The version has one source: the ModuleVersion of the module manifest (read as data, nothing is executed).
+$version = [string](Import-PowerShellDataFile -LiteralPath (Join-Path $packageRoot 'PraCloudMailbox.psd1')).ModuleVersion
+if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Version not found in package\PraCloudMailbox.psd1 (ModuleVersion).' }
+
+# The source is authenticated first: an unsigned or changed source never produces a package.
+Assert-AuthenticatedPackage $packageRoot
+
 if (-not $Destination) { $Destination = Join-Path (Split-Path $root -Parent) "package\PraCloudMailbox-$version" }
-$Destination = [IO.Path]::GetFullPath($Destination, (Get-Location).Path).TrimEnd('\')
+if (-not [IO.Path]::IsPathRooted($Destination)) { $Destination = Join-Path (Get-Location).Path $Destination }
+$Destination = [IO.Path]::GetFullPath($Destination).TrimEnd('\')
 $zipPath = "$Destination.zip"
+$hashPath = "$zipPath.sha256"
 
 $rootPrefix = [IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
 if (($Destination + '\').StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase) -or $rootPrefix.StartsWith($Destination + '\', [StringComparison]::OrdinalIgnoreCase)) {
@@ -76,35 +112,36 @@ if (Test-Path -LiteralPath $Destination) {
     }
     Remove-Item -LiteralPath $Destination -Recurse -Force
 }
-if ($Zip -and (Test-Path -LiteralPath $zipPath)) {
-    if (-not $Force) { throw "The zip already exists: $zipPath. Use -Force to replace it." }
-    Remove-Item -LiteralPath $zipPath -Force
+if ($Zip) {
+    foreach ($existing in $zipPath, $hashPath) {
+        if (-not (Test-Path -LiteralPath $existing)) { continue }
+        if (-not $Force) { throw "The file already exists: $existing. Use -Force to replace it." }
+        Remove-Item -LiteralPath $existing -Force
+    }
 }
 
-# ---- HTML guides, rebuilt from the Markdown sources ----------------------------------------------------
-& (Join-Path $PSScriptRoot 'Build-Documentation.ps1') | Out-Null
-
-# ---- Files needed at run time ----------------------------------------------------------------------------
-$files = [Collections.Generic.List[string]]::new()
-foreach ($f in 'Invoke-PraCloudMailbox.ps1', 'README.md', 'CHANGELOG.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'templates\Report.template.html',
-    'config\Targets.sample.csv', 'config\EntraConnect.sample.ps1', 'docs\PraCloudMailbox-UserGuide.html', 'docs\PraCloudMailbox-Guide.html') { $files.Add($f) }
-foreach ($m in 'PRA2.Common.psm1', 'PRA2.Store.psm1', 'PRA2.Collect.psm1', 'PRA2.Cloud.psm1', 'PRA2.Gui.psm1', 'PRA2.Gui.xaml') { $files.Add("module\$m") }
-Get-ChildItem -LiteralPath (Join-Path $root 'lib\sqlite') -Recurse -File | ForEach-Object { $files.Add($_.FullName.Substring($rootPrefix.Length)) }
+# ---- Files needed at run time (paths relative to package\, the same as in the extracted ZIP) ----------------
+$manifest = Import-PowerShellDataFile -LiteralPath (Join-Path $packageRoot 'PackageIntegrity.psd1')
+$files = New-Object 'Collections.Generic.List[string]'
+foreach ($entry in $manifest.Files) { $files.Add([string]$entry.Path) }
+$files.Add('PackageIntegrity.psd1')
+if ((New-OrdinalSet $files.ToArray()).Count -ne $files.Count) { throw 'Package integrity: duplicate distribution file path.' }
 
 foreach ($f in $files) {
-    $source = Join-Path $root $f
+    # CHANGELOG.md is the only file copied from the repository root; it is hashed by the manifest.
+    $source = if ([string]::Equals($f, 'CHANGELOG.md', [StringComparison]::Ordinal)) { Join-Path $root $f } else { Join-Path $packageRoot $f }
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing file in the tool folder: $f" }
     $target = Join-Path $Destination $f
     [void][IO.Directory]::CreateDirectory((Split-Path $target -Parent))
     Copy-Item -LiteralPath $source -Destination $target
 }
 
-# ---- Configuration with the environment values emptied -----------------------------------------------------
+# ---- Configuration with the environment values emptied ---------------------------------------------------
 $configRelative = 'config\PraCloudMailbox.config.psd1'
-$config = [IO.File]::ReadAllText((Join-Path $root $configRelative), [Text.Encoding]::UTF8)
-$emptied = [Collections.Generic.List[string]]::new()
+$config = [IO.File]::ReadAllText((Join-Path $packageRoot $configRelative), [Text.Encoding]::UTF8)
+$emptied = New-Object 'Collections.Generic.List[string]'
 $keys = 'DomainController', 'Server', 'SearchBase', 'GroupDN', 'CsvPath', 'ContactsSearchBase', 'DistributionGroupsSearchBase', 'TenantId', 'Organization',
-    'AppId', 'CertificateThumbprint', 'DefaultUsageLocation', 'GroupId', 'SkuPartNumber', 'HoldPolicy', 'ScriptPath',
+    'AppId', 'CertificateThumbprint', 'UserPrincipalName', 'DefaultUsageLocation', 'GroupId', 'SkuPartNumber', 'HoldPolicy', 'ScriptPath',
     'LicensingGroupId', 'OnPremisesRoutingDomain'
 foreach ($key in $keys) {
     # Every occurrence, also inside an inline hashtable (Users = @{ Mode = 'Group'; GroupId = '...' }).
@@ -120,16 +157,15 @@ $config = [regex]::Replace($config, "(?m)^(\s*Mode\s*=\s*)'(Script|Remoting)'", 
 $config = Reset-PraPackageConsent -Text $config
 $configTarget = Join-Path $Destination $configRelative
 [IO.File]::WriteAllText($configTarget, $config, [Text.UTF8Encoding]::new($true))
-$files.Add($configRelative)
 
 # ---- Checks -------------------------------------------------------------------------------------------------
-$problems = [Collections.Generic.List[string]]::new()
+$problems = New-Object 'Collections.Generic.List[string]'
 foreach ($name in 'data', 'logs', 'reports', 'tests', 'tools') {
     if (Test-Path -LiteralPath (Join-Path $Destination $name)) { $problems.Add("Folder $name\ must not be in the package.") }
 }
-Get-ChildItem -LiteralPath $Destination -Recurse -File | Where-Object { $_.Extension -in '.db', '.bak', '.xml', '.log' } | ForEach-Object { $problems.Add("File not allowed in the package: $($_.Name)") }
-$textFiles = Get-ChildItem -LiteralPath $Destination -Recurse -File | Where-Object { $_.Extension -in '.ps1', '.psm1', '.psd1', '.csv', '.md', '.html', '.txt' }
-foreach ($value in ($emptied | Where-Object { $_.Length -ge 4 } | Select-Object -Unique)) {
+Get-ChildItem -LiteralPath $Destination -Recurse -File | Where-Object { Test-OrdinalIn $_.Extension @('.db', '.bak', '.sha256', '.clixml', '.jsonl', '.log') -IgnoreCase } | ForEach-Object { $problems.Add("File not allowed in the package: $($_.Name)") }
+$textFiles = Get-ChildItem -LiteralPath $Destination -Recurse -File | Where-Object { Test-OrdinalIn $_.Extension @('.ps1', '.psm1', '.psd1', '.csv', '.md', '.html', '.txt', '.xaml') -IgnoreCase }
+foreach ($value in (New-OrdinalSet @($emptied | Where-Object { $_.Length -ge 4 }))) {
     foreach ($file in $textFiles) {
         if ([IO.File]::ReadAllText($file.FullName).IndexOf($value, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
             $problems.Add("An environment value of the configuration ($value) appears in $($file.FullName.Substring($Destination.Length + 1)).")
@@ -137,23 +173,32 @@ foreach ($value in ($emptied | Where-Object { $_.Length -ge 4 } | Select-Object 
     }
 }
 $check = Import-PowerShellDataFile -LiteralPath $configTarget
-if ($check.Cloud.TenantId -or $check.Cloud.AppId -or $check.Cloud.CertificateThumbprint -or $check.Licensing.Users.GroupId -or $check.Retention.HoldPolicy) { $problems.Add('Tenant values are still in the packaged configuration.') }
+if ($check.Cloud.TenantId -or $check.Cloud.AppId -or $check.Cloud.CertificateThumbprint -or $check.Exchange.Server -or $check.Licensing.Users.GroupId -or $check.Retention.HoldPolicy) { $problems.Add('Tenant or Exchange values are still in the packaged configuration.') }
 if ($check.Resources.OnPremisesReady -ne $false -or $check.Resources.AllowUnprotectedDeletion -ne $false) { $problems.Add('Resources.OnPremisesReady and Resources.AllowUnprotectedDeletion must both be $false in the packaged configuration.') }
-foreach ($file in Get-ChildItem -LiteralPath $Destination -Recurse -File -Include '*.ps1', '*.psm1', '*.psd1') {
-    $errors = $null
-    $null = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors)
-    if ($errors) { $problems.Add("Parse error in $($file.Name): $($errors[0].Message)") }
-}
+$allowed = @($files) + @($configRelative)
+$delivered = @(Get-ChildItem -LiteralPath $Destination -Recurse -File | ForEach-Object { $_.FullName.Substring($Destination.Length + 1) })
+foreach ($extra in @($delivered | Where-Object { -not (Test-OrdinalIn $_ $allowed) })) { $problems.Add("Unexpected file in the package: $extra") }
+foreach ($missing in @($allowed | Where-Object { -not (Test-OrdinalIn $_ $delivered) })) { $problems.Add("Expected file missing from the package: $missing") }
 if ($problems.Count) { throw ("Package not valid ($Destination):`n - " + ($problems -join "`n - ")) }
+try { Assert-AuthenticatedPackage $Destination -Distribution }
+catch { Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction SilentlyContinue; throw }
 
-if ($Zip) { Compress-Archive -LiteralPath $Destination -DestinationPath $zipPath -CompressionLevel Optimal }
+if ($Zip) {
+    Compress-Archive -LiteralPath $Destination -DestinationPath $zipPath -CompressionLevel Optimal
+    $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    [IO.File]::WriteAllText($hashPath, ('{0}  {1}' -f $hash, [IO.Path]::GetFileName($zipPath)) + "`n", [Text.UTF8Encoding]::new($false))
+}
 
 $all = Get-ChildItem -LiteralPath $Destination -Recurse -File
 Write-Host ''
 Write-Host "  PRA Cloud Mailbox $version - package ready" -ForegroundColor Green
 Write-Host "  Folder   : $Destination"
-if ($Zip) { Write-Host ("  Zip      : {0} ({1:N1} MB)" -f $zipPath, ((Get-Item -LiteralPath $zipPath).Length / 1MB)) }
+if ($Zip) {
+    Write-Host ("  Zip      : {0} ({1:N1} MB)" -f $zipPath, ((Get-Item -LiteralPath $zipPath).Length / 1MB))
+    Write-Host "  SHA-256  : $hashPath"
+}
 Write-Host ("  Content  : {0} files, {1:N1} MB" -f $all.Count, (($all | Measure-Object Length -Sum).Sum / 1MB))
-Write-Host "  Config   : environment values emptied ($(@($emptied | Select-Object -Unique).Count)) - fill in the configuration (developer guide, chapter 6)"
+Write-Host '  Integrity: owner signatures and SHA256 inventory verified'
+Write-Host "  Config   : environment values emptied ($((New-OrdinalSet $emptied.ToArray()).Count)) - fill in the configuration (administrator guide, chapter 6)"
 Write-Host ''
 $all | Sort-Object FullName | ForEach-Object { '    {0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring($Destination.Length + 1) }

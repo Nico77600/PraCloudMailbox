@@ -1,0 +1,7 @@
+PRA Cloud Mailbox: this archive is the source code, not the tool.
+
+To use PRA Cloud Mailbox, download the release ZIP, signed by the owner, from:
+
+    https://github.com/Nico77600/PraCloudMailbox/releases/latest
+
+On that page, under Assets, download PraCloudMailbox-<version>.zip (and its .sha256 file), not the Source code archives.

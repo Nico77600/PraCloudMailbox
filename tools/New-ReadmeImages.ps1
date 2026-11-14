@@ -1,8 +1,8 @@
-﻿#Requires -Version 7.4
+﻿#Requires -Version 7.5
 
 <#
 .SYNOPSIS
-    Renders the graphics of the GitHub README from the PRA Cloud Mailbox developer guide, in a light and a
+    Renders the graphics of the GitHub README from the PRA Cloud Mailbox administrator guide, in a light and a
     dark version: banner, principles, how it works, Convert and Recover, states, resources and permissions.
 
 .DESCRIPTION
@@ -20,7 +20,7 @@
     are opened. Output: docs\images\readme-<name>-light.png and readme-<name>-dark.png.
 
 .PARAMETER OutputFolder
-    Default: docs\images next to the tools folder.
+    Default: package\docs\images next to the tools folder.
 
 .PARAMETER KeepWork
     Keeps the work folder (the HTML pages of the graphics) and shows its path.
@@ -30,7 +30,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.0.0  (from Web Services Client for Exchange 1.0.0)
+    Version : 2.0.0  (from Web Services Client for Exchange 1.0.0)
     Part of : PRA Cloud Mailbox (repository tool, not in the package)
 #>
 [CmdletBinding()]
@@ -40,7 +40,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-if (-not $OutputFolder) { $OutputFolder = Join-Path $root 'docs\images' }
+if (-not $OutputFolder) { $OutputFolder = Join-Path $root 'package\docs\images' }
 
 #region Assets of the guide ------------------------------------------------------------------------
 function ConvertTo-ReadmeInline([string]$Text) {
@@ -54,8 +54,8 @@ function ConvertTo-ReadmeInline([string]$Text) {
 function Get-ReadmeAssets {
     param([string]$Root)
     $builder = Join-Path $Root 'tools\Build-Documentation.ps1'
-    $guideHtml = Join-Path $Root 'docs\PraCloudMailbox-Guide.html'
-    $guideMd = Join-Path $Root 'docs\PraCloudMailbox-Guide.md'
+    $guideHtml = Join-Path $Root 'package\docs\PraCloudMailbox-Guide.html'
+    $guideMd = Join-Path $Root 'package\docs\PraCloudMailbox-Guide.md'
     if (-not (Test-Path $guideHtml)) { throw 'docs\PraCloudMailbox-Guide.html not found: run tools\Build-Documentation.ps1 first (it holds the CSS of the graphics).' }
     # Icons: the $Icons table of the documentation builder, read without running the builder.
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($builder, [ref]$null, [ref]$null)
@@ -255,7 +255,7 @@ try {
     # Banner: the hero of the guide, with the key figures.
     $badges = @(
         "<span class=""badge badge-accent"">Version $($assets.Version)</span>"
-        "<span class=""badge"">$(Get-ReadmeIcon 'terminal' 'icon-sm')PowerShell 5.1 &middot; 7.4+</span>"
+        "<span class=""badge"">$(Get-ReadmeIcon 'terminal' 'icon-sm')PowerShell 7.5+</span>"
         "<span class=""badge"">$(Get-ReadmeIcon 'shield' 'icon-sm')Journal before each change</span>"
         "<span class=""badge"">$(Get-ReadmeIcon 'tag' 'icon-sm')MIT license</span>"
     ) -join ''
@@ -276,7 +276,7 @@ try {
     # Same construction as scenario 1: entry pipeline on the left, four action cards on the right.
     $stages = @(
         'settings | Configuration | scope, tenant, app certificate, licences, holds, Entra Connect'
-        'arrow | read by | one entry script, command line or WPF window'
+        'arrow | read by | one entry script, command line or guided console'
         'terminal | Invoke-PraCloudMailbox.ps1 | -Action, -Mode, -Batch; Preview before Apply'
         'arrow | collects before the disaster | copy the SQLite snapshot to the cloud admin server'
         'database | Exchange snapshot | mailboxes, addresses, shared permissions and native-resource metadata'
@@ -286,7 +286,7 @@ try {
         'chart | Batch and reports | SQLite journal, log, transcript, CSV and HTML report'
     )
     $actions = @(
-        [pscustomobject]@{ Icon = 'database'; Name = 'Collect'; Chip = '<span class="rb-chip hot">snapshot</span>'; Text = 'Before the disaster, read <strong>mailboxes, addresses and permissions</strong> from Exchange into SQLite. Windows PowerShell 5.1; no tenant change.'; Pills = (Get-ReadmePill 'Preview first' 'info') + (Get-ReadmePill 'Scheduled task' 'success') }
+        [pscustomobject]@{ Icon = 'database'; Name = 'Collect'; Chip = '<span class="rb-chip hot">snapshot</span>'; Text = 'Before the disaster, read <strong>mailboxes, addresses and permissions</strong> from Exchange into SQLite. PowerShell 7.5, remote session to Exchange; never changes Exchange.'; Pills = (Get-ReadmePill 'Preview first' 'info') + (Get-ReadmePill 'Scheduled task' 'success') }
         [pscustomobject]@{ Icon = 'search'; Name = 'Check'; Chip = '<span class="rb-chip">read only</span>'; Text = 'On the cloud admin server: <strong>is every object ready?</strong> Check identity, recipient, app permissions, protection and required capacity.'; Pills = (Get-ReadmePill 'Ready' 'success') + (Get-ReadmePill 'Blocked' 'warning') }
         [pscustomobject]@{ Icon = 'target'; Name = 'Convert'; Chip = '<span class="rb-chip hot">changes</span>'; Text = 'Promote user Teams storage; create shared mailboxes in waves with their permissions. <strong>Opt-in native rooms/equipment</strong> get new cloud resources.'; Pills = (Get-ReadmePill 'Journaled' 'info') + (Get-ReadmePill 'Resumable' 'success') }
         [pscustomobject]@{ Icon = 'refresh'; Name = 'Recover'; Chip = '<span class="rb-chip hot">changes</span>'; Text = 'Users return under a case hold; shared cloud mailboxes become inactive. <strong>Native bookings must be exported</strong> before destructive recovery.'; Pills = (Get-ReadmePill 'User/shared data protected' 'success') + (Get-ReadmePill 'Native: no hold' 'warning') }
@@ -296,7 +296,7 @@ try {
         "<div class=""rb-col""><div class=""rb-caption"">Four actions <span>$mid Preview by default, Apply on demand</span></div><div class=""rb-modes"">$actionHtml</div></div></div>"
     New-ReadmeGraphic -Name 'how-it-works' -Body $howItWorks -Width 1000
 
-    # Convert and Recover, users and shared mailboxes: the validated order of the steps.
+    # Convert and Recover, users and shared mailboxes: the order of the steps.
     $flows = [ordered]@{
         'Users &middot; Convert <span>&middot; minutes</span>' = @(
             'mail | GUID cleared | the MailUser no longer points on-premises', 'arrow | | ', 'cloud | Cloud authority | Entra Connect ignores the object', 'arrow | | '

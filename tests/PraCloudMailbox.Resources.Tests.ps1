@@ -1,19 +1,22 @@
-#Requires -Version 5.1
+﻿#Requires -Version 7.5
 Describe 'Native resource safety rules' {
     BeforeAll {
-        $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-        Import-Module (Join-Path $root 'module\PRA2.Common.psm1') -Force
-        Import-Module (Join-Path $root 'module\PRA2.Cloud.psm1') -Force
+        . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
+        $script:Package = New-PcmTestPackage -Repository ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')))
+        $root = $script:Package
+        Import-Module (Join-Path $root 'module\PRA.Common.psm1') -Force
+        Import-Module (Join-Path $root 'module\PRA.Cloud.psm1') -Force
     }
+    AfterAll { Remove-PcmTestPackage $script:Package }
 
     Describe 'CloudResource Collect wiring' {
         BeforeAll {
-            $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-            Import-Module (Join-Path $root 'module\PRA2.Common.psm1') -Force
-            Import-Module (Join-Path $root 'module\PRA2.Collect.psm1') -Force
-            Import-Module (Join-Path $root 'module\PRA2.Store.psm1') -Force
+            $root = $script:Package
+            Import-Module (Join-Path $root 'module\PRA.Common.psm1') -Force
+            Import-Module (Join-Path $root 'module\PRA.Collect.psm1') -Force
+            Import-Module (Join-Path $root 'module\PRA.Store.psm1') -Force
             $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'Invoke-PraCloudMailbox.ps1'), [ref]$null, [ref]$null)
-            foreach ($function in @($ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -in @('Invoke-PraCollect','Skip-PraStep','New-PraRow') })) {
+            foreach ($function in @($ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -in @('Invoke-PcmCollect','Skip-PcmStep','New-PcmRow','Get-PcmCommandLine','ConvertTo-PcmLiteral') })) {
                 . ([scriptblock]::Create($function.Extent.Text))
             }
             function Start-ResourceCollectTest {
@@ -23,25 +26,26 @@ Describe 'Native resource safety rules' {
                 $run = @{ Config = $config; Mode = $Mode; Action = 'Collect'; CurrentOperation = ''; CurrentIdentity = ''
                     Excluded = [System.Collections.Generic.List[string]]::new(); Rows = [System.Collections.Generic.List[object]]::new(); NextSteps = @() }
                 $mailbox = [pscustomobject]@{ PrimarySmtpAddress = 'resource@contoso.com'; RecipientTypeDetails = $Kind; Guid = 'source-guid' }
-                foreach ($entry in @{ context = $run; Action = 'Collect'; Identity = ''; Scope = 'All'; Force = $true; CollectTestMailbox = $mailbox }.GetEnumerator()) {
+                $script:ConfigPathBound = $false; $script:ConfirmBound = $false
+                foreach ($entry in @{ context = $run; Action = 'Collect'; Identity = ''; CsvPath = ''; SearchBase = ''; Group = ''; MaxObjects = 0; BaseConfigPath = ''; Scope = 'All'; Snapshot = [long]0; Force = $true; CollectTestMailbox = $mailbox }.GetEnumerator()) {
                     Set-Variable -Name $entry.Key -Value $entry.Value -Scope 1
                 }
             }
-            Mock Connect-Pra2Exchange { 'offline' }
-            Mock Get-Pra2ScopeMailbox { $CollectTestMailbox }
-            Mock Get-Pra2ResourceSettings { @{ SchemaVersion = 1; Capacity = 12 } }
-            Mock Get-Pra2SharedPermission { @{ Permissions = @(); Members = @(); Warnings = @() } }
-            Mock ConvertTo-Pra2MailboxRecord {
+            Mock Connect-PcmExchange { 'offline' }
+            Mock Get-PcmScopeMailbox { $CollectTestMailbox }
+            Mock Get-PcmResourceSettings { @{ SchemaVersion = 1; Capacity = 12 } }
+            Mock Get-PcmSharedPermission { @{ Permissions = @(); Members = @(); Warnings = @() } }
+            Mock ConvertTo-PcmMailboxRecord {
                 [ordered]@{ object_guid = [string]$Mailbox.Guid; kind = ([string]$Mailbox.RecipientTypeDetails -replace 'Mailbox$', '')
                     primary_smtp_address = [string]$Mailbox.PrimarySmtpAddress; user_principal_name = [string]$Mailbox.PrimarySmtpAddress; exchange_guid = 'source-exchange-guid'
                     legacy_exchange_dn = ''; email_addresses_json = '["SMTP:resource@contoso.com"]'
                     resource_settings_json = $(if ($ResourceSettings) { $ResourceSettings | ConvertTo-Json -Compress } else { $null }) }
             }
-            Mock Write-PraStep { }
-            Mock Write-PraItem { }
-            Mock Write-PraLog { }
-            Mock Skip-PraStep { }
-            Mock Open-Pra2Store { throw 'Snapshot writing must not be reached.' }
+            Mock Write-PcmStep { }
+            Mock Write-PcmItem { }
+            Mock Write-PcmLog { }
+            Mock Skip-PcmStep { }
+            Mock Open-PcmStore { throw 'Snapshot writing must not be reached.' }
         }
 
         It 'collects booking settings only for opted-in native resources (<ResourceMode>, <Kind>)' -TestCases @(
@@ -53,22 +57,22 @@ Describe 'Native resource safety rules' {
             @{ ResourceMode = 'SynchronizedShared'; Kind = 'EquipmentMailbox'; Calls = 0 }) {
             param($ResourceMode, $Kind, $Calls)
             Start-ResourceCollectTest -ResourceMode $ResourceMode -Kind $Kind
-            Invoke-PraCollect
-            Should -Invoke Get-Pra2ResourceSettings -Times $Calls -Exactly
-            Should -Invoke ConvertTo-Pra2MailboxRecord -Times 1 -Exactly
-            Should -Invoke ConvertTo-Pra2MailboxRecord -Times $Calls -Exactly -ParameterFilter { $null -ne $ResourceSettings }
-            Should -Invoke Open-Pra2Store -Times 0 -Exactly
+            Invoke-PcmCollect
+            Should -Invoke Get-PcmResourceSettings -Times $Calls -Exactly
+            Should -Invoke ConvertTo-PcmMailboxRecord -Times 1 -Exactly
+            Should -Invoke ConvertTo-PcmMailboxRecord -Times $Calls -Exactly -ParameterFilter { $null -ne $ResourceSettings }
+            Should -Invoke Open-PcmStore -Times 0 -Exactly
         }
 
         It 'aborts before snapshot writing when native settings fail or are missing (<Failure>)' -TestCases @(
             @{ Failure = 'ReadError' }, @{ Failure = 'Empty' }) {
             param($Failure)
             Start-ResourceCollectTest -ResourceMode CloudResource -Kind RoomMailbox -Mode Apply
-            if ($Failure -eq 'ReadError') { Mock Get-Pra2ResourceSettings { throw 'Unresolved booking delegate.' } }
-            else { Mock Get-Pra2ResourceSettings { $null } }
-            { Invoke-PraCollect } | Should -Throw '*Collect stopped before writing the snapshot*resource@contoso.com*'
-            Should -Invoke ConvertTo-Pra2MailboxRecord -Times 0 -Exactly
-            Should -Invoke Open-Pra2Store -Times 0 -Exactly
+            if ($Failure -eq 'ReadError') { Mock Get-PcmResourceSettings { throw 'Unresolved booking delegate.' } }
+            else { Mock Get-PcmResourceSettings { $null } }
+            { Invoke-PcmCollect } | Should -Throw '*Collect stopped before writing the snapshot*resource@contoso.com*'
+            Should -Invoke ConvertTo-PcmMailboxRecord -Times 0 -Exactly
+            Should -Invoke Open-PcmStore -Times 0 -Exactly
         }
         It 'does not collect general mailbox rights for native rooms/equipment even in mixed scope (<Kind>)' -TestCases @(
             @{ Kind = 'RoomMailbox' }, @{ Kind = 'EquipmentMailbox' }) {
@@ -76,18 +80,18 @@ Describe 'Native resource safety rules' {
             Start-ResourceCollectTest -ResourceMode CloudResource -Kind $Kind
             $context.Config.Collect.SharedPermissions = $true
             $shared = [pscustomobject]@{ Guid = 'shared-guid'; PrimarySmtpAddress = 'shared@contoso.com'; RecipientTypeDetails = 'SharedMailbox' }
-            Mock Get-Pra2ScopeMailbox { @($CollectTestMailbox, $shared) }
-            Invoke-PraCollect
-            Should -Invoke Get-Pra2SharedPermission -Times 1 -Exactly -ParameterFilter { $Mailbox.Guid -eq 'shared-guid' }
-            Should -Invoke Get-Pra2SharedPermission -Times 0 -Exactly -ParameterFilter { $Mailbox.RecipientTypeDetails -eq $Kind }
+            Mock Get-PcmScopeMailbox { @($CollectTestMailbox, $shared) }
+            Invoke-PcmCollect
+            Should -Invoke Get-PcmSharedPermission -Times 1 -Exactly -ParameterFilter { $Mailbox.Guid -eq 'shared-guid' }
+            Should -Invoke Get-PcmSharedPermission -Times 0 -Exactly -ParameterFilter { $Mailbox.RecipientTypeDetails -eq $Kind }
         }
         It 'preserves legacy synced room/equipment general permission collection (<Kind>)' -TestCases @(
             @{ Kind = 'RoomMailbox' }, @{ Kind = 'EquipmentMailbox' }) {
             param($Kind)
             Start-ResourceCollectTest -ResourceMode SynchronizedShared -Kind $Kind
             $context.Config.Collect.SharedPermissions = $true
-            Invoke-PraCollect
-            Should -Invoke Get-Pra2SharedPermission -Times 1 -Exactly
+            Invoke-PcmCollect
+            Should -Invoke Get-PcmSharedPermission -Times 1 -Exactly
         }
     }
     BeforeEach {
@@ -100,22 +104,22 @@ Describe 'Native resource safety rules' {
 
     It 'defaults to synchronized shared behavior and requires explicit CloudResource selection' {
         $config.Scope.Remove('ResourceMode')
-        Test-Pra2NativeResource -Config $config -Record $record | Should -BeFalse
+        Test-PcmNativeResource -Config $config -Record $record | Should -BeFalse
         $config.Scope.ResourceMode = 'CloudResource'
-        Test-Pra2NativeResource -Config $config -Record $record | Should -BeTrue
+        Test-PcmNativeResource -Config $config -Record $record | Should -BeTrue
         $record.kind = 'Shared'
-        Test-Pra2NativeResource -Config $config -Record $record | Should -BeFalse
+        Test-PcmNativeResource -Config $config -Record $record | Should -BeFalse
     }
 
     It 'does not infer address availability from absent Graph user' {
         $state = [pscustomobject]@{ NativeResource = $true; User = $null; Collisions = @(); AbsenceVerified = $false; Owned = $false }
-        @(Get-Pra2Readiness -Config $config -Record $record -State $state | Where-Object Code -eq RESOURCE_ABSENCE_UNVERIFIED).Count | Should -Be 1
+        @(Get-PcmReadiness -Config $config -Record $record -State $state | Where-Object Code -eq RESOURCE_ABSENCE_UNVERIFIED).Count | Should -Be 1
     }
 
     It 'requires settings recollection and explicit ConvertRooms even in CloudResource mode' {
         $config.Scope.ConvertRooms = $false
         $state = [pscustomobject]@{ NativeResource = $true; User = $null; Collisions = @(); AbsenceVerified = $true; Owned = $false }
-        $findings = @(Get-Pra2Readiness -Config $config -Record $record -State $state)
+        $findings = @(Get-PcmReadiness -Config $config -Record $record -State $state)
         $findings.Code | Should -Contain RESOURCE_COLLECT_REQUIRED
         $findings.Code | Should -Contain KIND_NOT_SUPPORTED
         $findings.Code | Should -Not -Contain ENTRA_NOT_FOUND
@@ -123,11 +127,11 @@ Describe 'Native resource safety rules' {
 
     It 'refuses schema-one rows lacking the resource settings property without a property-access error' {
         $record.PSObject.Properties.Remove('resource_settings_json')
-        { Read-Pra2ResourceSettings -Record $record } | Should -Throw '*v1 snapshot*Collect is required*'
+        { Read-PcmResourceSettings -Record $record } | Should -Throw '*v1 snapshot*Collect is required*'
     }
 
     It 'preserves all SMTP/X500 including legacy DN with exactly the original primary' {
-        $addresses = @(Get-Pra2ResourceAddresses $record)
+        $addresses = @(Get-PcmResourceAddresses $record)
         $addresses | Should -Contain 'SMTP:room@contoso.com'
         $addresses | Should -Contain 'smtp:alternate@contoso.com'
         $addresses | Should -Contain 'X500:/o=legacy/cn=room'
@@ -138,24 +142,24 @@ Describe 'Native resource safety rules' {
     It 'detects a non-user Exchange recipient proxy collision independently of Graph' {
         $inventory = [pscustomobject]@{ Users = @(); Recipients = @([pscustomobject]@{ Identity = 'unrelated'; RecipientTypeDetails = 'MailContact'; Alias = 'other'
                     PrimarySmtpAddress = 'other@contoso.com'; EmailAddresses = @('smtp:alternate@contoso.com'); Guid = 'contact' }) }
-        @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 1
+        @(Get-PcmResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 1
     }
 
     It 'does not ignore a different resource GUID just because it has the same address' {
         $inventory = [pscustomobject]@{ Users = @(); Recipients = @([pscustomobject]@{ Identity = 'room'; RecipientTypeDetails = 'RoomMailbox'; Alias = 'room'
                     PrimarySmtpAddress = 'room@contoso.com'; EmailAddresses = @(); ExchangeGuid = 'different'; ExternalDirectoryObjectId = 'foreign' }) }
-        @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory -OwnedId 'owned' -OwnedGuid 'owned-guid').Count | Should -Be 1
+        @(Get-PcmResourceCollisions -Record $record -Inventory $inventory -OwnedId 'owned' -OwnedGuid 'owned-guid').Count | Should -Be 1
     }
 
     It 'accepts only an enabled enterprise plan and active assignment from the specific resource group' {
         $group = [pscustomobject]@{ Id = 'resource-group'; EnterprisePlans = @('enterprise'); EnterpriseAssignments = @([pscustomobject]@{ SkuId = 'sku-enterprise'; PlanIds = @('enterprise') }) }
         $user = [pscustomobject]@{ assignedPlans = @([pscustomobject]@{ servicePlanId = 'enterprise'; capabilityStatus = 'Enabled' })
             licenseAssignmentStates = @([pscustomobject]@{ skuId = 'sku-enterprise'; assignedByGroup = 'different-group'; state = 'Active'; error = 'None'; disabledPlans = @() }) }
-        Test-Pra2ResourceLicence -User $user -Group $group | Should -BeFalse
+        Test-PcmResourceLicence -User $user -Group $group | Should -BeFalse
         $user.licenseAssignmentStates[0].assignedByGroup = 'resource-group'
-        Test-Pra2ResourceLicence -User $user -Group $group | Should -BeTrue
+        Test-PcmResourceLicence -User $user -Group $group | Should -BeTrue
         $user.assignedPlans[0].capabilityStatus = 'Suspended'
-        Test-Pra2ResourceLicence -User $user -Group $group | Should -BeFalse
+        Test-PcmResourceLicence -User $user -Group $group | Should -BeFalse
     }
 
     It 'refuses missing, malformed, looping and unasserted resource routing (<Fault>)' -TestCases @(
@@ -168,39 +172,39 @@ Describe 'Native resource safety rules' {
             ProxyLoop { $record.email_addresses_json = '["SMTP:room@contoso.com","smtp:room@onprem.contoso.com"]' }
             NotReady { $config.Resources.OnPremisesReady = $false }
         }
-        { Get-Pra2ResourceRoute -Config $config -Record $record -RequireReady } | Should -Throw
+        { Get-PcmResourceRoute -Config $config -Record $record -RequireReady } | Should -Throw
     }
 
     It 'returns the exact hybrid destination without mutating the source' {
-        Get-Pra2ResourceRoute -Config $config -Record $record -RequireReady | Should -Be 'room@onprem.contoso.com'
+        Get-PcmResourceRoute -Config $config -Record $record -RequireReady | Should -Be 'room@onprem.contoso.com'
         $record.primary_smtp_address | Should -Be 'room@contoso.com'
     }
 
     It 'selects persisted lifecycle independently of current configuration' {
         $item = [pscustomobject]@{ original_json = '{"lifecycle":"CloudResource","cloudId":"immutable-id","cloudGuid":"independent-guid","token":"0123456789abcdef0123456789abcdef","creationName":"PRA-R-01234567-89abcdef-0123456789abcdef0123456789abcdef","markerAttribute":"CustomAttribute15"}' }
         $config.Scope.ResourceMode = 'SynchronizedShared'
-        (Get-Pra2ResourceIntent -Item $item).cloudId | Should -Be 'immutable-id'
+        (Get-PcmResourceIntent -Item $item).cloudId | Should -Be 'immutable-id'
         $item.original_json = '{"entraId":"legacy"}'
-        Get-Pra2ResourceIntent -Item $item | Should -BeNullOrEmpty
+        Get-PcmResourceIntent -Item $item | Should -BeNullOrEmpty
     }
 
     It 'never downgrades missing/legacy protection mode or accepts an unknown mode' {
-        Get-Pra2ResourceProtectionMode -Intent $null | Should -BeExactly None
-        Get-Pra2ResourceProtectionMode -Intent ([pscustomobject]@{ lifecycle = 'CloudResource' }) | Should -BeExactly CaseHold
-        Get-Pra2ResourceProtectionMode -Intent ([pscustomobject]@{ protectionMode = 'None' }) | Should -BeExactly None
-        { Get-Pra2ResourceProtectionMode -Intent ([pscustomobject]@{ protectionMode = '' }) } | Should -Throw '*Unknown*'
-        { Get-Pra2ResourceProtectionMode -Intent ([pscustomobject]@{ protectionMode = @('None') }) } | Should -Throw '*Unknown*'
-        { Get-Pra2ResourceProtectionMode -Intent ([pscustomobject]@{ protectionMode = 'None'; holdTag = 'UniHlegacy' }) } | Should -Throw '*conflicts*'
+        Get-PcmResourceProtectionMode -Intent $null | Should -BeExactly None
+        Get-PcmResourceProtectionMode -Intent ([pscustomobject]@{ lifecycle = 'CloudResource' }) | Should -BeExactly CaseHold
+        Get-PcmResourceProtectionMode -Intent ([pscustomobject]@{ protectionMode = 'None' }) | Should -BeExactly None
+        { Get-PcmResourceProtectionMode -Intent ([pscustomobject]@{ protectionMode = '' }) } | Should -Throw '*Unknown*'
+        { Get-PcmResourceProtectionMode -Intent ([pscustomobject]@{ protectionMode = @('None') }) } | Should -Throw '*Unknown*'
+        { Get-PcmResourceProtectionMode -Intent ([pscustomobject]@{ protectionMode = 'None'; holdTag = 'UniHlegacy' }) } | Should -Throw '*conflicts*'
     }
 
     It 'does not require usageLocation or licensing for the new native readiness path' {
         $config.Cloud = @{ DefaultUsageLocation = '' }
         $state = [pscustomobject]@{ NativeResource = $true; Collisions = @(); AbsenceVerified = $true; ProtectionMode = 'None' }
-        $findings = @(Get-Pra2Readiness -Config $config -Record $record -State $state)
+        $findings = @(Get-PcmReadiness -Config $config -Record $record -State $state)
         $findings.Code | Should -Not -Contain NO_USAGE_LOCATION
         $findings.Code | Should -Contain RESOURCE_UNPROTECTED
         $state.ProtectionMode = 'CaseHold'
-        @(Get-Pra2Readiness -Config $config -Record $record -State $state).Code | Should -Contain NO_USAGE_LOCATION
+        @(Get-PcmReadiness -Config $config -Record $record -State $state).Code | Should -Contain NO_USAGE_LOCATION
     }
 
     It 'fails closed on a missing, empty, misspelled or non-string readiness protection mode (<Name>)' -TestCases @(
@@ -210,7 +214,7 @@ Describe 'Native resource safety rules' {
         param($Name, $Mode)
         $state = [pscustomobject]@{ NativeResource = $true; Collisions = @(); AbsenceVerified = $true }
         if ($Name -ne 'missing') { $state | Add-Member -NotePropertyName ProtectionMode -NotePropertyValue $Mode }
-        $findings = @(Get-Pra2Readiness -Config $config -Record $record -State $state)
+        $findings = @(Get-PcmReadiness -Config $config -Record $record -State $state)
         @($findings | Where-Object { $_.Code -eq 'RESOURCE_PROTECTION_UNKNOWN' -and $_.Level -eq 'Error' }).Count | Should -Be 1
         $findings.Code | Should -Not -Contain RESOURCE_UNPROTECTED
         $findings.Code | Should -Not -Contain RESOURCE_NATIVE
@@ -222,17 +226,17 @@ Describe 'Native resource safety rules' {
         param($Mode, $Present)
         $config.Cloud = @{ DefaultUsageLocation = 'FR' }
         $state = [pscustomobject]@{ NativeResource = $true; Collisions = @(); AbsenceVerified = $true; ProtectionMode = $Mode }
-        $findings = @(Get-Pra2Readiness -Config $config -Record $record -State $state)
+        $findings = @(Get-PcmReadiness -Config $config -Record $record -State $state)
         $findings.Code | Should -Contain $Present
         $findings.Code | Should -Not -Contain RESOURCE_PROTECTION_UNKNOWN
     }
 
     It 'treats a journal without protectionMode as the legacy case-hold contract and never as unprotected' {
         $json = '{"lifecycle":"CloudResource","cloudId":"immutable-id","cloudGuid":"independent-guid","token":"0123456789abcdef0123456789abcdef","creationName":"PRA-R-01234567-89abcdef-0123456789abcdef0123456789abcdef","markerAttribute":"CustomAttribute15","licensingGroupId":"11111111-1111-1111-1111-111111111111","holdTag":"UniHlegacy"}'
-        $intent = Get-Pra2ResourceIntent -Item ([pscustomobject]@{ original_json = $json })
-        Get-Pra2ResourceProtectionMode -Intent $intent | Should -BeExactly CaseHold
+        $intent = Get-PcmResourceIntent -Item ([pscustomobject]@{ original_json = $json })
+        Get-PcmResourceProtectionMode -Intent $intent | Should -BeExactly CaseHold
         $bad = $json.Replace('"licensingGroupId"', '"protectionMode":"Unprotected","licensingGroupId"')
-        { Get-Pra2ResourceIntent -Item ([pscustomobject]@{ original_json = $bad }) } | Should -Throw '*Unknown*'
+        { Get-PcmResourceIntent -Item ([pscustomobject]@{ original_json = $bad }) } | Should -Throw '*Unknown*'
     }
 
     It 'rejects inconsistent durable deletion progress in a journal intent (<Fault>)' -TestCases @(
@@ -243,7 +247,7 @@ Describe 'Native resource safety rules' {
         @{ Fault = 'CaseHoldMix'; Json = '"unprotectedDeletionAttempted":true,"unprotectedDeletionProgress":"Issued"'; Message = '*Protected journal conflicts*' }) {
         param($Fault, $Json, $Message)
         $text = '{"lifecycle":"CloudResource","cloudId":"immutable-id","cloudGuid":"independent-guid","token":"0123456789abcdef0123456789abcdef","creationName":"PRA-R-01234567-89abcdef-0123456789abcdef0123456789abcdef","markerAttribute":"CustomAttribute15",' + $Json + '}'
-        { Get-Pra2ResourceIntent -Item ([pscustomobject]@{ original_json = $text }) } | Should -Throw $Message
+        { Get-PcmResourceIntent -Item ([pscustomobject]@{ original_json = $text }) } | Should -Throw $Message
     }
 
     It 'derives deletion progress from the legacy attempted flag and refuses an ambiguous or completed DELETE (<Expected>)' -TestCases @(
@@ -255,9 +259,9 @@ Describe 'Native resource safety rules' {
         @{ Intent = @{ unprotectedDeletionAttempted = $true; unprotectedDeletionProgress = 'Verified' }; Expected = 'Verified'; Repeatable = $false }) {
         param($Intent, $Expected, $Repeatable)
         $object = [pscustomobject]($Intent + @{ cloudId = 'immutable-id' })
-        Get-Pra2UnprotectedDeletionProgress -Intent $object | Should -BeExactly $Expected
-        if ($Repeatable) { { Assert-Pra2UnprotectedDeletionRepeatable -Intent $object } | Should -Not -Throw }
-        else { { Assert-Pra2UnprotectedDeletionRepeatable -Intent $object } | Should -Throw '*no second deletion*' }
+        Get-PcmUnprotectedDeletionProgress -Intent $object | Should -BeExactly $Expected
+        if ($Repeatable) { { Assert-PcmUnprotectedDeletionRepeatable -Intent $object } | Should -Not -Throw }
+        else { { Assert-PcmUnprotectedDeletionRepeatable -Intent $object } | Should -Throw '*no second deletion*' }
     }
 
     # This exercises the PowerShell 7 cloud runtime (Graph HTTP metadata and URI encoding), not the 5.1 Collect path.
@@ -301,9 +305,9 @@ Describe 'Native resource safety rules' {
                 $global:PraFake.Users.Remove('foreign-id')
                 $global:PraFake.Recycle['foreign-id'] = $deleted
             }
-            $inventory = Get-Pra2ResourceInventory -Records @($record)
+            $inventory = Get-PcmResourceInventory -Records @($record)
             $inventory.Recipients.Count | Should -Be 1
-            @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory).Count | Should -BeGreaterThan 0
+            @(Get-PcmResourceCollisions -Record $record -Inventory $inventory).Count | Should -BeGreaterThan 0
             $global:PraFake.RecipientQueries.Count | Should -BeGreaterThan 0
             foreach ($query in $global:PraFake.RecipientQueries) {
                 if ($query.Identity) {
@@ -329,14 +333,14 @@ Describe 'Native resource safety rules' {
             $deleted = Add-PraFakeUser -Upn 'unrelated@contoso.com' -Id 'deleted-legacy'
             $deleted['LegacyExchangeDN'] = '/O=OLD/CN=ROOM'
             $global:PraFake.Users.Remove($deleted.Id); $global:PraFake.Recycle[$deleted.Id] = $deleted
-            $inventory = Get-Pra2ResourceInventory -Records @($record, $record)
+            $inventory = Get-PcmResourceInventory -Records @($record, $record)
             $queries = @($global:PraFake.RecipientQueries | Where-Object Identity)
             $queries.Count | Should -Be 2
             $queries.Identity | Should -Contain '/o=legacy/cn=room'
             $queries.Identity | Should -Contain '/o=old/cn=room'
             $inventory.Recipients.Count | Should -Be 1
             @($inventory.Recipients[0].EmailAddresses) | Should -Not -Contain 'X500:/o=old/cn=room'
-            @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 1
+            @(Get-PcmResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 1
         }
 
         It 'accepts only explicit typed or serialized not-found metadata (<Shape>)' -TestCases @(
@@ -361,9 +365,9 @@ Describe 'Native resource safety rules' {
                 if ($Shape -eq 'RemoteWrapped') { $exception = [InvalidOperationException]::new('Wrapped REST failure.', $exception) }
             }
             $global:PraFake.Faults.RecipientIdentityError = [System.Management.Automation.ErrorRecord]::new($exception, $fqid, $category, '/o=old/cn=room')
-            $inventory = Get-Pra2ResourceInventory -Records @($record)
+            $inventory = Get-PcmResourceInventory -Records @($record)
             $inventory.Recipients.Count | Should -Be 0
-            @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 0
+            @(Get-PcmResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 0
             @($global:PraFake.RecipientQueries | Where-Object Identity).Count | Should -Be 2
             $global:PraFake.Calls.Count | Should -Be 0
         }
@@ -398,7 +402,7 @@ Describe 'Native resource safety rules' {
             }
             if ($Failure -ne 'MissingRemote') { $exception.Data['RemoteException'] = if ($Failure -eq 'NullRemote') { $null } else { $remote } }
             $global:PraFake.Faults.RecipientIdentityError = [System.Management.Automation.ErrorRecord]::new($exception, '[],Write-ErrorMessage', $Category, '/o=old/cn=room')
-            { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw
+            { Get-PcmResourceInventory -Records @($record) } | Should -Throw
             @($global:PraFake.RecipientQueries | Where-Object Identity).Count | Should -Be 1
             $global:PraFake.Calls.Count | Should -Be 0
         }
@@ -416,16 +420,16 @@ Describe 'Native resource safety rules' {
             param($Failure, $Category, $FQID, $Message)
             $exception = if ($Failure -eq 'TypedWrongCategory') { [Microsoft.Exchange.Configuration.Tasks.ManagementObjectNotFoundException]::new($Message) } else { [Exception]::new($Message) }
             $global:PraFake.Faults.RecipientIdentityError = [System.Management.Automation.ErrorRecord]::new($exception, $FQID, $Category, '/o=old/cn=room')
-            { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw
+            { Get-PcmResourceInventory -Records @($record) } | Should -Throw
             @($global:PraFake.RecipientQueries | Where-Object Identity).Count | Should -Be 1
             $global:PraFake.Calls.Count | Should -Be 0
         }
 
         It 'accepts a successful empty exact identity result without an unfiltered fallback' {
             $global:PraFake.Faults.RecipientIdentityEmpty = $true
-            $inventory = Get-Pra2ResourceInventory -Records @($record)
+            $inventory = Get-PcmResourceInventory -Records @($record)
             $inventory.Recipients.Count | Should -Be 0
-            @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 0
+            @(Get-PcmResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 0
             @($global:PraFake.RecipientQueries | Where-Object { -not $_.Filter -and -not $_.Identity }).Count | Should -Be 0
         }
 
@@ -446,7 +450,7 @@ Describe 'Native resource safety rules' {
                 $global:PraFake.Faults.RecipientIdentityError = [System.Management.Automation.ErrorRecord]::new(
                     [Exception]::new('Legacy service unavailable.'), 'ServiceUnavailable', 'ResourceUnavailable', '/o=Source/cn=fixture-equipment')
             }
-            $states = Get-Pra2CloudStateSet -Context @{ Config = $config } -Records $records
+            $states = Get-PcmCloudStateSet -Context @{ Config = $config } -Records $records
             $states.Count | Should -Be 3
             foreach ($row in $records) {
                 $row.primary_smtp_address | Should -Match '@tenant.onmicrosoft.com$'
@@ -482,10 +486,10 @@ Describe 'Native resource safety rules' {
                 $global:PraFake.Contacts[$id] = @{ Guid = $id; Identity = $id; RecipientTypeDetails = 'MailContact'; Alias = $id; PrimarySmtpAddress = "$id@contoso.com"
                     EmailAddresses = @(); LegacyExchangeDN = '/o=old/cn=room' }
             }
-            $inventory = Get-Pra2ResourceInventory -Records @($record)
+            $inventory = Get-PcmResourceInventory -Records @($record)
             $inventory.Recipients.Count | Should -Be 2
-            @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 2
-            $collisions = @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory -OwnedContactId first)
+            @(Get-PcmResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 2
+            $collisions = @(Get-PcmResourceCollisions -Record $record -Inventory $inventory -OwnedContactId first)
             $collisions.Count | Should -Be 1
             $collisions[0] | Should -Match second
         }
@@ -493,7 +497,7 @@ Describe 'Native resource safety rules' {
         It 'fails closed if identity returns non-exact or partial failure results (<Result>)' -TestCases @(
             @{ Result = 'Wrong' }, @{ Result = 'PartialNotFound' }, @{ Result = 'PartialRemoteNotFound' }) {
             param($Result)
-            Mock Get-Recipient -ModuleName PRA2.Cloud {
+            Mock Get-Recipient -ModuleName PRA.Cloud {
                 if (-not $Identity) { return }
                 [pscustomobject]@{ Guid = 'foreign'; Identity = 'foreign'; EmailAddresses = @(); LegacyExchangeDN = $(if ($Result -eq 'Wrong') { '/o=foreign/cn=room' } else { $Identity }) }
                 if ($Result -in @('PartialNotFound', 'PartialRemoteNotFound')) {
@@ -507,7 +511,7 @@ Describe 'Native resource safety rules' {
                     Write-Error -ErrorRecord ([System.Management.Automation.ErrorRecord]::new($exception, $fqid, $category, $Identity)) -ErrorAction Stop
                 }
             }
-            { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw
+            { Get-PcmResourceInventory -Records @($record) } | Should -Throw
         }
 
         It 'keeps all active and deleted Graph pages for UPN-only and immutable-anchor collisions' {
@@ -519,9 +523,9 @@ Describe 'Native resource safety rules' {
             $deleted = Add-PraFakeUser -Upn 'deleted@contoso.com' -Id 'immutable-only' -ImmutableId $record.immutable_id
             $global:PraFake.Users.Remove($deleted.Id)
             $global:PraFake.Recycle[$deleted.Id] = $deleted
-            $inventory = Get-Pra2ResourceInventory -Records @($record)
+            $inventory = Get-PcmResourceInventory -Records @($record)
             $inventory.Users.Count | Should -Be 2
-            $collisions = @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory)
+            $collisions = @(Get-PcmResourceCollisions -Record $record -Inventory $inventory)
             ($collisions -join ';') | Should -Match 'upn-only'
             ($collisions -join ';') | Should -Match 'immutable-only'
         }
@@ -535,7 +539,7 @@ Describe 'Native resource safety rules' {
             $global:PraFake.Contacts['exact'] = @{ Guid = 'exact'; Identity = 'exact'; Alias = $record.alias
                 PrimarySmtpAddress = $record.primary_smtp_address; EmailAddresses = @("X500:/o=Legacy/cn=O'Brien*(test)"); LegacyExchangeDN = $record.legacy_exchange_dn }
             $global:PraFake.Contacts['foreign'] = @{ Guid = 'foreign'; Identity = 'foreign'; Alias = 'foreign'; PrimarySmtpAddress = 'foreign@contoso.com'; EmailAddresses = @() }
-            $inventory = Get-Pra2ResourceInventory -Records @($record)
+            $inventory = Get-PcmResourceInventory -Records @($record)
             $inventory.Recipients.Count | Should -Be 1
             $inventory.Recipients[0].Guid | Should -Be exact
             $global:PraFake.RecipientQueries[0].Filter | Should -Match "o''brien"
@@ -551,9 +555,9 @@ Describe 'Native resource safety rules' {
                 $global:PraFake.Contacts[$id] = @{ Guid = $id; Identity = $id; RecipientTypeDetails = 'MailContact'; Alias = 'room'; PrimarySmtpAddress = 'foreign@contoso.com'
                     EmailAddresses = @('smtp:alternate@contoso.com', 'smtp:resource35@contoso.com') }
             }
-            $inventory = Get-Pra2ResourceInventory -Records $records
+            $inventory = Get-PcmResourceInventory -Records $records
             $inventory.Recipients.Count | Should -Be 2
-            @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 2
+            @(Get-PcmResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 2
             $queries = @($global:PraFake.RecipientQueries | Where-Object Filter)
             $queries.Count | Should -BeGreaterThan 1
             $allClauses = @(foreach ($query in $queries) {
@@ -565,20 +569,20 @@ Describe 'Native resource safety rules' {
                     foreach ($match in $matches) { $match.Value }
                 })
             @($allClauses | Select-Object -Unique).Count | Should -Be $allClauses.Count
-            foreach ($other in $records) { { Get-Pra2ResourceCollisions -Record $other -Inventory $inventory } | Should -Not -Throw }
+            foreach ($other in $records) { { Get-PcmResourceCollisions -Record $other -Inventory $inventory } | Should -Not -Throw }
         }
 
         It 'bounds long X500 filters by characters as well as clause count' {
             $addresses = @(1..20 | ForEach-Object { 'X500:/o=legacy/cn=' + ('a' * 350) + $_ })
             $record.email_addresses_json = ConvertTo-Json -InputObject $addresses -Compress
-            $null = Get-Pra2ResourceInventory -Records @($record)
+            $null = Get-PcmResourceInventory -Records @($record)
             $global:PraFake.RecipientQueries.Count | Should -BeGreaterThan 1
             foreach ($query in @($global:PraFake.RecipientQueries | Where-Object Filter)) { $query.Filter.Length | Should -BeLessOrEqual 4000 }
         }
 
         It 'never emits an empty first chunk when one exact Graph clause reaches the character limit' {
             $record.alias = 'a' * (2000 - "(mailNickname eq '')".Length)
-            $null = Get-Pra2ResourceInventory -Records @($record)
+            $null = Get-PcmResourceInventory -Records @($record)
             @($global:PraFake.GraphQueries | Where-Object { $_.Filter.Length -eq 2000 }).Count | Should -Be 1
             foreach ($query in @($global:PraFake.RecipientQueries | Where-Object Filter)) {
                 $query.Filter | Should -Not -BeNullOrEmpty
@@ -589,13 +593,13 @@ Describe 'Native resource safety rules' {
         It 'does not return partial inventory when a later chunk cannot be read' {
             $record.email_addresses_json = ConvertTo-Json -InputObject @(1..60 | ForEach-Object { "smtp:proxy$_@contoso.com" }) -Compress
             $global:PraFake.Faults.RecipientQueryFailsAt = 2
-            { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw '*filtered query access denied*'
+            { Get-PcmResourceInventory -Records @($record) } | Should -Throw '*filtered query access denied*'
             $global:PraFake.RecipientQueries.Count | Should -Be 2
         }
 
         It 'fails closed on unreadable Graph after successful exact Exchange queries' {
             $global:PraFake.Faults.GraphReadFails = $true
-            { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw
+            { Get-PcmResourceInventory -Records @($record) } | Should -Throw
             $global:PraFake.RecipientQueries.Count | Should -BeGreaterThan 0
         }
 
@@ -603,20 +607,20 @@ Describe 'Native resource safety rules' {
             @{ Selection = 'Missing' }, @{ Selection = 'Empty' }, @{ Selection = 'Null' }, @{ Selection = 'Invalid' }, @{ Selection = 'Oversize' }, @{ Selection = 'EmptyLegacy' }) {
             param($Selection)
             switch ($Selection) {
-                Missing { { Get-Pra2ResourceInventory } | Should -Throw '*requires selected records*' }
-                Empty { { Get-Pra2ResourceInventory -Records @() } | Should -Throw '*requires selected records*' }
-                Null { { Get-Pra2ResourceInventory -Records @($null) } | Should -Throw '*empty selected record*' }
-                Invalid { $record.primary_smtp_address = 'invalid'; { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw '*invalid*' }
-                Oversize { $record.alias = 'a' * 4001; { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw '*bounded recipient filter size*' }
-                EmptyLegacy { $record.email_addresses_json = '["X500:"]'; { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw '*legacy identity is empty*' }
+                Missing { { Get-PcmResourceInventory } | Should -Throw '*requires selected records*' }
+                Empty { { Get-PcmResourceInventory -Records @() } | Should -Throw '*requires selected records*' }
+                Null { { Get-PcmResourceInventory -Records @($null) } | Should -Throw '*empty selected record*' }
+                Invalid { $record.primary_smtp_address = 'invalid'; { Get-PcmResourceInventory -Records @($record) } | Should -Throw '*invalid*' }
+                Oversize { $record.alias = 'a' * 4001; { Get-PcmResourceInventory -Records @($record) } | Should -Throw '*bounded recipient filter size*' }
+                EmptyLegacy { $record.email_addresses_json = '["X500:"]'; { Get-PcmResourceInventory -Records @($record) } | Should -Throw '*legacy identity is empty*' }
             }
             $global:PraFake.RecipientQueries.Count | Should -Be 0
         }
 
         It 'refuses using a targeted inventory to prove absence for an unqueried record' {
-            $inventory = Get-Pra2ResourceInventory -Records @($record)
+            $inventory = Get-PcmResourceInventory -Records @($record)
             $record.alias = 'another-alias'
-            { Get-Pra2ResourceCollisions -Record $record -Inventory $inventory } | Should -Throw '*does not cover all selected record keys*'
+            { Get-PcmResourceCollisions -Record $record -Inventory $inventory } | Should -Throw '*does not cover all selected record keys*'
         }
 
         It 'queries room-list record addresses and alias rather than the tenant or resource-member scope' {
@@ -624,7 +628,7 @@ Describe 'Native resource safety rules' {
                 EmailAddresses = @('SMTP:building@contoso.com', 'smtp:building-proxy@contoso.com'); LegacyExchangeDN = '/o=legacy/cn=building' }
             $global:PraFake.Contacts['list-collision'] = @{ Guid = 'list-collision'; Identity = 'foreign'; RecipientTypeDetails = 'MailContact'; Alias = 'foreign'
                 PrimarySmtpAddress = 'foreign@contoso.com'; EmailAddresses = @('smtp:building-proxy@contoso.com') }
-            { Get-Pra2ResourceCloudRoomList -List $list -AllowMissing } | Should -Throw '*Room-list collision*'
+            { Get-PcmResourceCloudRoomList -List $list -AllowMissing } | Should -Throw '*Room-list collision*'
             $filter = $global:PraFake.RecipientQueries[0].Filter
             $filter | Should -Match "Alias -eq 'building'"
             $filter | Should -Match 'building-proxy@contoso.com'
@@ -637,12 +641,12 @@ Describe 'Native resource safety rules' {
                 Alias = 'room'; PrimarySmtpAddress = 'room@contoso.com'; EmailAddresses = @() }
             $owned = Add-PraFakeUser -Upn 'room@contoso.com' -Id 'owned-id'
             $owned.ExchangeGuid = 'owned-guid'
-            $inventory = Get-Pra2ResourceInventory -Records @($record)
-            @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory -OwnedId 'owned-id' -OwnedGuid 'owned-guid' -OwnedContactId 'owned-contact').Count | Should -Be 0
+            $inventory = Get-PcmResourceInventory -Records @($record)
+            @(Get-PcmResourceCollisions -Record $record -Inventory $inventory -OwnedId 'owned-id' -OwnedGuid 'owned-guid' -OwnedContactId 'owned-contact').Count | Should -Be 0
             $global:PraFake.Contacts['competing'] = @{ Guid = 'competing'; Identity = 'competing'; RecipientTypeDetails = 'MailContact'
                 Alias = 'room'; PrimarySmtpAddress = 'foreign@contoso.com'; EmailAddresses = @() }
-            $inventory = Get-Pra2ResourceInventory -Records @($record)
-            $collisions = @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory -OwnedId 'owned-id' -OwnedGuid 'owned-guid' -OwnedContactId 'owned-contact')
+            $inventory = Get-PcmResourceInventory -Records @($record)
+            $collisions = @(Get-PcmResourceCollisions -Record $record -Inventory $inventory -OwnedId 'owned-id' -OwnedGuid 'owned-guid' -OwnedContactId 'owned-contact')
             $collisions.Count | Should -Be 1
             $collisions[0] | Should -Match 'competing'
         }
@@ -652,7 +656,7 @@ Describe 'Native resource safety rules' {
                 foreach ($fault in 'MissingValue', 'NullValue', 'ScalarValue', 'LimitedIdentity', 'NextPageFails') { @{ Path = $path; Fault = $fault } }
             }) {
             param($Path, $Fault)
-            Mock Invoke-Pra2Graph -ModuleName PRA2.Cloud {
+            Mock Invoke-PcmGraph -ModuleName PRA.Cloud {
                 if ($Uri -match '[?&]fail=true') { throw 'Graph next page access denied.' }
                 if ($Uri -like "https://graph.microsoft.com/v1.0/$Path`?*") {
                     switch ($Fault) {
@@ -665,7 +669,7 @@ Describe 'Native resource safety rules' {
                 }
                 return [pscustomobject]@{ value = @() }
             }
-            { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw
+            { Get-PcmResourceInventory -Records @($record) } | Should -Throw
         }
 
         It 'finds an unknown active user outside naming prefixes by only <Key>' -TestCases @(
@@ -695,10 +699,10 @@ Describe 'Native resource safety rules' {
                 Anchor { $user.ImmutableId = $record.immutable_id }
             }
             1..30 | ForEach-Object { $null = Add-PraFakeUser -Upn "unrelated$_@contoso.com" }
-            $inventory = Get-Pra2ResourceInventory -Records @($record)
+            $inventory = Get-PcmResourceInventory -Records @($record)
             $inventory.Users.Count | Should -Be 1
             $inventory.Users[0].id | Should -Be unknown-active
-            @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory | Where-Object { $_ -like 'Existing Entra*' }).Count | Should -Be 1
+            @(Get-PcmResourceCollisions -Record $record -Inventory $inventory | Where-Object { $_ -like 'Existing Entra*' }).Count | Should -Be 1
             foreach ($query in @($global:PraFake.GraphQueries | Where-Object Path -eq users)) {
                 $query.Filter | Should -Not -BeNullOrEmpty
                 $query.Filter | Should -Not -Match 'startswith|endswith|displayName|PRA-|\$count|eventual'
@@ -718,14 +722,14 @@ Describe 'Native resource safety rules' {
             $right = Add-PraFakeUser -Upn 'right@contoso.com' -Id 'right-anchor' -ImmutableId $record.immutable_id
             $deleted = Add-PraFakeUser -Upn 'deleted@contoso.com' -Id 'deleted-wrong-anchor' -ImmutableId $wrong.ImmutableId
             $global:PraFake.Users.Remove($deleted.Id); $global:PraFake.Recycle[$deleted.Id] = $deleted
-            $inventory = Get-Pra2ResourceInventory -Records @($record)
+            $inventory = Get-PcmResourceInventory -Records @($record)
             $inventory.Users.Count | Should -Be 2
             $inventory.Users.id | Should -Not -Contain wrong-anchor
-            $collisions = @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory)
+            $collisions = @(Get-PcmResourceCollisions -Record $record -Inventory $inventory)
             $collisions.Count | Should -Be 1
             $collisions[0] | Should -Match right-anchor
             $record.immutable_id = $wrong.ImmutableId
-            { Get-Pra2ResourceCollisions -Record $record -Inventory $inventory } | Should -Throw '*does not cover the selected immutable anchor*'
+            { Get-PcmResourceCollisions -Record $record -Inventory $inventory } | Should -Throw '*does not cover the selected immutable anchor*'
         }
 
         It 'quotes and encodes exact Graph values without interpreting apostrophes, ampersands, plus or query text' {
@@ -736,7 +740,7 @@ Describe 'Native resource safety rules' {
             $record.immutable_id = "AbC+/'&?=="
             $exact = Add-PraFakeUser -Upn 'exact@contoso.com' -Id 'exact' -ImmutableId $record.immutable_id
             $null = Add-PraFakeUser -Upn 'foreign@contoso.com' -Id 'foreign'
-            $inventory = Get-Pra2ResourceInventory -Records @($record)
+            $inventory = Get-PcmResourceInventory -Records @($record)
             $inventory.Users.Count | Should -Be 1
             $inventory.Users[0].id | Should -Be exact
             $filters = $global:PraFake.GraphQueries.Filter -join ' '
@@ -772,7 +776,7 @@ Describe 'Native resource safety rules' {
         It 'segregates exact non-SMTP OR predicates from default SMTP, UPN, alias and anchor queries' {
             $record.email_addresses_json = '["SMTP:room@contoso.com","smtp:alternate@contoso.com","X500:/O=Legacy/CN=Room","SIP:room@contoso.com"]'
             $record.user_principal_name = 'old-logon@contoso.com'
-            $null = Get-Pra2ResourceInventory -Records @($record)
+            $null = Get-PcmResourceInventory -Records @($record)
             $active = @($global:PraFake.GraphQueries | Where-Object Path -eq users)
             $default = @($active | Where-Object { $_.Headers.Count -eq 0 })
             $advanced = @($active | Where-Object { $_.Headers.Count -gt 0 })
@@ -803,12 +807,12 @@ Describe 'Native resource safety rules' {
         It 'leaves SMTP-only inventory and ordinary Graph callers in default mode' {
             $record.email_addresses_json = '["SMTP:room@contoso.com","smtp:alternate@contoso.com"]'
             $record.legacy_exchange_dn = ''
-            $null = Get-Pra2ResourceInventory -Records @($record)
+            $null = Get-PcmResourceInventory -Records @($record)
             $active = @($global:PraFake.GraphQueries | Where-Object Path -eq users)
             $active.Count | Should -Be 1
             $active[0].Headers.Count | Should -Be 0
             $active[0].Query | Should -Not -Match '\$count'
-            $null = Invoke-Pra2Graph -Uri "v1.0/users?`$filter=mailNickname%20eq%20'room'"
+            $null = Invoke-PcmGraph -Uri "v1.0/users?`$filter=mailNickname%20eq%20'room'"
             $global:PraFake.GraphQueries[-1].Headers.Count | Should -Be 0
             $global:PraFake.GraphQueries[-1].Query | Should -Not -Match '\$count'
         }
@@ -819,9 +823,9 @@ Describe 'Native resource safety rules' {
                 $user = Add-PraFakeUser -Upn "$id@contoso.com" -Id $id
                 $user.Alias = $id; $user.Addresses = @('X500:/O=LEGACY/CN=ROOM')
             }
-            $inventory = Get-Pra2ResourceInventory -Records @($record)
+            $inventory = Get-PcmResourceInventory -Records @($record)
             $inventory.Users.Count | Should -Be 2
-            @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory | Where-Object { $_ -like 'Existing Entra*' }).Count | Should -Be 2
+            @(Get-PcmResourceCollisions -Record $record -Inventory $inventory | Where-Object { $_ -like 'Existing Entra*' }).Count | Should -Be 2
             $advanced = @($global:PraFake.GraphQueries | Where-Object { $_.Headers.Count -gt 0 })
             $advanced.Count | Should -Be 2
             $advanced[1].Query | Should -Match '\$skiptoken=1'
@@ -833,7 +837,7 @@ Describe 'Native resource safety rules' {
             $filter = "proxyAddresses/any(p:p eq 'X500:/O=Legacy/CN=Room')"
             $headers = [System.Collections.Generic.Dictionary[string,object]]::new()
             $headers.Add('ConsistencyLevel', 'eventual')
-            $page = Invoke-Pra2Graph -Uri ('https://graph.microsoft.com/v1.0/users?$count=true&$filter=' + [uri]::EscapeDataString($filter)) -Headers $headers
+            $page = Invoke-PcmGraph -Uri ('https://graph.microsoft.com/v1.0/users?$count=true&$filter=' + [uri]::EscapeDataString($filter)) -Headers $headers
             $page.'@odata.count' | Should -Be 2
             $global:PraFake.GraphQueries[-1].Headers.ConsistencyLevel | Should -BeExactly eventual
             $global:PraFake.Calls.Count | Should -Be 0
@@ -850,7 +854,7 @@ Describe 'Native resource safety rules' {
             if ($Fault -eq 'FalseCount') { $parameters.Uri += '&$count=false' }
             if ($Fault -in @('HeaderOnly', 'FalseCount')) { $parameters.Headers = @{ ConsistencyLevel = 'eventual' } }
             if ($Fault -eq 'WrongHeader') { $parameters.Headers = @{ ConsistencyLevel = 'strong' } }
-            { Invoke-Pra2Graph @parameters } | Should -Throw '*Request_UnsupportedQuery*requires*'
+            { Invoke-PcmGraph @parameters } | Should -Throw '*Request_UnsupportedQuery*requires*'
             $global:PraFake.GraphQueries.Count | Should -Be 1
         }
 
@@ -859,7 +863,7 @@ Describe 'Native resource safety rules' {
                 foreach ($page in 'First', 'Next') { @{ Status = $status; Page = $page } }
             }) {
             param($Status, $Page)
-            Mock Start-Sleep -ModuleName PRA2.Cloud { }
+            Mock Start-Sleep -ModuleName PRA.Cloud { }
             $global:PraFake.Faults.GraphAdvancedStatus = $Status
             if ($Page -eq 'Next') {
                 $global:PraFake.PageSize = 1
@@ -869,7 +873,7 @@ Describe 'Native resource safety rules' {
                 }
                 $global:PraFake.Faults.GraphAdvancedFailsAt = 3
             }
-            { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw
+            { Get-PcmResourceInventory -Records @($record) } | Should -Throw
             $attempts = if ($Status -in @(429, 503)) { 5 } else { 1 }
             $global:PraFake.GraphQueries.Count | Should -Be ($attempts + $(if ($Page -eq 'Next') { 2 } else { 1 }))
             @($global:PraFake.GraphQueries | Where-Object { $_.Headers.Count -gt 0 }).Count | Should -Be ($attempts + $(if ($Page -eq 'Next') { 1 } else { 0 }))
@@ -880,7 +884,7 @@ Describe 'Native resource safety rules' {
                     $query.Query | Should -Match '\$count=true'
                 }
             }
-            Should -Invoke Start-Sleep -ModuleName PRA2.Cloud -Times $(if ($Status -in @(429, 503)) { 4 } else { 0 }) -Exactly
+            Should -Invoke Start-Sleep -ModuleName PRA.Cloud -Times $(if ($Status -in @(429, 503)) { 4 } else { 0 }) -Exactly
             $global:PraFake.Calls.Count | Should -Be 0
         }
 
@@ -888,7 +892,7 @@ Describe 'Native resource safety rules' {
             @{ Fault = 'CountOnly' }, @{ Fault = 'NullValue' }, @{ Fault = 'ScalarValue' },
             @{ Fault = 'LimitedIdentity' }, @{ Fault = 'NextPageFails' }) {
             param($Fault)
-            Mock Invoke-Pra2Graph -ModuleName PRA2.Cloud {
+            Mock Invoke-PcmGraph -ModuleName PRA.Cloud {
                 param($Uri, $Headers)
                 if (-not $Headers) { return [pscustomobject]@{ value = @() } }
                 if ($Uri -match '[?&]fail=true') { throw 'Advanced Graph next page access denied.' }
@@ -900,8 +904,8 @@ Describe 'Native resource safety rules' {
                     NextPageFails { return [pscustomobject]@{ '@odata.count' = 0; value = @(); '@odata.nextLink' = 'https://graph.microsoft.com/v1.0/users?fail=true' } }
                 }
             }
-            { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw
-            Should -Invoke Invoke-Pra2Graph -ModuleName PRA2.Cloud -Times $(if ($Fault -eq 'NextPageFails') { 2 } else { 1 }) -Exactly -ParameterFilter {
+            { Get-PcmResourceInventory -Records @($record) } | Should -Throw
+            Should -Invoke Invoke-PcmGraph -ModuleName PRA.Cloud -Times $(if ($Fault -eq 'NextPageFails') { 2 } else { 1 }) -Exactly -ParameterFilter {
                 $Headers -and $Headers['ConsistencyLevel'] -ceq 'eventual'
             }
             $global:PraFake.Calls.Count | Should -Be 0
@@ -913,7 +917,7 @@ Describe 'Native resource safety rules' {
             $user = Add-PraFakeUser -Upn 'outside@contoso.com' -Id 'x500-only'
             $user.Addresses = @('X500:/o=legacy/cn=room')
             $global:PraGraphX500User = ConvertTo-PraFakeGraphUser $user
-            Mock Invoke-Pra2Graph -ModuleName PRA2.Cloud {
+            Mock Invoke-PcmGraph -ModuleName PRA.Cloud {
                 param($Uri, $Headers)
                 if (-not $Headers) { return [pscustomobject]@{ value = @() } }
                 $page = [ordered]@{ value = @($global:PraGraphX500User) }
@@ -921,9 +925,9 @@ Describe 'Native resource safety rules' {
                 return [pscustomobject]$page
             }
             try {
-                $inventory = Get-Pra2ResourceInventory -Records @($record)
+                $inventory = Get-PcmResourceInventory -Records @($record)
                 $inventory.Users.Count | Should -Be 1
-                @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory | Where-Object { $_ -like 'Existing Entra*' }).Count | Should -Be 1
+                @(Get-PcmResourceCollisions -Record $record -Inventory $inventory | Where-Object { $_ -like 'Existing Entra*' }).Count | Should -Be 1
             } finally { Remove-Variable PraGraphX500User -Scope Global }
         }
 
@@ -939,10 +943,10 @@ Describe 'Native resource safety rules' {
             }
             $deleted = Add-PraFakeUser -Upn 'deleted@contoso.com' -Id deleted -ImmutableId 'source-anchor'
             $global:PraFake.Users.Remove($deleted.Id); $global:PraFake.Recycle[$deleted.Id] = $deleted
-            $inventory = Get-Pra2ResourceInventory -Records $records
+            $inventory = Get-PcmResourceInventory -Records $records
             $inventory.Users.Count | Should -Be 3
             $inventory.Users.id | Should -Contain first; $inventory.Users.id | Should -Contain second; $inventory.Users.id | Should -Contain deleted
-            @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory | Where-Object { $_ -like 'Existing Entra*' }).Count | Should -Be 3
+            @(Get-PcmResourceCollisions -Record $record -Inventory $inventory | Where-Object { $_ -like 'Existing Entra*' }).Count | Should -Be 3
             $queries = @($global:PraFake.GraphQueries | Where-Object Path -eq users)
             @($queries | Where-Object Query -Match '\$skiptoken=').Count | Should -BeGreaterThan 1
             $filters = @($queries.Filter | Sort-Object -Unique)
@@ -955,7 +959,7 @@ Describe 'Native resource safety rules' {
                     foreach ($match in $matches) { $match.Value }
                 })
             @($allClauses | Sort-Object -CaseSensitive -Unique).Count | Should -Be $allClauses.Count
-            foreach ($row in $records) { { Get-Pra2ResourceCollisions -Record $row -Inventory $inventory } | Should -Not -Throw }
+            foreach ($row in $records) { { Get-PcmResourceCollisions -Record $row -Inventory $inventory } | Should -Not -Throw }
         }
 
         It 'preserves two immutable anchors differing only by Base64 case in the selected union' {
@@ -964,11 +968,11 @@ Describe 'Native resource safety rules' {
             $other.immutable_id = 'abc=='
             $null = Add-PraFakeUser -Upn 'upper@contoso.com' -Id upper -ImmutableId 'AbC=='
             $null = Add-PraFakeUser -Upn 'lower@contoso.com' -Id lower -ImmutableId 'abc=='
-            $inventory = Get-Pra2ResourceInventory -Records @($record, $other)
+            $inventory = Get-PcmResourceInventory -Records @($record, $other)
             $inventory.GraphImmutableIds.Count | Should -Be 2
             $inventory.Users.Count | Should -Be 2
-            @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 1
-            @(Get-Pra2ResourceCollisions -Record $other -Inventory $inventory).Count | Should -Be 1
+            @(Get-PcmResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 1
+            @(Get-PcmResourceCollisions -Record $other -Inventory $inventory).Count | Should -Be 1
         }
 
         It 'fails closed without whole-tenant or query-mode fallbacks on <Failure>' -TestCases @(
@@ -983,7 +987,7 @@ Describe 'Native resource safety rules' {
                     $global:PraFake.Faults.GraphQueryFailsAt = 2
                 }
             }
-            { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw
+            { Get-PcmResourceInventory -Records @($record) } | Should -Throw
             $global:PraFake.GraphQueries.Count | Should -Be $(if ($Failure -eq 'Unsupported') { 1 } else { 2 })
             foreach ($query in $global:PraFake.GraphQueries) {
                 $query.Filter | Should -Not -BeNullOrEmpty
@@ -998,7 +1002,7 @@ Describe 'Native resource safety rules' {
 
         It 'rejects oversized Graph predicates before any remote query' {
             $record.alias = 'a' * 2000
-            { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw '*bounded Graph filter size*'
+            { Get-PcmResourceInventory -Records @($record) } | Should -Throw '*bounded Graph filter size*'
             $global:PraFake.GraphQueries.Count | Should -Be 0
             $global:PraFake.RecipientQueries.Count | Should -Be 0
         }
@@ -1024,7 +1028,7 @@ Describe 'Native resource safety rules' {
                 NonStringAnchor { $global:PraGraphBadUser.onPremisesImmutableId = @('source-anchor') }
                 NonBooleanSync { $global:PraGraphBadUser.onPremisesSyncEnabled = 'true' }
             }
-            Mock Invoke-Pra2Graph -ModuleName PRA2.Cloud {
+            Mock Invoke-PcmGraph -ModuleName PRA.Cloud {
                 $user = $global:PraGraphBadUser
                 if ($Fault -eq 'ConflictingDuplicate') {
                     $other = $user | Select-Object *
@@ -1033,7 +1037,7 @@ Describe 'Native resource safety rules' {
                 }
                 return [pscustomobject]@{ value = @($user) }
             }
-            try { { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw }
+            try { { Get-PcmResourceInventory -Records @($record) } | Should -Throw }
             finally { Remove-Variable PraGraphBadUser -Scope Global }
         }
 
@@ -1043,19 +1047,19 @@ Describe 'Native resource safety rules' {
             @{ Link = 'https://graph.microsoft.com/v1.0/groups?x=1' }, @{ Link = 'v1.0/users?x=1' }
             @{ Link = 'https://graph.microsoft.com/v1.0/users?x=1'; Repeat = $true }) {
             param($Link, $Repeat)
-            Mock Invoke-Pra2Graph -ModuleName PRA2.Cloud { return [pscustomobject]@{ value = @(); '@odata.nextLink' = $Link } }
-            { Get-Pra2ResourceInventory -Records @($record) } | Should -Throw '*page link*'
-            Should -Invoke Invoke-Pra2Graph -ModuleName PRA2.Cloud -Times $(if ($Repeat) { 2 } else { 1 }) -Exactly
+            Mock Invoke-PcmGraph -ModuleName PRA.Cloud { return [pscustomobject]@{ value = @(); '@odata.nextLink' = $Link } }
+            { Get-PcmResourceInventory -Records @($record) } | Should -Throw '*page link*'
+            Should -Invoke Invoke-PcmGraph -ModuleName PRA.Cloud -Times $(if ($Repeat) { 2 } else { 1 }) -Exactly
         }
 
         It 'treats a complete empty scoped Graph collection as absence and re-reads fresh collisions on resume' {
-            $inventory = Get-Pra2ResourceInventory -Records @($record)
+            $inventory = Get-PcmResourceInventory -Records @($record)
             $inventory.Users.Count | Should -Be 0
-            @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 0
+            @(Get-PcmResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 0
             $user = Add-PraFakeUser -Upn 'new-foreign@contoso.com' -Id 'new-foreign' -ImmutableId $record.immutable_id
-            $fresh = Get-Pra2ResourceInventory -Records @($record)
+            $fresh = Get-PcmResourceInventory -Records @($record)
             $fresh.Users.Count | Should -Be 1
-            @(Get-Pra2ResourceCollisions -Record $record -Inventory $fresh).Count | Should -Be 1
+            @(Get-PcmResourceCollisions -Record $record -Inventory $fresh).Count | Should -Be 1
             @($global:PraFake.GraphQueries | Where-Object Path -eq users).Count | Should -Be 4
         }
     }
@@ -1069,15 +1073,15 @@ Describe 'Native resource safety rules' {
                     $script:stubs += $name
                 }
             }
-            Mock Invoke-Pra2Graph -ModuleName PRA2.Cloud {
+            Mock Invoke-PcmGraph -ModuleName PRA.Cloud {
                 $fake = $global:PraResFake
                 if ($Uri -match '^v1\.0/users/') { return $fake.Active }
                 if ($Uri -match 'deletedItems/[^?]+\?\$select=id,assignedLicenses') { return $fake.DeletedUser }
                 if ($Uri -match 'deletedItems/') { return $fake.Deleted }
                 throw "Unexpected Graph URI $Uri"
             }
-            Mock Get-Mailbox -ModuleName PRA2.Cloud { return $global:PraResFake.Soft }
-            Mock Get-OrganizationConfig -ModuleName PRA2.Cloud { return [pscustomobject]@{ InPlaceHolds = @($global:PraResFake.OrgHolds) } }
+            Mock Get-Mailbox -ModuleName PRA.Cloud { return $global:PraResFake.Soft }
+            Mock Get-OrganizationConfig -ModuleName PRA.Cloud { return [pscustomobject]@{ InPlaceHolds = @($global:PraResFake.OrgHolds) } }
         }
         AfterAll {
             foreach ($name in $script:stubs) { Remove-Item -Path "function:global:$name" -ErrorAction SilentlyContinue }
@@ -1095,35 +1099,35 @@ Describe 'Native resource safety rules' {
         }
 
         It 'proves deletion only from the exact deleted identity, one non-inactive soft-deleted GUID, and no hold or licence' {
-            Test-Pra2UnprotectedResourceDeleted -Intent $intent | Should -BeTrue
+            Test-PcmUnprotectedResourceDeleted -Intent $intent | Should -BeTrue
         }
         It 'refuses to treat a missing deletion intent as proof' {
             $intent.PSObject.Properties.Remove('unprotectedDeletionAttempted'); $intent.PSObject.Properties.Remove('unprotectedDeletionProgress')
-            { Test-Pra2UnprotectedResourceDeleted -Intent $intent } | Should -Throw '*No journaled unprotected deletion intent*'
+            { Test-PcmUnprotectedResourceDeleted -Intent $intent } | Should -Throw '*No journaled unprotected deletion intent*'
         }
         It 'refuses protected journals and missing immutable identifiers' {
             $intent.protectionMode = 'CaseHold'
-            { Test-Pra2UnprotectedResourceDeleted -Intent $intent } | Should -Throw
+            { Test-PcmUnprotectedResourceDeleted -Intent $intent } | Should -Throw
             $intent.protectionMode = 'None'; $intent.cloudGuid = ''
-            { Test-Pra2UnprotectedResourceDeleted -Intent $intent } | Should -Throw '*immutable ID/ExchangeGuid is missing*'
+            { Test-PcmUnprotectedResourceDeleted -Intent $intent } | Should -Throw '*immutable ID/ExchangeGuid is missing*'
         }
         It 'keeps waiting while the identity is still visible after an intent or issued deletion (<Progress>)' -TestCases @(
             @{ Progress = 'Intent' }, @{ Progress = 'Issued' }) {
             param($Progress)
             $intent.unprotectedDeletionProgress = $Progress
             $global:PraResFake.Active = [pscustomobject]@{ id = 'immutable-id' }
-            Test-Pra2UnprotectedResourceDeleted -Intent $intent | Should -BeFalse
+            Test-PcmUnprotectedResourceDeleted -Intent $intent | Should -BeFalse
         }
         It 'refuses an identity that is active again after verified deletion' {
             $intent.unprotectedDeletionProgress = 'Verified'
             $global:PraResFake.Active = [pscustomobject]@{ id = 'immutable-id' }
-            { Test-Pra2UnprotectedResourceDeleted -Intent $intent } | Should -Throw '*active again*'
+            { Test-PcmUnprotectedResourceDeleted -Intent $intent } | Should -Throw '*active again*'
         }
         It 'is not proven without the deleted identity or without a soft-deleted mailbox (<Missing>)' -TestCases @(
             @{ Missing = 'Deleted' }, @{ Missing = 'Soft' }) {
             param($Missing)
             $global:PraResFake[$Missing] = $(if ($Missing -eq 'Soft') { @() } else { $null })
-            Test-Pra2UnprotectedResourceDeleted -Intent $intent | Should -BeFalse
+            Test-PcmUnprotectedResourceDeleted -Intent $intent | Should -BeFalse
         }
         It 'refuses wrong or ambiguous deletion evidence (<Fault>)' -TestCases @(
             @{ Fault = 'DeletedId' }, @{ Fault = 'SoftId' }, @{ Fault = 'Duplicate' }, @{ Fault = 'Inactive' }, @{ Fault = 'InactiveMissing' }) {
@@ -1135,7 +1139,7 @@ Describe 'Native resource safety rules' {
                 Inactive { $global:PraResFake.Soft[0].IsInactiveMailbox = $true }
                 InactiveMissing { $global:PraResFake.Soft[0].PSObject.Properties.Remove('IsInactiveMailbox') }
             }
-            { Test-Pra2UnprotectedResourceDeleted -Intent $intent } | Should -Throw
+            { Test-PcmUnprotectedResourceDeleted -Intent $intent } | Should -Throw
         }
         It 'refuses holds, licences or unreadable protection facts on the deleted resource (<Fault>)' -TestCases @(
             @{ Fault = 'InPlaceHold' }, @{ Fault = 'Litigation' }, @{ Fault = 'DelayHold' }, @{ Fault = 'Licence' }, @{ Fault = 'LicenceState' }, @{ Fault = 'NotExposed' }, @{ Fault = 'OrgHold' }) {
@@ -1149,7 +1153,7 @@ Describe 'Native resource safety rules' {
                 NotExposed { $global:PraResFake.DeletedUser.PSObject.Properties.Remove('licenseAssignmentStates') }
                 OrgHold { $global:PraResFake.OrgHolds = @('mbxunexpected:2') }
             }
-            { Test-Pra2UnprotectedResourceDeleted -Intent $intent } | Should -Throw
+            { Test-PcmUnprotectedResourceDeleted -Intent $intent } | Should -Throw
         }
 
         Describe 'Expected tombstone collision qualification' {
@@ -1178,10 +1182,10 @@ Describe 'Native resource safety rules' {
                 if ($DateKind -eq 'DateTimeOffset') { $recipient.WhenSoftDeleted = [datetimeoffset]::UtcNow }
                 if ($DateKind -eq 'String') { $recipient.WhenSoftDeleted = '2026-10-14T12:51:45+02:00' }
                 $before = $inventory | ConvertTo-Json -Depth 5 -Compress
-                @(Get-Pra2UnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory).Count | Should -Be 0
-                @(Get-Pra2ResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 2
+                @(Get-PcmUnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory).Count | Should -Be 0
+                @(Get-PcmResourceCollisions -Record $record -Inventory $inventory).Count | Should -Be 2
                 ($inventory | ConvertTo-Json -Depth 5 -Compress) | Should -BeExactly $before
-                Should -Invoke Get-Mailbox -ModuleName PRA2.Cloud -Times 1 -Exactly
+                Should -Invoke Get-Mailbox -ModuleName PRA.Cloud -Times 1 -Exactly
             }
 
             It 'blocks mismatched identities, unproven deletion dates and incorrect recipient types (<Fault>)' -TestCases @(
@@ -1201,7 +1205,7 @@ Describe 'Native resource safety rules' {
                     WrongType { $recipient.RecipientTypeDetails = 'EquipmentMailbox' }
                     ActiveRecipient { $recipient.WhenSoftDeleted = $null; $recipient.Name = 'PRA-R-old-prefix-is-not-proof' }
                 }
-                @(Get-Pra2UnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory).Count | Should -Be 1
+                @(Get-PcmUnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory).Count | Should -Be 1
             }
 
             It 'blocks foreign active/soft-deleted and recycled competing recipients with the same GUID (<Foreign>)' -TestCases @(
@@ -1213,14 +1217,14 @@ Describe 'Native resource safety rules' {
                 if ($Foreign -ne 'SameGuid') { $other.ExchangeGuid = [guid]::NewGuid().ToString() }
                 if ($Foreign -eq 'Active') { $other.WhenSoftDeleted = $null }
                 $inventory.Recipients += $other
-                $collisions = @(Get-Pra2UnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory)
+                $collisions = @(Get-PcmUnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory)
                 $collisions.Count | Should -Be 1
                 $collisions[0] | Should -Match ([regex]::Escape($other.ExternalDirectoryObjectId))
             }
 
             It 'refuses ambiguous duplicates of the expected recipient' {
                 $inventory.Recipients += ($recipient | Select-Object *)
-                { Get-Pra2UnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory } | Should -Throw '*inventory is ambiguous*'
+                { Get-PcmUnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory } | Should -Throw '*inventory is ambiguous*'
             }
 
             It 'refuses changed fresh deletion/protection facts after journal verification (<Fault>)' -TestCases @(
@@ -1238,7 +1242,7 @@ Describe 'Native resource safety rules' {
                     Inactive { $global:PraResFake.Soft[0].IsInactiveMailbox = $true }
                     OrganizationHold { $global:PraResFake.OrgHolds = @('mbxunexpected:2') }
                 }
-                { Get-Pra2UnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory } | Should -Throw
+                { Get-PcmUnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory } | Should -Throw
             }
 
             It 'refuses incomplete ownership, source type, protection and durable progress pins (<Fault>)' -TestCases @(
@@ -1256,7 +1260,7 @@ Describe 'Native resource safety rules' {
                     SourceKind { $record.kind = 'User' }
                     CloudType { $intent.cloudType = 'EquipmentMailbox' }
                 }
-                { Get-Pra2UnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory } | Should -Throw
+                { Get-PcmUnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory } | Should -Throw
             }
 
             It 'preserves selected-key and immutable-anchor coverage guards (<Guard>)' -TestCases @(
@@ -1264,12 +1268,12 @@ Describe 'Native resource safety rules' {
                 @{ Guard = 'GraphImmutableIds'; Message = '*selected immutable anchor*' }) {
                 param($Guard, $Message)
                 $inventory.$Guard = @()
-                { Get-Pra2UnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory } | Should -Throw $Message
+                { Get-PcmUnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory } | Should -Throw $Message
             }
 
             It 'keeps a live Graph immutable-anchor collision even without address overlap' {
                 $inventory.Users += [pscustomobject]@{ id = 'foreign-id'; userPrincipalName = 'renamed@contoso.com'; onPremisesImmutableId = 'source-anchor' }
-                $collisions = @(Get-Pra2UnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory)
+                $collisions = @(Get-PcmUnprotectedRecoverCollisions -Intent $intent -Record $record -Inventory $inventory)
                 $collisions.Count | Should -Be 1
                 $collisions[0] | Should -Match 'foreign-id'
             }

@@ -1,416 +1,1282 @@
 ﻿<#
 .SYNOPSIS
-    PRA Cloud Mailbox - tests of the window (Pester 5+), in both editions. No Exchange and no cloud: the state is a
-    test configuration, snapshot, journal and Check report; the questions and confirmations are answered by hooks.
+    PRA Cloud Mailbox - tests of the guided console (Pester 5+). No Exchange and no cloud: the state is a synthetic configuration, snapshot and journal
+    (tools\DocumentationImages\ConsoleFixture.ps1), the engine is the synthetic engine (tools\DocumentationImages\StubEngine.ps1), the probes are mocked.
+.DESCRIPTION
+    The pure functions are tested in this process; the real window is built and driven in child processes (pwsh -STA), one per scenario, which print their
+    observations as one JSON line.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.2.0
+    Version : 2.0.0
 #>
-#Requires -Version 5.1
+#Requires -Version 7.5
 
 BeforeAll {
-    $script:Root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-    Import-Module (Join-Path $script:Root 'module\PRA2.Common.psm1') -Force
-    Import-Module (Join-Path $script:Root 'module\PRA2.Store.psm1') -Force
-    $script:Gui = Import-Module (Join-Path $script:Root 'module\PRA2.Gui.psm1') -Force -PassThru
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:Root 'Invoke-PraCloudMailbox.ps1'), [ref]$null, [ref]$null)
-    $function = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Read-PraIdentityFile' }, $true)
-    . ([scriptblock]::Create($function.Extent.Text))
+    $script:Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+    . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
+    . (Join-Path $script:Repo 'tools\DocumentationImages\New-ToolCopy.ps1')
+    . (Join-Path $script:Repo 'tools\DocumentationImages\ConsoleFixture.ps1')
+    $script:Root = New-PcmTestPackage -Repository $script:Repo
+    Import-Module (Join-Path $script:Root 'module\PRA.Common.psm1') -Force
+    Import-Module (Join-Path $script:Root 'module\PRA.Store.psm1') -Force
+    $script:Gui = Import-Module (Join-Path $script:Root 'module\PRA.Gui.psm1') -Force -PassThru
+    # The SQLite library stays loaded, and so locked, until the process ends, and it comes from the first folder that opens a store: it is the one of the temporary package
+    # (removed without error at the end), never the copy under TestDrive, which Pester must be able to delete.
+    & (Get-Module PRA.Store) { Import-PcmSqlite -Root $args[0] } $script:Root
+    # One synthetic tool folder for the pure-function tests (a snapshot, a journal, a group captured by Collect).
+    $script:Tool = New-DocumentationToolCopy -Repository $script:Repo -Destination (Join-Path $TestDrive 'tool')
+    $script:Fixture = New-ConsoleFixture -ToolRoot $script:Tool
+    $script:State = Read-PcmGuiState -Root $script:Tool -ConfigPath $script:Fixture.Config
 
-    $script:Alice = 'a0000000-0000-0000-0000-000000000001'
-    $script:Bob = 'a0000000-0000-0000-0000-000000000002'
-    $script:Compta = 'a0000000-0000-0000-0000-000000000003'
-
-    function script:Write-TestCsv {
-        <# A report CSV as Complete-PraRun writes it (delimiter ;). #>
-        param([string]$Path, [object[]]$Rows)
-        $Rows | ForEach-Object { [pscustomobject]$_ } | Export-Csv -LiteralPath $Path -NoTypeInformation -Delimiter ';' -Encoding UTF8
-    }
-    function script:New-TestState {
-        <# Configuration, snapshot (alice, bob, compta), journal (a Partial Convert batch: alice done, bob not started) and Check. #>
-        param([string]$Folder)
-        $data = Join-Path $Folder 'data'; $reports = Join-Path $Folder 'reports'
-        $null = New-Item -ItemType Directory -Path $data, $reports, (Join-Path $Folder 'logs') -Force
-        $config = Join-Path $Folder 'test.config.psd1'
-        $text = @"
-@{
-    Environment = 'TEST'
-    Scope = @{ Mode = 'Auto' }
-    Store = @{ Path = '$data\test.db'; JournalPath = '$data\journal.db'; BackupFolder = '$data\backup' }
-    Cloud = @{ TenantId = '11111111-2222-3333-4444-555555555555'; Organization = 'contoso.onmicrosoft.com'; AppId = '66666666-7777-8888-9999-000000000000'; CertificateThumbprint = '$('A' * 40)' }
-    Licensing = @{ Users = @{ Mode = 'Group'; GroupId = '12121212-1212-1212-1212-121212121212' }; Shared = @{ SkuPartNumber = 'SPE_E5' } }
-    Retention = @{ HoldPolicy = 'PRA-Hold' }
-    EntraConnect = @{ Mode = 'Manual' }
-    Logging = @{ Folder = '$Folder\logs' }
-    Report = @{ Enabled = `$true; Folder = '$reports' }
-}
-"@
-        [IO.File]::WriteAllText($config, $text, (New-Object Text.UTF8Encoding($true)))
-        $cn = Open-Pra2Store -Path "$data\test.db" -Root $script:Root
-        try {
-            $sid = New-Pra2Snapshot $cn @{ RunId = 'r1'; Environment = 'TEST'; ToolVersion = 'test'; ExchangeServer = 'EX1'; ScopeJson = '{}' }
-            $rows = @(
-                [ordered]@{ object_guid = $script:Alice; kind = 'User'; user_principal_name = 'alice@contoso.com'; primary_smtp_address = 'alice@contoso.com'; sam_account_name = 'alice' }
-                [ordered]@{ object_guid = $script:Bob; kind = 'User'; user_principal_name = 'bob@contoso.com'; primary_smtp_address = 'bob@contoso.com'; sam_account_name = 'bob' }
-                [ordered]@{ object_guid = $script:Compta; kind = 'Shared'; user_principal_name = 'compta@contoso.com'; primary_smtp_address = 'compta@contoso.com'; sam_account_name = 'compta' })
-            $null = Add-Pra2Row $cn mailbox $sid $rows
-            Set-Pra2SnapshotStatus $cn $sid Complete @{ mailbox = 3; permission = 0 }
-        } finally { Close-Pra2Store $cn }
-        $j = Open-Pra2Store -Path "$data\journal.db" -Root $script:Root -Kind Journal
-        try {
-            $batch = New-Pra2Batch $j Convert @{ SnapshotId = $sid; Environment = 'TEST' }
-            Set-Pra2BatchItem $j $batch $script:Alice @{ kind = 'User'; identity = 'alice@contoso.com'; step = 'Mailbox'; status = 'Done' }
-            Set-Pra2BatchItem $j $batch $script:Bob @{ kind = 'User'; identity = 'bob@contoso.com'; status = 'Planned' }
-            Set-Pra2Batch $j $batch Partial
-        } finally { Close-Pra2Store $j }
-        $check = { param($guid, $upn, $kind, $status, $detail, $warnings) [ordered]@{ Identity = $upn; Kind = $kind; PrimarySmtpAddress = $upn; ObjectGuid = $guid; Action = 'Check'
-                ExchangeOnline = 'MailUser'; Licence = ''; Holds = ''; FinalStatus = $status; Detail = $detail; Warnings = $warnings } }
-        Write-TestCsv -Path (Join-Path $reports 'PRA2_check_test.csv') -Rows @(
-            (& $check $script:Alice 'alice@contoso.com' 'User' 'Success' 'ready' '')
-            (& $check $script:Bob 'bob@contoso.com' 'User' 'Error' 'NO_USAGE_LOCATION: no usage location' '')
-            (& $check $script:Compta 'compta@contoso.com' 'Shared' 'Success' 'ready' 'HOLD_PRESENT: hold on the object'))
-        return [pscustomobject]@{ Config = $config; Batch = $batch; Snapshot = $sid; Reports = $reports; Data = $data }
-    }
-    function script:Invoke-TestPump {
-        <# Lets the dispatcher run the timers of the window for a moment. #>
-        $frame = New-Object Windows.Threading.DispatcherFrame
-        [void][Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Background,
-            [Windows.Threading.DispatcherOperationCallback] { param($f) $f.Continue = $false; $null }, $frame)
-        [Windows.Threading.Dispatcher]::PushFrame($frame)
+    # The prelude of the child processes: the tool copy, the fixture, the real window with mocked probes, and the helpers to drive it.
+    $script:Prelude = @'
+param([string]$Repo, [string]$Work, [string]$Kind = 'Cloud')
+$ErrorActionPreference = 'Stop'
+[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('en-US')
+. (Join-Path $Repo 'tools\DocumentationImages\New-ToolCopy.ps1'); . (Join-Path $Repo 'tools\DocumentationImages\ConsoleFixture.ps1')
+$root = New-DocumentationToolCopy -Repository $Repo -Destination $Work
+Import-Module (Join-Path $root 'module\PRA.Common.psm1') -Force; Import-Module (Join-Path $root 'module\PRA.Store.psm1') -Force
+$gm = Import-Module (Join-Path $root 'module\PRA.Gui.psm1') -Force -PassThru
+$fixture = New-ConsoleFixture -ToolRoot $root
+function Pump($ms = 80) { $f = New-Object Windows.Threading.DispatcherFrame; $t = New-Object Windows.Threading.DispatcherTimer; $t.Interval = [timespan]::FromMilliseconds($ms); $t.Tag = $f; $t.Add_Tick({ param($s) $s.Tag.Continue = $false; $s.Stop() }); $t.Start(); [Windows.Threading.Dispatcher]::PushFrame($f) }
+function Click($n) { $g.Controls[$n].RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent))); Pump 30 }
+function Check($n) { $g.Controls[$n].IsChecked = $true; Pump 30 }
+function Enter($n, $text) { $g.Controls[$n].Text = $text; Pump 30 }
+function WaitRun { $d = [datetime]::UtcNow.AddSeconds(90); while ($g.Run -and [datetime]::UtcNow -lt $d) { Pump 60 }; if ($g.Run) { throw 'the run did not end' }; Pump 100 }
+function WaitFor([scriptblock]$Condition, [int]$Seconds = 45) { $d = [datetime]::UtcNow.AddSeconds($Seconds); while (-not (& $Condition) -and [datetime]::UtcNow -lt $d) { Pump 80 }; if (-not (& $Condition)) { throw 'condition not reached' } }
+function Hold($flag) { [IO.File]::WriteAllText((Join-Path $root "hold.$flag"), '1') }
+function Release($flag) { Remove-Item (Join-Path $root "hold.$flag") -ErrorAction SilentlyContinue }
+function Scenario($holdAfter) { $s = [IO.File]::ReadAllText((Join-Path $root 'scenario.json')) | ConvertFrom-Json; $s.holdAfter = $holdAfter; [IO.File]::WriteAllText((Join-Path $root 'scenario.json'), ($s | ConvertTo-Json -Depth 6)) }
+function Ask { $s = [IO.File]::ReadAllText((Join-Path $root 'scenario.json')) | ConvertFrom-Json; $s | Add-Member -NotePropertyName ask -NotePropertyValue $true -Force; [IO.File]::WriteAllText((Join-Path $root 'scenario.json'), ($s | ConvertTo-Json -Depth 6)) }
+function Args_ { [IO.File]::ReadAllText((Join-Path $root 'last-args.json')) | ConvertFrom-Json }
+function Mod([scriptblock]$Script) { & $gm $Script }
+$cloudLights = @([ordered]@{ Name = 'PowerShell 7.5'; Status = 'Ok'; Detail = 'ok' }, [ordered]@{ Name = 'Cloud modules'; Status = 'Ok'; Detail = 'ok' }, [ordered]@{ Name = 'Sign-in: certificate'; Status = 'Ok'; Detail = 'ok' })
+$cloudProbe = { param($r) [pscustomobject]@{ CanCollect = $true; CanCloudEngine = $true; CanCloudBase = $true; ExchangeServer = 'ex01.contoso.com'; Net = ''; Role = 'None'; Lights = $cloudLights } }
+$collectProbe = { param($r) [pscustomobject]@{ CanCollect = $true; CanCloudEngine = $true; CanCloudBase = $false; ExchangeServer = 'ex01.contoso.com'; Net = ''; Role = 'None'; Lights = @(
+            [ordered]@{ Name = 'PowerShell 7.5'; Status = 'Ok'; Detail = 'ok' }, [ordered]@{ Name = 'Cloud modules'; Status = 'Fail'; Detail = 'missing' }) } }
+$exchangeAnswers = { param($server, $seconds) [pscustomobject]@{ IsCompleted = $true; Result = [pscustomobject]@{ Ok = $true; Why = '' } } }
+$exchangeSilent = { param($server, $seconds) [pscustomobject]@{ IsCompleted = $true; Result = [pscustomobject]@{ Ok = $false; Why = 'The server did not answer.' } } }
+$questions = New-Object Collections.Generic.List[string]
+$g = New-PcmGuiWindow -Root $root -ConfigPath $fixture.Config -Version 'test' -Theme Light -PrerequisiteProbe $(if ($Kind -eq 'Collect') { $collectProbe } else { $cloudProbe }) -ExchangeProbe $(if ($Kind -eq 'ExchangeDown') { $exchangeSilent } else { $exchangeAnswers }) -Hooks @{ NoConsole = $true; Question = { param($t, $x) $questions.Add($x); $true }; PickOu = { param($units) @($units)[0].Name } }
+$g.Form.WindowStartupLocation = 'Manual'; $g.Form.Left = -3000; $g.Form.Top = 0; $g.Form.ShowActivated = $false
+$g.Form.Show(); Pump 200
+$c = $g.Controls
+$configHash = (Get-FileHash -LiteralPath $fixture.Config -Algorithm SHA256).Hash
+function Done($result) { Write-Output ('RESULT:' + ($result | ConvertTo-Json -Depth 8 -Compress)); $g.Form.Dispatcher.InvokeShutdown() 2>$null }
+'@
+    function script:Invoke-GuiChild {
+        <# Runs a scenario in its own pwsh -STA process (the prelude first) and returns the observations it printed. #>
+        param([Parameter(Mandatory)][string]$Body, [ValidateSet('Cloud', 'Collect', 'ExchangeDown')][string]$Kind = 'Cloud')
+        $file = Join-Path $TestDrive ('child-{0}.ps1' -f [guid]::NewGuid().ToString('N').Substring(0, 8))
+        [IO.File]::WriteAllText($file, ($script:Prelude + "`r`n" + $Body), (New-Object Text.UTF8Encoding($true)))
+        $work = Join-Path $TestDrive ('work-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $text = (& pwsh -NoProfile -STA -File $file -Repo $script:Repo -Work $work -Kind $Kind 2>&1 | Out-String)
+        $line = @($text -split "`r?`n" | Where-Object { $_.StartsWith('RESULT:') }) | Select-Object -Last 1
+        if (-not $line) { throw "The child process gave no result:`n$text" }
+        return ($line.Substring(7) | ConvertFrom-Json)
     }
 }
 
-Describe 'Window: data (pure functions)' {
-    It 'describes the configured resource path rather than refusing every resource' {
-        & $script:Gui { Get-PraGuiResourceText -Config @{ Scope = @{ ConvertRooms = $false } } } | Should -BeLike '*not converted*'
-        & $script:Gui { Get-PraGuiResourceText -Config @{ Scope = @{ ConvertRooms = $true; ResourceMode = 'CloudResource' } } } | Should -BeLike '*true cloud room/equipment*'
-        & $script:Gui { Get-PraGuiResourceText -Config @{ Scope = @{ ConvertRooms = $true } } } | Should -BeLike '*legacy synchronised*'
+AfterAll {
+    Remove-PcmTestPackage $script:Root
+}
+
+Describe 'Console: the request and the command line of a run' {
+    It 'puts the official spelling of every value, whatever the letter case typed' {
+        $request = New-PcmGuiRequest -Action 'convert' -Mode 'apply' -Scope 'usersonly' -Expect ''
+        $request.Action | Should -BeExactly 'Convert'
+        $request.Mode | Should -BeExactly 'Apply'
+        $request.Scope | Should -BeExactly 'UsersOnly'
+        (New-PcmGuiRequest -Action 'check' -Batch 'ABCD1234' -Expect 'DEPROVISIONED').Expect | Should -BeExactly 'Deprovisioned'
     }
-    It 'builds the command line of a run: same script and parameters, -Force only for Apply, -NonInteractive always' {
-        $preview = Get-PraGuiCommand -Root 'C:\PRA' -ConfigPath 'C:\PRA\config\c.psd1' -Engine 'pwsh.exe' -Request @{ Action = 'Convert'; Mode = 'Preview'; IdentityPath = 'C:\PRA\data\gui\wave.csv' }
-        $preview.Arguments | Should -Match '^-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\\PRA\\Invoke-PraCloudMailbox.ps1" -Action Convert -Mode Preview -IdentityPath "C:\\PRA\\data\\gui\\wave.csv" -ConfigPath "C:\\PRA\\config\\c.psd1"$'
-        $preview.Display | Should -Be 'pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Preview -IdentityPath "C:\PRA\data\gui\wave.csv"'
-        $apply = Get-PraGuiCommand -Root 'C:\PRA' -ConfigPath 'C:\PRA\c.psd1' -Engine 'pwsh.exe' -Request @{ Action = 'Recover'; Mode = 'Apply'; Batch = 'abcd1234' }
-        $apply.Arguments | Should -Match '-Action Recover -Mode Apply -Batch abcd1234 -ConfigPath "C:\\PRA\\c.psd1" -Force$'
-        $check = Get-PraGuiCommand -Root 'C:\PRA' -ConfigPath 'C:\PRA\c.psd1' -Engine 'pwsh.exe' -Request @{ Action = 'Check'; Scope = 'UsersOnly' }
-        $check.Arguments | Should -Not -Match '-Mode'
-        $check.Arguments | Should -Match '-Action Check -Scope UsersOnly'
-        (Get-PraGuiCommand -Root 'C:\PRA' -ConfigPath 'C:\PRA\c.psd1' -Engine 'powershell.exe' -Request @{ Action = 'Collect'; Mode = 'Apply' }).Display | Should -BeLike 'powershell.exe -File *-Action Collect -Mode Apply -Force'
+    It 'refuses what the engine would refuse, in plain words' {
+        { New-PcmGuiRequest -Action Convert -Identity 'a@contoso.com' -Group 'PRA-Wave1' } | Should -Throw '*one way to pick the objects*'
+        { New-PcmGuiRequest -Action Convert -CsvPath 'a.csv' -SearchBase 'contoso.com/Paris' } | Should -Throw '*one way to pick the objects*'
+        { New-PcmGuiRequest -Action Recover } | Should -Throw '*Pick the batch*'
+        { New-PcmGuiRequest -Action Check -Mode Apply } | Should -Throw '*only reads*'
+        { New-PcmGuiRequest -Action Convert -Expect Provisioned } | Should -Throw '*follows a batch*'
+        { New-PcmGuiRequest -Action Collect -Group 'x' } | Should -Throw '*Collect reads Exchange*'
+        { New-PcmGuiRequest -Action Convert -Identity "a`r`nb" } | Should -Throw '*control character*'
+        { New-PcmGuiRequest -Action Convert -MaxObjects -1 } | Should -Throw '*zero*'
+        { New-PcmGuiRequest -Action Convert -Group 'g' -ResolveOnly $true } | Should -Throw '*only for a check of a group*'
+        { New-PcmGuiRequest -Action Check -Batch '1a2b3c4d' -Group 'g' -ResolveOnly $true } | Should -Throw '*only for a check of a group*'
+        { New-PcmGuiRequest -Action Convert -Scope Everything } | Should -Throw
     }
+    It 'maps every source and filter to the parameters of the engine' -TestCases @(
+        @{ Name = 'one mailbox'; Request = @{ Action = 'Convert'; Identity = 'adele.vance@contoso.com' }; Expected = '-Identity adele.vance@contoso.com' }
+        @{ Name = 'a group'; Request = @{ Action = 'Convert'; Group = 'PRA-Wave1' }; Expected = '-Group PRA-Wave1' }
+        @{ Name = 'an OU'; Request = @{ Action = 'Convert'; SearchBase = 'contoso.com/Paris' }; Expected = '-SearchBase contoso.com/Paris' }
+        @{ Name = 'a CSV file (wave)'; Request = @{ Action = 'Recover'; Batch = 'abcd1234'; CsvPath = 'C:\PRA\logs\gui\wave-1.csv' }; Expected = '-Batch abcd1234 -CsvPath C:\PRA\logs\gui\wave-1.csv' }
+        @{ Name = 'a scope and a limit'; Request = @{ Action = 'Convert'; Scope = 'SharedOnly'; MaxObjects = 200 }; Expected = '-Scope SharedOnly -MaxObjects 200' }
+        @{ Name = 'a snapshot'; Request = @{ Action = 'Check'; Snapshot = 40 }; Expected = '-Snapshot 40' }
+        @{ Name = 'a group lookup'; Request = @{ Action = 'Check'; Group = 'PRA-Wave1'; ResolveOnly = $true }; Expected = '-Group PRA-Wave1 -ResolveOnly' }
+        @{ Name = 'a follow-up'; Request = @{ Action = 'Check'; Batch = '1a2b3c4d'; Expect = 'retained'; Once = $true }; Expected = '-Batch 1a2b3c4d -Expect Retained -Once' }) {
+        param($Name, $Request, $Expected)
+        $command = Get-PcmGuiCommand -Root 'C:\PRA' -ConfigPath 'C:\PRA\config\PraCloudMailbox.config.psd1' -Request (New-PcmGuiRequest @Request) -Engine 'pwsh.exe'
+        ($command.Tokens -join ' ') | Should -BeLike "*$Expected*"
+        $command.Display | Should -BeLike "*$Expected*"
+    }
+    It 'never uses -NonInteractive (the interactive sign-in needs its window), runs the script of the tool folder and adds -Force only for an Apply' {
+        $preview = Get-PcmGuiCommand -Root 'C:\PRA' -ConfigPath 'C:\PRA\config\PraCloudMailbox.config.psd1' -Request (New-PcmGuiRequest -Action Convert -Group 'g') -Engine 'pwsh.exe'
+        $apply = Get-PcmGuiCommand -Root 'C:\PRA' -ConfigPath 'C:\PRA\config\PraCloudMailbox.config.psd1' -Request (New-PcmGuiRequest -Action Convert -Mode Apply -Group 'g') -Engine 'pwsh.exe'
+        $preview.Arguments | Should -Not -Match 'NonInteractive'
+        $preview.Arguments | Should -BeLike '-NoProfile -STA -File "C:\PRA\Invoke-PraCloudMailbox.ps1" -Action Convert -Mode Preview -Group g -ConfigPath*'
+        $preview.Tokens | Should -Not -Contain '-Force'
+        $apply.Tokens | Should -Contain '-Force'
+        $apply.Display | Should -BeLike '*-Mode Apply*-Force'
+        $preview.NeedsConsoleWindow | Should -BeTrue
+    }
+    It 'runs Collect like the cloud actions, in PowerShell 7 with a console window of its own, and a check without -Mode' {
+        $collect = Get-PcmGuiCommand -Root 'C:\PRA' -ConfigPath 'C:\PRA\c.psd1' -Request (New-PcmGuiRequest -Action Collect -Mode Apply) -Engine 'pwsh.exe'
+        $collect.NeedsConsoleWindow | Should -BeTrue
+        $collect.Arguments | Should -Not -Match 'NonInteractive'
+        $collect.Display | Should -BeLike '.\Invoke-PraCloudMailbox.ps1 -Action Collect -Mode Apply*-Force'
+        (Get-PcmGuiCommand -Root 'C:\PRA' -ConfigPath 'C:\PRA\c.psd1' -Request (New-PcmGuiRequest -Action Check) -Engine 'pwsh.exe').Tokens | Should -Not -Contain '-Mode'
+    }
+    It 'schedules the daily Collect like any action: the official spelling, no objects, -Mode Apply -Force and never -NonInteractive' {
+        $request = New-PcmGuiRequest -Action 'sCHEdule' -Mode 'apply'
+        $request.Action | Should -BeExactly 'Schedule'
+        $command = Get-PcmGuiCommand -Root 'C:\PRA' -ConfigPath 'C:\PRA\config\PraCloudMailbox.config.psd1' -Request $request -Engine 'pwsh.exe'
+        $command.Display | Should -BeExactly '.\Invoke-PraCloudMailbox.ps1 -Action Schedule -Mode Apply -Force'
+        $command.Arguments | Should -BeLike '-NoProfile -STA -File "C:\PRA\Invoke-PraCloudMailbox.ps1" -Action Schedule -Mode Apply -ConfigPath*-Force'
+        $command.Arguments | Should -Not -Match 'NonInteractive'
+        $command.NeedsConsoleWindow | Should -BeTrue
+        { New-PcmGuiRequest -Action Schedule -Group 'g' } | Should -Throw '*takes no mailbox, batch, OU, group, CSV file or snapshot*'
+        { New-PcmGuiRequest -Action Schedule -Once $true } | Should -Throw '*takes no check option*'
+        (& $script:Gui { Get-PcmGuiPlanTitle -Action Schedule }) | Should -Be @('Configuration', 'Account', 'Exchange access', 'Batch logon right', 'Scheduled task')
+    }
+    It 'passes the generated configuration and names the original one for the next steps and the report' {
+        $command = Get-PcmGuiCommand -Root 'C:\PRA' -ConfigPath 'C:\PRA\logs\gui\run-1\effective.config.psd1' -BaseConfigPath 'D:\PRA\lab.config.psd1' -Request (New-PcmGuiRequest -Action Check) -Engine 'pwsh.exe'
+        $command.Tokens | Should -Contain '-BaseConfigPath'
+        $command.Arguments | Should -BeLike '*-ConfigPath "C:\PRA\logs\gui\run-1\effective.config.psd1" -BaseConfigPath "D:\PRA\lab.config.psd1"'
+        $command.Display | Should -BeLike '*-ConfigPath D:\PRA\lab.config.psd1'
+        $command.Display | Should -Not -BeLike '*effective*'
+    }
+    It 'quotes a value with spaces or quotes for the process and shows it as an operator would type it' {
+        $command = Get-PcmGuiCommand -Root 'C:\Program Files\PRA' -ConfigPath 'C:\Program Files\PRA\config\c.psd1' -Request (New-PcmGuiRequest -Action Convert -SearchBase 'contoso.com/Paris "North"') -Engine 'pwsh.exe'
+        $command.Arguments | Should -BeLike '*-File "C:\Program Files\PRA\Invoke-PraCloudMailbox.ps1"*-SearchBase "contoso.com/Paris \"North\""*'
+        ConvertTo-PcmGuiNativeArgument 'C:\dir\' | Should -BeExactly '"C:\dir\\"'
+        { ConvertTo-PcmGuiNativeArgument ('a' + [char]0 + 'b') } | Should -Throw
+    }
+}
+
+Describe 'Console: the typed confirmation' {
+    It 'accepts the name of the action in any letter case, spaces around it ignored (<Typed>)' -TestCases @(@{ Typed = 'convert' }, @{ Typed = ' Convert ' }, @{ Typed = 'CONVERT' }, @{ Typed = "`tConVert`r`n" }) {
+        param($Typed)
+        Test-PcmGuiConfirmation -Typed $Typed -Word 'CONVERT' | Should -BeTrue
+    }
+    It 'refuses another word and any invisible character (<Name>)' -TestCases @(
+        @{ Name = 'other word'; Typed = 'recover' }, @{ Name = 'empty'; Typed = '' }, @{ Name = 'zero-width space'; Typed = ('conv' + [char]0x200B + 'ert') }
+        @{ Name = 'zero-width at the end'; Typed = ('Convert' + [char]0x200B) }, @{ Name = 'control character'; Typed = ('Convert' + [char]1) }, @{ Name = 'soft hyphen'; Typed = ('Conv' + [char]0xAD + 'ert') }) {
+        param($Name, $Typed)
+        Test-PcmGuiConfirmation -Typed $Typed -Word 'CONVERT' | Should -BeFalse
+    }
+}
+
+Describe 'Console: the events of the engine and the waves' {
     It 'reads the events incrementally, complete lines only, and keeps a line that is not JSON as text' {
         $path = Join-Path $TestDrive 'events.jsonl'
         [IO.File]::WriteAllText($path, '{"kind":"step","index":1}' + "`n" + 'not json' + "`n" + '{"kind":"item","te')
-        $first = Read-PraGuiEvents -Path $path
+        $first = Read-PcmGuiEvents -Path $path
         @($first.Events).Count | Should -Be 2
         $first.Events[0].kind | Should -Be 'step'
         $first.Events[1].text | Should -Be 'not json'
+        $first.HasPartial | Should -BeTrue
         [IO.File]::AppendAllText($path, 'xt":"done"}' + "`n")
-        $second = Read-PraGuiEvents -Path $path -Position $first.Position
+        $second = Read-PcmGuiEvents -Path $path -Position $first.Position
         @($second.Events).Count | Should -Be 1
         $second.Events[0].text | Should -Be 'done'
-        @((Read-PraGuiEvents -Path $path -Position $second.Position).Events).Count | Should -Be 0
-        @((Read-PraGuiEvents -Path (Join-Path $TestDrive 'missing.jsonl')).Events).Count | Should -Be 0
+        @((Read-PcmGuiEvents -Path $path -Position $second.Position).Events).Count | Should -Be 0
+        @((Read-PcmGuiEvents -Path (Join-Path $TestDrive 'missing.jsonl')).Events).Count | Should -Be 0
     }
-    It 'filters as typed: quotes and wildcards are literal, the clauses are joined with AND' {
-        Get-PraGuiRowFilter -Text "  O'Brien*[x]%  " -Clauses @("Kind = 'User'", '', "InCloud = '0'") | Should -Be "Search LIKE '%o''brien[*][[]x[]][%]%' AND Kind = 'User' AND InCloud = '0'"
-        Get-PraGuiRowFilter -Text '' -Clauses @() | Should -Be ''
+    It 'writes the objects ticked for a wave as the CSV given to -CsvPath: Identity (the object ID) and Name' {
+        $path = Write-PcmGuiWave -Folder (Join-Path $TestDrive 'waves') -Name 'abcd1234' -Rows @([pscustomobject]@{ Guid = 'AAA'; Name = 'Adele "AV" Vance' }, [pscustomobject]@{ Guid = 'bbb'; Name = 'Alex' })
+        $rows = @(Import-Csv -LiteralPath $path)
+        $rows.Count | Should -Be 2
+        $rows[0].Identity | Should -Be 'AAA'
+        $rows[0].Name | Should -Be "Adele 'AV' Vance"
+        (Get-Content -LiteralPath $path -TotalCount 1) | Should -Match 'Identity,Name'
     }
-    It 'keys a selection by its objects, whatever their order' {
-        $one = Get-PraGuiSelectionKey -Prefix 'Convert|4' -Guids @('b', 'a')
-        $one | Should -Be (Get-PraGuiSelectionKey -Prefix 'Convert|4' -Guids @('a', 'b'))
-        $one | Should -Not -Be (Get-PraGuiSelectionKey -Prefix 'Convert|4' -Guids @('a', 'c'))
-        $one | Should -Not -Be (Get-PraGuiSelectionKey -Prefix 'Convert|5' -Guids @('a', 'b'))
-        $one | Should -Match '^Convert\|4\|2\|[0-9A-F]{16}$'
-    }
-    It 'turns a Check report into Ready, Warning and Not ready rows, and names a tenant finding' {
-        $rows = @(
-            [pscustomobject]@{ Identity = 'a@c.com'; Kind = 'User'; ObjectGuid = 'g1'; PrimarySmtpAddress = 'a@c.com'; FinalStatus = 'Success'; Warnings = ''; Detail = 'ok'; Licence = ''; ExchangeOnline = ''; Holds = '' }
-            [pscustomobject]@{ Identity = 'b@c.com'; Kind = 'User'; ObjectGuid = 'g2'; PrimarySmtpAddress = 'b@c.com'; FinalStatus = 'Success'; Warnings = 'HOLD'; Detail = 'ok'; Licence = ''; ExchangeOnline = ''; Holds = '' }
-            [pscustomobject]@{ Identity = 'c@c.com'; Kind = 'Shared'; ObjectGuid = 'g3'; PrimarySmtpAddress = 'c@c.com'; FinalStatus = 'Error'; Warnings = 'x'; Detail = ('y' * 300); Licence = ''; ExchangeOnline = ''; Holds = '' }
-            [pscustomobject]@{ Identity = ''; Kind = ''; ObjectGuid = ''; PrimarySmtpAddress = ''; FinalStatus = 'Error'; Warnings = ''; Detail = '[Run/Execution/Tenant-Facts] 1 free unit for 5 users'; Licence = ''; ExchangeOnline = ''; Holds = '' })
-        $table = ConvertTo-PraGuiCheckTable -Rows $rows
-        @($table.Rows | ForEach-Object { $_['StatusText'] }) | Should -Be @('Ready', 'Warning', 'Not ready', 'Not ready')
-        $table.Rows[1]['Issue'] | Should -Be 'HOLD'
-        $table.Rows[2]['Issue'].Length | Should -Be 260
-        $table.Rows[3]['Identity'] | Should -Be '(tenant)'
-        $table.Rows[3]['Issue'] | Should -Be '1 free unit for 5 users'
-        (ConvertTo-PraGuiCheckTable -Rows @()).Rows.Count | Should -Be 0
-    }
-    It 'shows the last Convert batch of each object, and an object rolled back is no longer in the cloud' {
-        $objects = @(
-            [pscustomobject]@{ object_guid = 'g1'; kind = 'User'; user_principal_name = 'a@c.com'; primary_smtp_address = 'a@c.com'; sam_account_name = 'a' }
-            [pscustomobject]@{ object_guid = 'g2'; kind = 'User'; user_principal_name = 'b@c.com'; primary_smtp_address = 'b@c.com'; sam_account_name = 'b' }
-            [pscustomobject]@{ object_guid = 'g3'; kind = 'Shared'; user_principal_name = ''; primary_smtp_address = 'c@c.com'; sam_account_name = 'c' })
-        $back = New-Object 'Collections.Generic.HashSet[string]'; [void]$back.Add('g2')
-        $newer = [pscustomobject]@{ Id = 'new00001'; Back = (New-Object 'Collections.Generic.HashSet[string]'); Items = @([pscustomobject]@{ object_guid = 'g1'; status = 'Planned'; step = '' }) }
-        $older = [pscustomobject]@{ Id = 'old00001'; Back = $back; Items = @([pscustomobject]@{ object_guid = 'g1'; status = 'Done'; step = 'Mailbox' }, [pscustomobject]@{ object_guid = 'g2'; status = 'Done'; step = 'Mailbox' }) }
-        $table = ConvertTo-PraGuiConvertTable -Objects $objects -Batches @($newer, $older) -Ticked @('G3')
-        @($table.Rows | ForEach-Object { $_['Batch'] }) | Should -Be @('new00001 · not started', 'old00001 · back', '')
-        @($table.Rows | ForEach-Object { $_['InCloud'] }) | Should -Be @('0', '0', '0')
-        @($table.Rows | ForEach-Object { $_['StatusText'] }) | Should -Be @('Not checked', 'Not checked', 'Not checked')
-        $table.Rows[2]['Identity'] | Should -Be 'c@c.com'
-        Get-PraGuiTicked $table | Should -Be @('g3')
-        $done = [pscustomobject]@{ Id = 'b1'; Back = (New-Object 'Collections.Generic.HashSet[string]'); Items = @([pscustomobject]@{ object_guid = 'g1'; status = 'Failed'; step = 'Licence' }) }
-        (ConvertTo-PraGuiConvertTable -Objects $objects -Batches @($done)).Rows[0]['InCloud'] | Should -Be '1'
-    }
-    It 'shows what is waiting for Recover in a batch' {
-        $back = New-Object 'Collections.Generic.HashSet[string]'; [void]$back.Add('g2')
-        $batch = [pscustomobject]@{ Id = 'b1'; Back = $back; Items = @(
-                [pscustomobject]@{ object_guid = 'g1'; kind = 'User'; identity = 'a'; status = 'Done'; step = 'Mailbox' }
-                [pscustomobject]@{ object_guid = 'g2'; kind = 'User'; identity = 'b'; status = 'Done'; step = 'Mailbox' }
-                [pscustomobject]@{ object_guid = 'g3'; kind = 'Shared'; identity = 'c'; status = 'Planned'; step = '' }
-                [pscustomobject]@{ object_guid = 'g4'; kind = 'Shared'; identity = 'd'; status = 'Failed'; step = 'Permissions' }) }
-        $table = ConvertTo-PraGuiRecoverTable -Batch $batch
-        @($table.Rows | ForEach-Object { $_['StatusText'] }) | Should -Be @('Waiting', 'Back on-premises', 'Nothing to roll back', 'Waiting')
-        @($table.Rows | ForEach-Object { $_['Converted'] }) | Should -Be @('Done', 'Done', 'Not started', 'Failed at Permissions')
-    }
-    It 'writes a wave that -IdentityPath reads back (object GUIDs)' {
-        $rows = @([pscustomobject]@{ ObjectGuid = 'g1'; Identity = 'a@c.com' }, [pscustomobject]@{ ObjectGuid = 'g2'; Identity = 'Dupont "Jean"' })
-        $path = Write-PraGuiWave -Folder (Join-Path $TestDrive 'gui') -Name 'convert' -Rows $rows
-        $path | Should -Match 'wave-convert-\d{8}-\d{6}\.csv$'
-        Read-PraIdentityFile -Path $path | Should -Be @('g1', 'g2')
-    }
-    It 'counts the objects of a preview from its report: planned users, shared, and the objects not ready' {
-        $path = Join-Path $TestDrive 'preview.csv'
-        Write-TestCsv -Path $path -Rows @(
-            [ordered]@{ Identity = 'a'; Kind = 'User'; ObjectGuid = 'g1'; FinalStatus = 'Planned' }
-            [ordered]@{ Identity = 'c'; Kind = 'Shared'; ObjectGuid = 'g3'; FinalStatus = 'Planned' }
-            [ordered]@{ Identity = 'b'; Kind = 'User'; ObjectGuid = 'g2'; FinalStatus = 'Error' }
-            [ordered]@{ Identity = ''; Kind = ''; ObjectGuid = ''; FinalStatus = 'Error' })
-        $count = Get-PraGuiPlanCount -Path $path
-        $count.Planned | Should -Be 2; $count.Users | Should -Be 1; $count.Shared | Should -Be 1; $count.Blocked | Should -Be 1
-        (Get-PraGuiPlanCount -Path '').Planned | Should -Be 0
-    }
-    It 'shows times in local time and the paths of the tool folder as relative paths' {
-        $utc = [datetime]::new(2026, 10, 8, 12, 0, 0, [DateTimeKind]::Utc)
-        Format-PraGuiTime $utc.ToString('o') | Should -Be $utc.ToLocalTime().ToString('yyyy-MM-dd HH:mm')
-        Format-PraGuiTime '' | Should -Be ''
-        & $script:Gui { Format-PraGuiPath -Path 'C:\PRA\data\x.db' -Root 'C:\PRA\' } | Should -Be '.\data\x.db'
-        & $script:Gui { Format-PraGuiPath -Path 'D:\other\x.db' -Root 'C:\PRA' } | Should -Be 'D:\other\x.db'
-    }
-    It 'counts room and equipment previews separately from shared mailboxes' {
-        $path = Join-Path $TestDrive 'resources-preview.csv'
-        Write-TestCsv -Path $path -Rows @(
-            @{ ObjectGuid = 'room'; Kind = 'Room'; FinalStatus = 'Planned' }
-            @{ ObjectGuid = 'equipment'; Kind = 'Equipment'; FinalStatus = 'Planned' }
-            @{ ObjectGuid = 'shared'; Kind = 'Shared'; FinalStatus = 'Planned' })
-        $count = Get-PraGuiPlanCount -Path $path
-        $count.Planned | Should -Be 3
-        $count.Resources | Should -Be 2
-        $count.Shared | Should -Be 1
+    It 'keys a selection by its objects, whatever their order and letter case' {
+        $one = Get-PcmGuiSelectionKey -Prefix 'abcd1234' -Guids @('B', 'a')
+        $one | Should -Be (Get-PcmGuiSelectionKey -Prefix 'abcd1234' -Guids @('A', 'b'))
+        $one | Should -Not -Be (Get-PcmGuiSelectionKey -Prefix 'abcd1234' -Guids @('a', 'c'))
+        $one | Should -Match '^abcd1234\|2\|[0-9A-F]{16}$'
     }
 }
 
-Describe 'Window: fresh installation' {
-    It 'opens with the shipped configuration and nothing else: no snapshot, no journal, no Check' {
-        $folder = Join-Path $TestDrive 'fresh'
-        $null = New-Item -ItemType Directory -Path $folder -Force
-        $config = Join-Path $folder 'fresh.config.psd1'
-        $text = "@{ Environment = 'PROD'; Scope = @{ Mode = 'Auto' }; EntraConnect = @{ Mode = 'Manual' }; Store = @{ Path = '$folder\data\PraCloudMailbox.db'; JournalPath = '$folder\data\journal.db'; BackupFolder = '$folder\data\backup' }; Logging = @{ Folder = '$folder\logs' }; Report = @{ Folder = '$folder\reports' } }"
-        [IO.File]::WriteAllText($config, $text, (New-Object Text.UTF8Encoding($true)))
-        $window = New-PraGuiWindow -Root $script:Root -ConfigPath $config -Theme Light
-        try {
-            $window.Controls.NextTitle.Text | Should -Be 'Fill in the configuration'
-            $window.Controls.NextButton.Tag | Should -Be ''
-            $window.Controls.TenantText.Text | Should -Be 'tenant not set'
-            @($window.Controls.OvBatches.ItemsSource)[0].Value | Should -Be 'no batch: nothing converted'
-            $window.Controls.ConvertApply.IsEnabled | Should -BeFalse
-            $window.Controls.ConvertHint.Text | Should -BeLike 'No snapshot*'
-            $window.Controls.RecoverHint.Text | Should -BeLike 'No Convert batch*'
-            $window.Controls.CheckTotal.Text | Should -Be '-'
-            Test-Path -LiteralPath (Join-Path $folder 'data') | Should -BeFalse
-        } finally { $window.Form.Close() }
-    }
-    It 'opens when the configuration cannot be read, and says so' {
-        $window = New-PraGuiWindow -Root $script:Root -ConfigPath (Join-Path $TestDrive 'missing.config.psd1') -Theme Light
-        try {
-            $window.Controls.EnvText.Text | Should -Be 'Configuration error'
-            $window.Controls.NextTitle.Text | Should -Be 'Fix the configuration'
-            $window.Controls.ConvertHint.Text | Should -Be 'Fix the configuration first.'
-        } finally { $window.Form.Close() }
-    }
-}
-
-Describe 'Window: built on a test state' {
+Describe 'Console: what this computer can do' {
     BeforeAll {
-        $script:State = New-TestState -Folder (Join-Path $TestDrive 'state')
-        $script:Window = New-PraGuiWindow -Root $script:Root -ConfigPath $script:State.Config -Version '1.2.0' -Theme Light
-        $form = $script:Window.Form
-        $form.WindowStartupLocation = 'Manual'; $form.Left = -6000; $form.Top = -6000; $form.ShowActivated = $false; $form.ShowInTaskbar = $false
-        $form.Show()
-        & $script:Gui {
-            $script:Gui.Hooks.Question = { param($Title, $Text) $global:PraGuiAsked = $Text; $true }
-            $script:Gui.Hooks.Notice = { param($Text) $global:PraGuiNotice = $Text }
-        }
-        $script:C = $script:Window.Controls
+        $script:Modules = @([pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.41.1' }, [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.10.1' })
+        $script:Snapshot = [pscustomobject]@{ Path = 'D:\PRA\snap.db'; Exists = $true; Id = 42; Taken = '2026-11-11 22:00'; AgeHours = 14.0; MaxAgeDays = 2; Error = '' }
+        $script:Journal = [pscustomobject]@{ Path = 'D:\PRA\journal.db'; Exists = $true; Batches = 1; Error = '' }
+        $script:CertificateOk = [pscustomobject]@{ Certificate = [pscustomobject]@{ Subject = 'CN=PRA-Cloud-App'; NotAfter = [datetime]::Now.AddDays(230); HasPrivateKey = $true }; Store = 'CurrentUser' }
+        $script:Pwsh = [pscustomobject]@{ Ok = $true; Path = 'C:\Program Files\PowerShell\7\pwsh.exe'; Version = '7.5.1'; Problem = '' }
     }
-    AfterAll {
-        & $script:Gui { if ($script:Gui) { $script:Gui.Run = $null; $script:Gui.Timer.Stop() } }
-        $script:Window.Form.Close()
-        Remove-Variable -Name PraGuiAsked, PraGuiNotice, PraGuiConfirm -Scope Global -ErrorAction SilentlyContinue
+    It 'shows the lights of a computer that can run every action, and settles the role from the Microsoft 365 and Exchange tests' {
+        $detect = Get-PcmGuiPrerequisite -Request @{ Edition = 'Core'; Version = '7.5.1'; Modules = $script:Modules; Snapshot = $script:Snapshot; Journal = $script:Journal; Certificate = $script:CertificateOk; Thumbprint = 'AA'; AppId = 'id'
+            ExchangeServer = 'EX01.contoso.com'; Pwsh = $script:Pwsh; Task = [pscustomobject]@{ Found = $true; Text = 'Scheduled task "PRA Collect" found.' } }
+        @($detect.Lights | ForEach-Object { $_.Name }) | Should -Be @('PowerShell 7.5', 'Cloud modules', 'Sign-in: certificate', 'Snapshot', 'Journal', 'Daily Collect')
+        @($detect.Lights | Where-Object { $_.Status -eq 'Fail' }).Count | Should -Be 0
+        $detect.CanCloudBase | Should -BeTrue
+        $detect.CanCollect | Should -BeTrue
+        $detect.ExchangeServer | Should -Be 'EX01.contoso.com'
+        Get-PcmGuiRole -Detect $detect -Net 'Ok' -Exchange 'Ok' | Should -Be 'Both'
+        Get-PcmGuiRole -Detect $detect -Net 'Ok' -Exchange '' | Should -Be 'Both'
+        Get-PcmGuiRole -Detect $detect -Net 'Ok' -Exchange 'Fail' | Should -Be 'Cloud'
+        Get-PcmGuiRole -Detect $detect -Net 'Fail' -Exchange 'Ok' | Should -Be 'Collect'
+        Get-PcmGuiRole -Detect $detect -Net 'Checking' -Exchange 'Fail' | Should -Be 'Checking'
+        Get-PcmGuiRole -Detect $detect -Net 'Fail' -Exchange 'Fail' | Should -Be 'None'
     }
+    It 'does not let this computer collect without Exchange.Server, and keeps the cloud actions when the cloud lights are green' {
+        $detect = Get-PcmGuiPrerequisite -Request @{ Edition = 'Core'; Version = '7.5.1'; Modules = $script:Modules; Snapshot = $script:Snapshot; Journal = $script:Journal; Certificate = $script:CertificateOk; Thumbprint = 'AA'; AppId = 'id'
+            ExchangeServer = '  '; Pwsh = $script:Pwsh }
+        $detect.CanCollect | Should -BeFalse
+        Get-PcmGuiRole -Detect $detect -Net 'Ok' | Should -Be 'Cloud'
+    }
+    It 'needs PowerShell 7.5 for every action' {
+        $detect = Get-PcmGuiPrerequisite -Request @{ Edition = 'Core'; Version = '7.4.6'; Modules = $script:Modules; Snapshot = $script:Snapshot; ExchangeServer = 'EX01.contoso.com'; Pwsh = $script:Pwsh }
+        ($detect.Lights | Where-Object { $_.Name -eq 'PowerShell 7.5' }).Status | Should -Be 'Fail'
+        $detect.CanCollect | Should -BeFalse
+        $detect.CanCloudBase | Should -BeFalse
+        $detect = Get-PcmGuiPrerequisite -Request @{ Edition = 'Desktop'; Version = '5.1.17763.1'; Modules = $script:Modules; Snapshot = $script:Snapshot; ExchangeServer = 'EX01.contoso.com'; Pwsh = $script:Pwsh }
+        ($detect.Lights | Where-Object { $_.Name -eq 'PowerShell 7.5' }).Detail | Should -BeLike '*every action needs PowerShell 7.5 or later*'
+        $detect.CanCollect | Should -BeFalse
+    }
+    It 'writes the Exchange light: not set, checking, answering, or not reachable (amber: only Collect uses it)' {
+        (Get-PcmGuiExchangeLight -State '' -Server '').Status | Should -Be 'NA'
+        (Get-PcmGuiExchangeLight -State '' -Server '').Detail | Should -BeLike '*Exchange.Server is not set*'
+        (Get-PcmGuiExchangeLight -State 'Checking' -Server 'EX01.contoso.com').Status | Should -Be 'Info'
+        $ok = Get-PcmGuiExchangeLight -State 'Ok' -Server 'EX01.contoso.com'
+        $ok.Status | Should -Be 'Ok'
+        $ok.Detail | Should -BeLike '*EX01.contoso.com*Kerberos*'
+        $fail = Get-PcmGuiExchangeLight -State 'Fail' -Answer ([pscustomobject]@{ Host = 'EX01.contoso.com'; Ok = $false; Why = 'The server did not answer.' }) -Server 'EX01.contoso.com'
+        $fail.Status | Should -Be 'Warn'
+        $fail.Detail | Should -BeLike '*cannot be opened*Collect cannot run here*The server did not answer.*'
+    }
+    It 'tests Exchange with a task-like probe that never blocks the window (answer, silence, refusal)' {
+        $answered = [pscustomobject]@{ IsCompleted = $true; Result = [pscustomobject]@{ Ok = $true; Why = '' } }
+        $silent = [pscustomobject]@{ IsCompleted = $false; Result = $null }
+        $refused = [pscustomobject]@{ IsCompleted = $true; Result = [pscustomobject]@{ Ok = $false; Why = 'Access is denied.' } }
+        $answer = { param($target, $seconds) ConvertTo-PcmGuiExchangeAnswer -Target $target -Seconds $seconds }
+        (& $script:Gui $answer ([pscustomobject]@{ Host = 'ex'; Task = $answered; Failure = '' }) 15).Ok | Should -BeTrue
+        $none = & $script:Gui $answer ([pscustomobject]@{ Host = 'ex'; Task = $silent; Failure = '' }) 15
+        $none.Ok | Should -BeFalse
+        $none.Why | Should -BeLike 'no answer within 15 seconds'
+        (& $script:Gui $answer ([pscustomobject]@{ Host = 'ex'; Task = $refused; Failure = '' }) 15).Why | Should -Be 'Access is denied.'
+        (& $script:Gui $answer ([pscustomobject]@{ Host = 'ex'; Task = $null; Failure = 'no probe' }) 15).Why | Should -Be 'no probe'
+    }
+    It 'explains an old module, an expired certificate and a certificate without a private key in plain words' {
+        $old = @([pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.10.0' }, [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.10.1' })
+        $detect = Get-PcmGuiPrerequisite -Request @{ Edition = 'Core'; Version = '7.5.1'; Modules = $old; Pwsh = $script:Pwsh; Thumbprint = 'AA'; AppId = 'id'
+            Certificate = [pscustomobject]@{ Certificate = [pscustomobject]@{ Subject = 'CN=x'; NotAfter = [datetime]::Now.AddDays(-3); HasPrivateKey = $true }; Store = 'CurrentUser' } }
+        ($detect.Lights | Where-Object { $_.Name -eq 'Cloud modules' }).Detail | Should -BeLike '*Install-Module Microsoft.Graph.Authentication -MinimumVersion 2.41.1*'
+        ($detect.Lights | Where-Object { $_.Name -eq 'Sign-in: certificate' }).Detail | Should -BeLike '*expired*'
+        $detect.CanCloudBase | Should -BeFalse
+        $light = { param($SignIn, $Thumbprint, $AppId, $Tenant, $Find) Get-PcmGuiSignInLight -SignIn $SignIn -Thumbprint $Thumbprint -AppId $AppId -Tenant $Tenant -Find $Find }
+        (& $script:Gui $light 'Certificate' 'AA' 'id' '' ([pscustomobject]@{ Certificate = [pscustomobject]@{ Subject = 'CN=x'; NotAfter = [datetime]::Now.AddDays(90); HasPrivateKey = $false }; Store = 'CurrentUser' })).Detail | Should -BeLike '*no private key*'
+        (& $script:Gui $light 'interactive' '' '' '' $null).Status | Should -Be 'Fail'
+        (& $script:Gui $light 'INTERACTIVE' '' '' '00000000-0000-0000-0000-000000000000' $null).Ok | Should -BeTrue
+    }
+    It 'warns when the snapshot is older than the maximum age and fails when there is none' {
+        $old = [pscustomobject]@{ Path = 'D:\PRA\snap.db'; Exists = $true; Id = 3; Taken = '2026-10-01 22:00'; AgeHours = 24.0 * 40; MaxAgeDays = 7; Error = '' }
+        $detect = Get-PcmGuiPrerequisite -Request @{ Edition = 'Core'; Version = '7.5.1'; Modules = $script:Modules; Snapshot = $old; Pwsh = $script:Pwsh }
+        ($detect.Lights | Where-Object { $_.Name -eq 'Snapshot' }).Status | Should -Be 'Warn'
+        $none = [pscustomobject]@{ Path = 'D:\PRA\snap.db'; Exists = $false; Id = 0; Taken = ''; AgeHours = 0.0; MaxAgeDays = 7; Error = '' }
+        $detect = Get-PcmGuiPrerequisite -Request @{ Edition = 'Core'; Version = '7.5.1'; Modules = $script:Modules; Snapshot = $none; Pwsh = $script:Pwsh }
+        ($detect.Lights | Where-Object { $_.Name -eq 'Snapshot' }).Status | Should -Be 'Fail'
+    }
+    It 'says why Microsoft 365 cannot be reached: a blocked or refused connection, a name that is not found, a silent network' {
+        $socket = { param($code) [Net.Sockets.SocketException]::new($code) }
+        $wrap = { param($inner) [Net.Http.HttpRequestException]::new('An error occurred while sending the request.', $inner) }
+        Get-PcmGuiNetworkWhy (& $wrap (& $socket 10013)) | Should -BeLike 'blocked on this computer*'
+        Get-PcmGuiNetworkWhy (& $wrap (& $socket 10061)) | Should -BeLike 'refused by the network*'
+        Get-PcmGuiNetworkWhy (& $wrap (& $socket 11001)) | Should -BeLike 'the name cannot be resolved*'
+        Get-PcmGuiNetworkWhy (& $wrap (& $socket 10060)) | Should -BeLike 'no answer from the network*'
+        Get-PcmGuiNetworkWhy ([InvalidOperationException]::new('boom')) | Should -Be 'boom'
+    }
+    It 'decides Ok, Partial or Fail from the answers, and writes the light' {
+        $good = [pscustomobject]@{ Host = 'login.microsoftonline.com'; Ok = $true; Why = '' }
+        $bad = [pscustomobject]@{ Host = 'outlook.office365.com'; Ok = $false; Why = 'no answer within 3 seconds' }
+        Get-PcmGuiNetworkVerdict @($good, $good) | Should -Be 'Ok'
+        Get-PcmGuiNetworkVerdict @($good, $bad) | Should -Be 'Partial'
+        Get-PcmGuiNetworkVerdict @($bad, $bad) | Should -Be 'Fail'
+        (Get-PcmGuiNetworkLight -State 'Partial' -Answers @($good, $bad)).Detail | Should -BeLike '*outlook.office365.com does not answer*no answer within 3 seconds*'
+        (Get-PcmGuiNetworkLight -State 'Ok' -Answers @($good, $good)).Status | Should -Be 'Ok'
+        (Get-PcmGuiNetworkLight -State 'Checking').Status | Should -Be 'Info'
+    }
+    It 'tests the two Microsoft 365 hosts with tasks that never block the window (answers, timeouts and failures)' {
+        $done = [Threading.Tasks.Task]::FromResult([object]::new())
+        $stuck = [Threading.Tasks.TaskCompletionSource[object]]::new().Task
+        $failed = [Threading.Tasks.Task]::FromException([Exception]::new('connection refused'))
+        $answers = @(& $script:Gui { param($a, $b, $c) ConvertTo-PcmGuiNetworkAnswer -Targets @([pscustomobject]@{ Host = 'a'; Task = $a; Failure = '' }, [pscustomobject]@{ Host = 'b'; Task = $b; Failure = '' }, [pscustomobject]@{ Host = 'c'; Task = $null; Failure = 'no probe' }) -Seconds 3 } $done $stuck $failed)
+        $answers[0].Ok | Should -BeTrue
+        $answers[1].Ok | Should -BeFalse
+        $answers[1].Why | Should -BeLike 'no answer within 3 seconds'
+        $answers[2].Why | Should -Be 'no probe'
+    }
+}
 
-    It 'finds every named element and reads the state: environment, next step, resume of the unfinished batch' {
-        @(& $script:Gui { $script:ControlNames }).Count | Should -Be $script:C.Count
-        $script:C.EnvText.Text | Should -Be 'Environment TEST'
-        $script:C.TenantText.Text | Should -Be 'contoso.onmicrosoft.com'
-        $script:C.NextTitle.Text | Should -Be ('Convert batch {0} is not finished' -f $script:State.Batch)
-        $script:C.NextButton.Tag | Should -Be 'Convert'
-        $script:C.ConvertResumePanel.Visibility | Should -Be 'Visible'
-        $script:C.CheckTotal.Text | Should -Be '3'
-        $script:C.CheckNotReady.Text | Should -Be '1'
-        @($script:C.SnapshotGrid.ItemsSource).Count | Should -Be 1
-        $script:C.Nav.Items.Count | Should -Be 5
+Describe 'Console: settings for one run only' {
+    It 'writes the changes to a generated copy, never to the configuration file, and lists what differs' {
+        $before = (Get-FileHash -LiteralPath $script:Fixture.Config).Hash
+        $made = New-PcmGuiRunConfig -Root $script:Tool -ConfigPath $script:Fixture.Config -Overrides @{ Environment = 'LAB'; Cloud = @{ TenantId = '11111111-2222-3333-4444-555555555555'; SignIn = 'Interactive'; UserPrincipalName = 'admin@contoso.com' } }
+        (Get-FileHash -LiteralPath $script:Fixture.Config).Hash | Should -Be $before
+        $made.Path | Should -BeLike '*logs\gui\run-*\effective.config.psd1'
+        $made.Base | Should -Be $script:Fixture.Config
+        @($made.Keys) | Should -Be @('Cloud.SignIn', 'Cloud.TenantId', 'Cloud.UserPrincipalName', 'Environment')
+        $loaded = Import-PcmConfiguration -Path $made.Path -Root $script:Tool
+        $loaded.Environment | Should -Be 'LAB'
+        $loaded.Cloud.SignIn | Should -Be 'Interactive'
+        $loaded.Cloud.TenantId | Should -Be '11111111-2222-3333-4444-555555555555'
+        $loaded.Cloud.Organization | Should -Be 'contoso.onmicrosoft.com'
+        $made.Hash | Should -Be (Get-FileHash -LiteralPath $made.Path).Hash.ToLowerInvariant()
     }
-    It 'shows the objects with their Check and their batch, and filters them as typed' {
-        $table = & $script:Gui { , $script:Gui.Tables.Convert }
-        $table.Rows.Count | Should -Be 3
-        $table.Select("InCloud = '1'")[0]['ObjectGuid'] | Should -Be $script:Alice
-        $table.Select("ObjectGuid = '$script:Bob'")[0]['StatusText'] | Should -Be 'Not ready'
-        $script:C.ConvertFilter.Text = 'COMPTA'
-        & $script:Gui { Update-PraGuiFilter -Page Convert }
-        $table.DefaultView.Count | Should -Be 1
-        $script:C.ConvertFilter.Text = ''
-        $script:C.ConvertStateFilter.SelectedItem = 'Not converted'
-        $table.DefaultView.Count | Should -Be 2
-        $script:C.ConvertStateFilter.SelectedIndex = 0
-        $table.DefaultView.Count | Should -Be 3
+    It 'writes an empty wave size as 0, which the engine reads as "the same as the temporary licences", and keeps the licences kept free' {
+        $answer = & $script:Gui {
+            param($root, $config)
+            $zero = [int](ConvertTo-PcmGuiWholeNumber '')
+            $made = New-PcmGuiRunConfig -Root $root -ConfigPath $config -Overrides @{ Licensing = @{ Shared = @{ Parallel = 40; KeepFree = 3 } }; Recover = @{ WaveSize = $zero } }
+            $loaded = Import-PcmConfiguration -Path $made.Path -Root $root
+            [pscustomobject]@{ Zero = $zero; Size = (Get-PcmRecoverWaveSize $loaded); Keep = $loaded.Licensing.Shared.KeepFree; Keys = @($made.Keys) }
+        } $script:Tool $script:Fixture.Config
+        $answer.Zero | Should -Be 0
+        $answer.Size | Should -Be 40
+        $answer.Keep | Should -Be 3
+        @($answer.Keys) | Should -Be @('Licensing.Shared.KeepFree', 'Licensing.Shared.Parallel', 'Recover.WaveSize')
     }
-    It 'ticks only the ready objects not converted, and the ticks choose the wave' {
-        & $script:Gui { Set-PraGuiTicks -Page Convert -Shown }
-        & $script:Gui { Get-PraGuiTicked $script:Gui.Tables.Convert } | Should -Be @($script:Compta)
-        $script:C.ConvertWave.IsChecked | Should -BeTrue
-        $selection = & $script:Gui { Get-PraGuiSelection -Page Convert }
-        $selection.ConfigKey | Should -Be (Get-FileHash -LiteralPath $script:State.Config -Algorithm SHA256).Hash
-        $selection.Key | Should -Be (Get-PraGuiSelectionKey -Prefix ('Convert|{0}|config|{1}' -f $script:State.Snapshot, $selection.ConfigKey) -Guids @($script:Compta))
-        $script:C.ConvertTicked.Text | Should -BeLike '1 ticked*'
+    It 'gives the configuration file itself when nothing was changed, and refuses a change the engine would refuse' {
+        $same = New-PcmGuiRunConfig -Root $script:Tool -ConfigPath $script:Fixture.Config
+        $same.Path | Should -Be $script:Fixture.Config
+        $same.Base | Should -BeNullOrEmpty
+        { New-PcmGuiRunConfig -Root $script:Tool -ConfigPath $script:Fixture.Config -Overrides @{ Cloud = @{ SignIn = 'Magic' } } } | Should -Throw '*not valid*SignIn*'
+        { New-PcmGuiRunConfig -Root $script:Tool -ConfigPath (Join-Path $TestDrive 'missing.psd1') -Overrides @{ Environment = 'X' } } | Should -Throw '*not found*'
     }
-    It 'opens Apply only after a preview of the same selection, and closes it when the selection changes' {
-        $script:C.ConvertApply.IsEnabled | Should -BeFalse
-        $csv = Join-Path $script:State.Reports 'PRA2_preview_test.csv'
-        Write-TestCsv -Path $csv -Rows @([ordered]@{ Identity = 'compta@contoso.com'; Kind = 'Shared'; ObjectGuid = $script:Compta; FinalStatus = 'Planned' })
-        & $script:Gui {
-            param($csv)
-            $selection = Get-PraGuiSelection -Page Convert
-            Complete-PraGuiAction -Run @{ Request = @{ Action = 'Convert'; Mode = 'Preview'; IdentityPath = 'wave.csv' }; Selection = $selection } -Result ([pscustomobject]@{ planned = 1; csvReport = $csv; exitCode = 0 })
-        } $csv
-        $script:C.ConvertApply.IsEnabled | Should -BeTrue
-        $script:C.ConvertHint.Text | Should -BeLike '*1 planned (0 user(s), 1 shared)*'
-        & $script:Gui { Set-PraGuiTicks -Page Convert }
-        $script:C.ConvertApply.IsEnabled | Should -BeFalse
-        $script:C.ConvertHint.Text | Should -BeLike 'A wave: tick its objects*'
+    It 'writes text, numbers, booleans, lists and sections that PowerShell reads back unchanged' {
+        $text = ConvertTo-PcmGuiDataLiteral @{ A = "it's"; B = 3; C = $true; D = @('x', 'y'); E = @{ F = '' }; G = @() }
+        $back = & ([scriptblock]::Create($text))
+        $back.A | Should -Be "it's"
+        $back.B | Should -Be 3
+        $back.C | Should -BeTrue
+        $back.D | Should -Be @('x', 'y')
+        $back.E.F | Should -Be ''
+        @($back.G).Count | Should -Be 0
     }
-    It 'runs nothing when the typed confirmation is refused' {
-        & $script:Gui {
-            $script:Gui.Controls.ConvertAll.IsChecked = $true
-            $selection = Get-PraGuiSelection -Page Convert
-            $script:Gui.Pending.Convert = @{ Key = $selection.Key; Guard = $selection.Key; Resume = $false; Batch = ''; Request = @{ Action = 'Convert'; Mode = 'Preview' }; Selection = $selection
-                Planned = 3; Tone = 'Success'; Confirm = 'three objects'; Hint = 'preview ok' }
-            $script:Gui.Hooks.Confirm = { param($Word, $Title, $Text, $Command) $global:PraGuiConfirm = "$Word|$Command"; $false }
-            Start-PraGuiApply -Page Convert
+}
+
+Describe 'Console: the snapshot, the journal and the lookups' {
+    It 'reads the configuration, the snapshot, the objects and the journal without changing anything' {
+        $script:State.ConfigError | Should -BeNullOrEmpty
+        $script:State.Snapshot.id | Should -Be 42
+        @($script:State.Objects).Count | Should -Be 24
+        @($script:State.Batches).Count | Should -Be 4
+        (Get-PcmGuiSnapshotInfo -State $script:State).MaxAgeDays | Should -Be 2
+        [math]::Round((Get-PcmGuiSnapshotInfo -State $script:State).AgeHours) | Should -BeGreaterOrEqual 13
+    }
+    It 'reports an unreadable file in the state instead of throwing' {
+        $broken = Join-Path $TestDrive 'broken.psd1'
+        [IO.File]::WriteAllText($broken, '@{ Environment = ''PROD'' ; Scope = @{ Mode = ''Magic'' } }')
+        (Read-PcmGuiState -Root $script:Tool -ConfigPath $broken).ConfigError | Should -BeLike '*Scope.Mode*'
+    }
+    It 'finds a mailbox by any identity, in any letter case (<Text>)' -TestCases @(
+        @{ Text = 'ADELE.VANCE@CONTOSO.COM' }, @{ Text = 'adelevance' }, @{ Text = 'Adele Vance' }, @{ Text = 'A0000000-0000-0000-0000-000000000001' }, @{ Text = '{a0000000-0000-0000-0000-000000000001}' }) {
+        param($Text)
+        @(Find-PcmGuiMailbox -State $script:State -Text $Text).Count | Should -Be 1
+    }
+    It 'finds nothing for an unknown identity or an empty text' {
+        @(Find-PcmGuiMailbox -State $script:State -Text 'nobody@contoso.com').Count | Should -Be 0
+        @(Find-PcmGuiMailbox -State $script:State -Text '  ').Count | Should -Be 0
+    }
+    It 'lists the OUs of the snapshot with the mailboxes under each, sub-OUs included' {
+        $units = @(Get-PcmGuiOuList -State $script:State)
+        ($units | Where-Object { $_.Name -eq 'contoso.com/Paris' }).Count | Should -Be 12
+        ($units | Where-Object { $_.Name -eq 'contoso.com/Paris/Users' }).Count | Should -Be 12
+        ($units | Where-Object { $_.Name -eq 'contoso.com/Lyon' }).Count | Should -Be 8
+        @($units | Where-Object { $_.Name -eq 'contoso.com' }).Count | Should -Be 0
+    }
+    It 'matches an OU given as a path or as a distinguished name, in any letter case, sub-OUs included' -TestCases @(
+        @{ Text = 'CONTOSO.COM/paris'; Count = 12 }, @{ Text = 'contoso.com/Paris/Users'; Count = 12 }, @{ Text = 'OU=Users,OU=Paris,DC=contoso,DC=com'; Count = 12 }
+        @{ Text = 'ou=lyon,dc=CONTOSO,dc=com'; Count = 8 }, @{ Text = 'contoso.com/Shared'; Count = 4 }, @{ Text = 'contoso.com/Nowhere'; Count = 0 }) {
+        param($Text, $Count)
+        @(Get-PcmGuiOuMatch -State $script:State -Text $Text).Count | Should -Be $Count
+    }
+    It 'finds the group Collect captured by name, account name, DN or ID, and counts its members and the ones that are not mailboxes' -TestCases @(
+        @{ Text = 'pra-wave1' }, @{ Text = 'PRA-WAVE1' }, @{ Text = 'cn=pra-wave1,ou=groups,dc=contoso,dc=com' }, @{ Text = 'B0000000-0000-0000-0000-000000000001' }) {
+        param($Text)
+        $found = Get-PcmGuiGroupInSnapshot -State $script:State -Value $Text
+        $found.HasTables | Should -BeTrue
+        $found.Count | Should -Be 1
+        $found.Name | Should -Be 'PRA-Wave1'
+        $found.Members | Should -Be 26
+        $found.Mailboxes | Should -Be 24
+        $found.Skipped | Should -Be 2
+    }
+    It 'says a group is not in the snapshot (it will be looked for in Microsoft Entra), also for a snapshot written before groups were captured' {
+        (Get-PcmGuiGroupInSnapshot -State $script:State -Value 'Nobody').Count | Should -Be 0
+        $old = New-DocumentationToolCopy -Repository $script:Repo -Destination (Join-Path $TestDrive 'old-tool')
+        $fixture = New-ConsoleFixture -ToolRoot $old
+        $connection = Open-PcmStore -Path (Join-Path $old 'data\PraCloudMailbox.db') -Root $old
+        try { $null = Invoke-PcmSql $connection 'DROP TABLE target_member'; $null = Invoke-PcmSql $connection 'DROP TABLE target_group' } finally { Close-PcmStore $connection }
+        $state = Read-PcmGuiState -Root $old -ConfigPath $fixture.Config
+        $answer = Get-PcmGuiGroupInSnapshot -State $state -Value 'PRA-Wave1'
+        $answer.HasTables | Should -BeFalse
+        $answer.Count | Should -Be 0
+        $answer.Error | Should -BeNullOrEmpty
+    }
+    It 'sums up each Convert batch: converted, left, waiting for Recover (the case of the object IDs ignored)' {
+        $summary = @(Get-PcmGuiBatchSummary -State $script:State)
+        ($summary | Where-Object { $_.Id -eq '1a2b3c4d' }).Waiting | Should -Be 24
+        $partial = $summary | Where-Object { $_.Id -eq '5e6f7a8b' }
+        $partial.Left | Should -Be 8
+        $partial.Converted | Should -Be 12
+        $rolled = $summary | Where-Object { $_.Id -eq '9c8d7e6f' }
+        $rolled.Waiting | Should -Be 2
+        $rolled.Recover | Should -BeLike 'Partial*'
+        $rolled.Back.Contains('A0000000-0000-0000-0000-000000000001') | Should -BeTrue
+    }
+    It 'builds the batch lists of the Task page: batches to continue, to roll back, rollbacks to continue, batches to follow' {
+        $continue = @(Get-PcmGuiBatchEntry -State $script:State -Kind ContinueConvert)
+        ($continue | Where-Object { $_.BatchId -eq '5e6f7a8b' }).Selectable | Should -BeTrue
+        ($continue | Where-Object { $_.BatchId -eq '1a2b3c4d' }).Selectable | Should -BeFalse
+        ($continue | Where-Object { $_.BatchId -eq '1a2b3c4d' }).State | Should -Be 'Complete'
+        $back = @(Get-PcmGuiBatchEntry -State $script:State -Kind Rollback)
+        ($back | Where-Object { $_.BatchId -eq '1a2b3c4d' }).State | Should -Be 'Can be rolled back'
+        ($back | Where-Object { $_.BatchId -eq '9c8d7e6f' }).State | Should -Be 'Partly rolled back'
+        $interrupted = @(Get-PcmGuiBatchEntry -State $script:State -Kind ContinueRollback)
+        $interrupted.Count | Should -Be 1
+        $interrupted[0].BatchId | Should -Be '9c8d7e6f'
+        @(Get-PcmGuiBatchEntry -State $script:State -Kind Follow).Count | Should -Be 4
+    }
+    It 'lists for a wave the mailboxes of a batch that are still in the cloud' {
+        @(Get-PcmGuiWaveRow -State $script:State -BatchId '1a2b3c4d').Count | Should -Be 24
+        @(Get-PcmGuiWaveRow -State $script:State -BatchId '9C8D7E6F').Count | Should -Be 2
+        (@(Get-PcmGuiWaveRow -State $script:State -BatchId '1a2b3c4d')[0]).Name | Should -Be 'Adele Vance'
+        @(Get-PcmGuiWaveRow -State $script:State -BatchId 'ffffffff').Count | Should -Be 0
+    }
+}
+
+Describe 'Console: the child process of a run' {
+    It 'runs a cloud action in its own console with the three standard streams redirected, and an end of file on its input' {
+        $pwsh = Get-PcmGuiEngine
+        $pwsh.Ok | Should -BeTrue
+        $command = [pscustomobject]@{ FilePath = $pwsh.Path; NeedsConsoleWindow = $true
+            Arguments = '-NoProfile -Command "[Console]::Out.WriteLine(\"out-line\"); [Console]::Error.WriteLine(\"err-line\"); $in = [Console]::In.ReadLine(); if ($null -eq $in) { exit 7 } else { exit 8 }"' }
+        $child = Start-PcmGuiChildProcess -Command $command -Root $script:Tool -EventPath (Join-Path $TestDrive 'child.events.jsonl') -StopPath (Join-Path $TestDrive 'child.stop')
+        $null = $child.Process.WaitForExit(30000)
+        $child.Process.ExitCode | Should -Be 7
+        $child.Output.Result | Should -BeLike '*out-line*'
+        $child.Errors.Result | Should -BeLike '*err-line*'
+        $child.Process.Dispose()
+    }
+    It 'gives the child the file of its events and the file that asks it to stop' {
+        $pwsh = Get-PcmGuiEngine
+        $command = [pscustomobject]@{ FilePath = $pwsh.Path; NeedsConsoleWindow = $false; Arguments = '-NoProfile -Command "[Console]::Out.WriteLine($env:PRA_EVENT_FILE + \"|\" + $env:PRA_STOP_FILE)"' }
+        $child = Start-PcmGuiChildProcess -Command $command -Root $script:Tool -EventPath (Join-Path $TestDrive 'x.events.jsonl') -StopPath (Join-Path $TestDrive 'x.stop')
+        $null = $child.Process.WaitForExit(30000)
+        $child.Output.Result.Trim() | Should -Be ((Join-Path $TestDrive 'x.events.jsonl') + '|' + (Join-Path $TestDrive 'x.stop'))
+        $child.Process.Dispose()
+    }
+}
+
+Describe 'Console: the real window, Convert of a group (synthetic engine, no live connection)' {
+    BeforeAll {
+        $script:Convert = Invoke-GuiChild -Body @'
+$o = [ordered]@{}
+$o.firstPage = $g.Page; $o.firstNext = $c.BtnNext.Content; $o.nextEnabled = $c.BtnNext.IsEnabled; $o.role = $c.RoleName.Text
+$o.page3Reachable = [bool](Mod { Test-PcmGuiPageReachable 3 }); $o.page5Reachable = [bool](Mod { Test-PcmGuiPageReachable 5 })
+$o.lights = $g.LightRows.Count
+Click 'BtnNext'
+$o.page = $g.Page
+$o.tiles = @{ Collect = $c.T_Collect.IsEnabled; Convert = $c.T_Convert.IsEnabled; Recover = $c.T_Recover.IsEnabled; Check = $c.T_Check.IsEnabled }
+$o.collectPill = $c.NT_Collect.Text; $o.cloudPill = $c.NT_Convert.Text
+$o.readyBeforeTask = [bool](Mod { Test-PcmGuiTaskReady })
+Check 'T_Convert'; Check 'S_Source_Group'
+$o.readyNoGroup = [bool](Mod { Test-PcmGuiTaskReady })
+Enter 'F_Group' 'pra-wave1'; Click 'BtnCheckGroup'
+WaitFor { -not $g.GroupLookup }
+$o.groupInfo = $c.GroupInfo.Text
+Check 'S_Scope_UsersOnly'
+$c.SettingsCard.Visibility = 'Visible'
+Enter 'F_Tenant' '11111111-2222-3333-4444-555555555555'
+$o.changed = @(Mod { Get-PcmGuiChangedSetting })
+$o.overrideKeys = @(Mod { (Get-PcmGuiOverride).Keys })
+$o.runLine = $c.RunLineSub.Text
+Check 'S_Scope_All'
+Click 'BtnNext'
+$o.verifyPage = $g.Page; $o.confirmEnabledBefore = $c.ConfirmBox.IsEnabled; $o.runEnabledBefore = $c.BtnNext.IsEnabled; $o.summaryBefore = $c.SumTitle.Text
+$o.applyRefused = ''
+try { Mod { Start-PcmGuiRun -Mode Apply } } catch { $o.applyRefused = $_.Exception.Message }
+Click 'BtnPreview'; WaitRun
+$a = Args_
+$o.previewArgs = @{ Action = $a.Action; Mode = $a.Mode; Group = $a.Group; Scope = $a.Scope; Force = $a.Force; BaseConfigPath = $a.BaseConfigPath; ConfigPath = $a.ConfigPath }
+$o.effectiveHasTenant = (Get-Content -LiteralPath (Join-Path $root 'effective-copy.psd1') -Raw) -match '11111111-2222-3333-4444-555555555555'
+$o.previewed = $g.Previewed; $o.rows = $g.VerRows.Count; $o.firstRow = $g.VerRows[0].Status; $o.firstName = $g.VerRows[0].Upn
+$o.skippedRows = @($g.VerRows | Where-Object { $_.Status -eq 'Skip' }).Count; $o.sharedLast = $g.VerRows[$g.VerRows.Count - 1].Type
+$o.summary = $c.SumTitle.Text; $o.target = $c.TargetText.Text; $o.chips = @($c.Chips.Children | ForEach-Object { $_.Child.Text })
+$o.confirmEnabledAfter = $c.ConfirmBox.IsEnabled; $o.runEnabledAfter = $c.BtnNext.IsEnabled
+Enter 'ConfirmBox' ('conv' + [char]0x200B + 'ert'); $o.zeroWidthEnabled = $c.BtnNext.IsEnabled
+Enter 'ConfirmBox' 'recover'; $o.otherWordEnabled = $c.BtnNext.IsEnabled
+Enter 'ConfirmBox' ' Convert '; $o.typedEnabled = $c.BtnNext.IsEnabled
+Check 'S_Scope_UsersOnly'
+$o.afterChangePending = [bool]$g.Pending; $o.afterChangeRows = $g.VerRows.Count; $o.afterChangeBox = $c.ConfirmBox.Text; $o.afterChangeEnabled = $c.BtnNext.IsEnabled
+Check 'S_Scope_All'
+Click 'BtnPreview'; WaitRun
+Enter 'ConfirmBox' 'CONVERT'
+$o.finalEnabled = $c.BtnNext.IsEnabled
+Ask
+Click 'BtnNext'
+$o.runningPage = $g.Page; $o.stopVisible = $c.BtnStop.Visibility.ToString()
+WaitRun
+$a = Args_
+$o.applyArgs = @{ Action = $a.Action; Mode = $a.Mode; Group = $a.Group; Scope = $a.Scope; Force = $a.Force }
+$o.steps = @($g.Model.Steps | ForEach-Object { $_.Title })
+$o.beforeFirstStep = ($g.Model.Raw['s1'] -join "`n"); $o.lastStepRaw = $(if ($g.Model.Raw.ContainsKey('s7')) { $g.Model.Raw['s7'] -join "`n" } else { '' })
+$o.stepStatus = @($g.Model.Steps | ForEach-Object { $_.Status })
+$o.user6 = $g.Model.Objects['s6'].Count
+$o.questions = @($questions); $o.answer = (Get-Content -LiteralPath (Join-Path $root 'asked-answer.txt') -Raw).Trim()
+$o.lastValid = $g.LastRun.Valid; $o.lastLevel = $g.LastRun.Level
+$o.runPageAfter = $g.Page; $o.whatNext = $c.BtnNext.Content
+Click 'BtnNext'
+$o.nextPage = $g.Page; $o.pill = $c.NextPillText.Text; $o.title = $c.NextTitle.Text; $o.batch = $c.BatchIdText.Text; $o.command = $c.NextCmd.Text; $o.result = $c.ResultText.Text
+$o.timeline = @($g.TimelineRows | ForEach-Object { '{0}|{1}' -f $_.Title, $_.Status })
+$o.stepsList = @($g.NextRows | ForEach-Object { $_.Text })
+$o.backEnabled = $c.BtnBack.IsEnabled; $o.nav3 = [bool](Mod { Test-PcmGuiPageReachable 3 })
+$o.configUnchanged = ((Get-FileHash -LiteralPath $fixture.Config -Algorithm SHA256).Hash -eq $configHash)
+Click 'BtnNext'
+$o.newTaskPage = $g.Page; $o.newTaskAction = $g.Action
+Done $o
+'@
+    }
+    It 'opens on Setup, with Next steps and Verify out of reach, the lights shown and the role found' {
+        $script:Convert.firstPage | Should -Be 1
+        $script:Convert.firstNext | Should -BeLike 'Choose a task*'
+        $script:Convert.nextEnabled | Should -BeTrue
+        $script:Convert.role | Should -Be 'Everything'
+        $script:Convert.page3Reachable | Should -BeFalse
+        $script:Convert.page5Reachable | Should -BeFalse
+        $script:Convert.lights | Should -Be 4
+    }
+    It 'offers every task when this computer can run them, and asks for a group before going on' {
+        $script:Convert.page | Should -Be 2
+        $script:Convert.tiles.Collect | Should -BeTrue
+        $script:Convert.tiles.Convert | Should -BeTrue
+        $script:Convert.readyBeforeTask | Should -BeFalse
+        $script:Convert.readyNoGroup | Should -BeFalse
+    }
+    It 'finds the group in the snapshot, whatever the letter case, and says how many members are skipped' {
+        $script:Convert.groupInfo | Should -BeLike 'Found in the snapshot (captured by Collect): PRA-Wave1 * 26 members including nested groups, 2 skipped (the Preview says why)'
+    }
+    It 'marks what was changed for this run only and keeps it out of the configuration file' {
+        @($script:Convert.changed) | Should -Be @('Scope', 'Tenant ID')
+        @($script:Convert.overrideKeys) | Should -Be @('Cloud')
+        $script:Convert.runLine | Should -BeLike '2 settings changed for this run only: Scope, Tenant ID.'
+        $script:Convert.configUnchanged | Should -BeTrue
+    }
+    It 'asks for a preview first: no run, no confirmation, and a refusal in plain words' {
+        $script:Convert.verifyPage | Should -Be 3
+        $script:Convert.confirmEnabledBefore | Should -BeFalse
+        $script:Convert.runEnabledBefore | Should -BeFalse
+        $script:Convert.summaryBefore | Should -Be 'Preview needed before running'
+        $script:Convert.applyRefused | Should -BeLike '*preview and the typed confirmation*'
+    }
+    It 'previews with the source, the scope and the copy of the configuration, never with -Force' {
+        $script:Convert.previewArgs.Action | Should -Be 'Convert'
+        $script:Convert.previewArgs.Mode | Should -Be 'Preview'
+        $script:Convert.previewArgs.Group | Should -Be 'pra-wave1'
+        $script:Convert.previewArgs.Scope | Should -BeNullOrEmpty
+        $script:Convert.previewArgs.Force | Should -BeFalse
+        $script:Convert.previewArgs.BaseConfigPath | Should -BeLike '*PraCloudMailbox.config.psd1'
+        $script:Convert.previewArgs.ConfigPath | Should -BeLike '*effective.config.psd1'
+        $script:Convert.effectiveHasTenant | Should -BeTrue
+    }
+    It 'shows what needs attention first, then the users, then the shared mailboxes, with the counts of the engine' {
+        $script:Convert.previewed | Should -BeTrue
+        $script:Convert.rows | Should -Be 26
+        $script:Convert.firstRow | Should -Be 'Warn'
+        $script:Convert.firstName | Should -Be 'alex.wilber@contoso.com'
+        $script:Convert.skippedRows | Should -Be 2
+        $script:Convert.sharedLast | Should -Be 'Shared'
+        $script:Convert.summary | Should -Be '24 mailboxes will be converted · nothing blocking'
+        $script:Convert.target | Should -BeLike 'Group pra-wave1 (captured by Collect, snapshot 42)*'
+        @($script:Convert.chips) | Should -Contain 'Users 20'
+        @($script:Convert.chips) | Should -Contain 'Shared 4'
+        @($script:Convert.chips) | Should -Contain 'Skipped 2'
+        @($script:Convert.chips) | Should -Contain '0 blocking'
+        @($script:Convert.chips) | Should -Contain '1 warning'
+    }
+    It 'unlocks Run only with the word of the action, in any letter case, never with an invisible character' {
+        $script:Convert.confirmEnabledAfter | Should -BeTrue
+        $script:Convert.runEnabledAfter | Should -BeFalse
+        $script:Convert.zeroWidthEnabled | Should -BeFalse
+        $script:Convert.otherWordEnabled | Should -BeFalse
+        $script:Convert.typedEnabled | Should -BeTrue
+    }
+    It 'voids the preview and the confirmation when the task or a setting changes' {
+        $script:Convert.afterChangePending | Should -BeFalse
+        $script:Convert.afterChangeRows | Should -Be 0
+        $script:Convert.afterChangeBox | Should -Be ''
+        $script:Convert.afterChangeEnabled | Should -BeFalse
+        $script:Convert.finalEnabled | Should -BeTrue
+    }
+    It 'runs with -Force once confirmed, and follows the steps of the engine with their objects' {
+        $script:Convert.runningPage | Should -Be 4
+        $script:Convert.stopVisible | Should -Be 'Visible'
+        $script:Convert.applyArgs.Mode | Should -Be 'Apply'
+        $script:Convert.applyArgs.Force | Should -BeTrue
+        $script:Convert.applyArgs.Group | Should -Be 'pra-wave1'
+        $script:Convert.applyArgs.Scope | Should -BeNullOrEmpty
+        @($script:Convert.steps).Count | Should -Be 7
+        $script:Convert.steps[5] | Should -Be '6. Convert the users'
+        @($script:Convert.stepStatus | Select-Object -Unique) | Should -Not -Contain 'Running'
+        $script:Convert.beforeFirstStep | Should -BeLike '*Cloud modules: Microsoft.Graph.Authentication*'
+        $script:Convert.lastStepRaw | Should -Not -BeLike '*Cloud modules*'
+        $script:Convert.user6 | Should -Be 20
+        $script:Convert.lastValid | Should -BeTrue
+        $script:Convert.runPageAfter | Should -Be 4
+        $script:Convert.whatNext | Should -BeLike 'What next?*'
+    }
+    It 'asks the question of the run in the window and answers it in the file the run named' {
+        @($script:Convert.questions).Count | Should -Be 1
+        $script:Convert.questions[0] | Should -BeLike 'Start a delta synchronisation*'
+        $script:Convert.answer | Should -Be 'yes'
+    }
+    It 'ends on the Next steps page with the batch ID, the command to roll it back, the timeline and no way back to Verify' {
+        $script:Convert.nextPage | Should -Be 5
+        $script:Convert.pill | Should -BeLike 'Done*warning'
+        $script:Convert.title | Should -Be 'The conversion is complete'
+        $script:Convert.batch | Should -Be '1a2b3c4d'
+        $script:Convert.command | Should -BeLike '.\Invoke-PraCloudMailbox.ps1 -Action Recover -Batch 1a2b3c4d'
+        $script:Convert.result | Should -BeLike 'Converted 24 (20 users, 4 shared)*1 warning*'
+        @($script:Convert.timeline) | Should -Be @('Collect|Ok', 'Convert|Warn', 'Recover|Skip')
+        @($script:Convert.stepsList).Count | Should -BeGreaterOrEqual 4
+        $script:Convert.stepsList[0] | Should -BeLike 'Open the report and read the 1 warning*'
+        $script:Convert.nav3 | Should -BeFalse
+        $script:Convert.newTaskPage | Should -Be 2
+        $script:Convert.newTaskAction | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Console: the real window, a wave of a rollback, the stop file and the closing of the window' {
+    BeforeAll {
+        $script:Wave = Invoke-GuiChild -Body @'
+$o = [ordered]@{}
+Click 'BtnNext'; Check 'T_Recover'
+$o.batches = @($g.BatchRows | ForEach-Object { '{0}|{1}|{2}' -f $_.BatchId, $_.State, $_.Selectable })
+$o.readyNoBatch = [bool](Mod { Test-PcmGuiTaskReady })
+$c.BatchList.SelectedItem = $g.BatchRows[0]; Pump 50
+$o.envLock = $c.EnvLock.Visibility.ToString(); $o.fEnvEnabled = $c.F_Env.IsEnabled
+$o.waveRows = $g.WaveRows.Count; $o.readyWhole = [bool](Mod { Test-PcmGuiTaskReady })
+Check 'S_Wave_Wave'
+$o.readyNoTick = [bool](Mod { Test-PcmGuiTaskReady })
+foreach ($row in @($g.WaveRows | Select-Object -First 3)) { $row.Checked = $true }
+Mod { Invoke-PcmGuiChange }
+$o.count = $c.WaveCount.Text; $o.readyTicked = [bool](Mod { Test-PcmGuiTaskReady }); $o.happen = $c.HappenText.Text
+Click 'BtnNext'
+Click 'BtnPreview'; WaitRun
+$a = Args_
+$o.previewArgs = @{ Action = $a.Action; Mode = $a.Mode; Batch = $a.Batch; Csv = [bool]$a.CsvPath }
+$o.waveCsv = @(Import-Csv -LiteralPath (Join-Path $root 'wave-copy.csv') | ForEach-Object { $_.Identity })
+$o.waveFile = (Get-Content -LiteralPath (Join-Path $root 'wave-copy.csv') -TotalCount 1)
+$o.confirmText = $c.ConfirmText.Text; $o.summary = $c.SumTitle.Text
+Enter 'ConfirmBox' 'recover'
+Scenario 2; Hold 'users'
+Click 'BtnNext'
+WaitFor { $g.Model.Objects.ContainsKey('s5') -and $g.Model.Objects['s5'].Count -ge 2 }
+$o.stopEnabledBefore = $c.BtnStop.IsEnabled
+Click 'BtnStop'
+$o.stopFile = Test-Path -LiteralPath $g.Run.StopPath
+$o.stopEnabledAfter = $c.BtnStop.IsEnabled; $o.pillStopping = $c.RunPillText.Text
+$g.Form.Close(); Pump 100
+$o.stillOpen = $g.Form.IsVisible; $o.closingMessage = ($g.Lines | Select-Object -Last 1).Text
+$o.backEnabledRunning = $c.BtnBack.IsEnabled
+Release 'users'
+WaitRun
+$o.level = $g.LastRun.Level; $o.stopped = $g.LastRun.Stopped; $o.exit = $g.LastRun.ExitCode
+Click 'BtnNext'
+$o.pill = $c.NextPillText.Text; $o.title = $c.NextTitle.Text; $o.continueVisible = $c.ContinueCmdBox.Visibility.ToString(); $o.continueCmd = $c.ContinueCmd.Text
+$o.stepsList = @($g.NextRows | ForEach-Object { $_.Text })
+Done $o
+'@
+    }
+    It 'lists the Convert batches that can be rolled back, with their state, and asks for a batch first' {
+        @($script:Wave.batches) | Should -Contain '1a2b3c4d|Can be rolled back|True'
+        @($script:Wave.batches) | Should -Contain '9c8d7e6f|Partly rolled back|True'
+        $script:Wave.readyNoBatch | Should -BeFalse
+    }
+    It 'locks the environment to the one of the batch and lists the mailboxes in the cloud for a wave' {
+        $script:Wave.envLock | Should -Be 'Visible'
+        $script:Wave.fEnvEnabled | Should -BeFalse
+        $script:Wave.waveRows | Should -Be 24
+        $script:Wave.readyWhole | Should -BeTrue
+        $script:Wave.readyNoTick | Should -BeFalse
+        $script:Wave.count | Should -Be '3 ticked of 24 in the cloud'
+        $script:Wave.readyTicked | Should -BeTrue
+        $script:Wave.happen | Should -BeLike '*puts 3 ticked mailboxes back on-premises*'
+    }
+    It 'gives the ticked objects to the engine as a CSV file with -CsvPath, on the batch' {
+        $script:Wave.previewArgs.Action | Should -Be 'Recover'
+        $script:Wave.previewArgs.Batch | Should -Be '1a2b3c4d'
+        $script:Wave.previewArgs.Csv | Should -BeTrue
+        @($script:Wave.waveCsv) | Should -Be @('a0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000003')
+        $script:Wave.waveFile | Should -Match 'Identity,Name'
+        $script:Wave.confirmText | Should -BeLike 'Type RECOVER*'
+        $script:Wave.summary | Should -BeLike '3 mailboxes will be rolled back*'
+    }
+    It 'asks the run to stop after the current object with the stop file, and refuses to close the window while the run goes on' {
+        $script:Wave.stopEnabledBefore | Should -BeTrue
+        $script:Wave.stopFile | Should -BeTrue
+        $script:Wave.stopEnabledAfter | Should -BeFalse
+        $script:Wave.pillStopping | Should -Be 'Stopping'
+        $script:Wave.stillOpen | Should -BeTrue
+        $script:Wave.closingMessage | Should -BeLike 'This window cannot be closed while a run is going*'
+        $script:Wave.backEnabledRunning | Should -BeFalse
+    }
+    It 'ends a stopped run normally, says it stopped as asked and gives the command to continue the batch' {
+        $script:Wave.exit | Should -Be 2
+        $script:Wave.level | Should -Be 'Pending'
+        $script:Wave.stopped | Should -BeTrue
+        $script:Wave.pill | Should -Be 'Stopped as asked'
+        $script:Wave.continueVisible | Should -Be 'Visible'
+        $script:Wave.continueCmd | Should -BeLike '*-Action Recover*-Batch 1a2b3c4d*'
+    }
+}
+
+Describe 'Console: the real window on a computer that can only collect, Collect in PowerShell 7 with a console of its own' {
+    BeforeAll {
+        $script:Collect = Invoke-GuiChild -Kind Collect -Body @'
+$o = [ordered]@{}
+$o.role = $c.RoleName.Text
+$o.settingsStore = $c.Row_Store.Visibility.ToString(); $o.settingsCloud = $c.CloudFields.Visibility.ToString()
+Click 'BtnNext'
+$o.tiles = @{ Collect = $c.T_Collect.IsEnabled; Convert = $c.T_Convert.IsEnabled; Recover = $c.T_Recover.IsEnabled; Check = $c.T_Check.IsEnabled }
+$o.cloudPill = $c.NT_Check.Text
+Check 'T_Collect'; Check 'C_Scope_UsersOnly'
+$o.scopeField = Mod { Get-PcmGuiField 'Scope' }; $o.collectView = $c.CollectPanel.Visibility.ToString(); $o.sourceBox = $c.SourceBox.Visibility.ToString()
+Click 'BtnNext'
+$o.confirmText = $c.ConfirmText.Text
+Click 'BtnPreview'; WaitRun
+$a = Args_
+$o.previewMode = $a.Mode; $o.previewScope = $a.Scope
+Enter 'ConfirmBox' 'collect'
+$o.runLabel = $c.BtnNext.Content; $o.runEnabled = $c.BtnNext.IsEnabled
+Click 'BtnNext'; WaitRun; Click 'BtnNext'
+$a = Args_
+$o.applyMode = $a.Mode; $o.applyForce = $a.Force; $o.applyScope = $a.Scope; $o.applyBatch = [string]$a.Batch
+$o.steps = @($g.Model.Steps | ForEach-Object { $_.Title })
+$o.title = $c.NextTitle.Text; $o.batchBox = $c.BatchIdBox.Visibility.ToString()
+Done $o
+'@
+    }
+    It 'finds the role Collect and shows every setting: the snapshot file and the Microsoft 365 connection' {
+        $script:Collect.role | Should -Be 'Collect'
+        $script:Collect.settingsStore | Should -Be 'Visible'
+        $script:Collect.settingsCloud | Should -Be 'Visible'
+    }
+    It 'greys the three cloud tiles with the reason, and offers Collect with its own scope' {
+        $script:Collect.tiles.Collect | Should -BeTrue
+        $script:Collect.tiles.Convert | Should -BeFalse
+        $script:Collect.tiles.Recover | Should -BeFalse
+        $script:Collect.tiles.Check | Should -BeFalse
+        $script:Collect.cloudPill | Should -Be 'Needs the cloud modules and a sign-in'
+        $script:Collect.scopeField | Should -Be 'UsersOnly'
+        $script:Collect.collectView | Should -Be 'Visible'
+        $script:Collect.sourceBox | Should -Be 'Collapsed'
+    }
+    It 'previews then writes the snapshot after the word COLLECT' {
+        $script:Collect.confirmText | Should -BeLike 'Type COLLECT*'
+        $script:Collect.previewMode | Should -Be 'Preview'
+        $script:Collect.previewScope | Should -Be 'UsersOnly'
+        $script:Collect.runLabel | Should -Be 'Collect the snapshot'
+        $script:Collect.runEnabled | Should -BeTrue
+        $script:Collect.applyMode | Should -Be 'Apply'
+        $script:Collect.applyForce | Should -BeTrue
+        $script:Collect.applyBatch | Should -BeNullOrEmpty
+        @($script:Collect.steps).Count | Should -Be 6
+        $script:Collect.title | Should -Be 'The snapshot is written'
+        $script:Collect.batchBox | Should -Be 'Collapsed'
+    }
+}
+
+Describe 'Console: the button that schedules the daily Collect' {
+    BeforeAll {
+        $script:Scheduled = Invoke-GuiChild -Kind Collect -Body @'
+$o = [ordered]@{}
+$global:probes = 0; $inner = $g.Probe; $g.Probe = { param($r) $global:probes++; & $inner $r }.GetNewClosure()
+Click 'BtnNext'
+$o.hiddenOnOtherTask = $c.BtnSchedule.IsVisible
+Check 'T_Collect'
+$o.visible = $c.BtnSchedule.IsVisible; $o.enabled = $c.BtnSchedule.IsEnabled; $o.label = [string]$c.BtnSchedule.Content
+$before = $global:probes
+Click 'BtnSchedule'; WaitRun
+$a = Args_
+$o.action = $a.Action; $o.mode = $a.Mode; $o.force = $a.Force; $o.batch = [string]$a.Batch; $o.identity = [string]$a.Identity
+$o.question = @($questions)[-1]
+$o.page = $g.Page
+$o.runTitle = $c.RunTitle.Text
+$o.steps = @($g.Model.Steps | ForEach-Object { $_.EngineTitle })
+$o.refreshed = ($global:probes - $before)
+$o.requestAction = $g.LastRun.Request.Action
+$o.valid = $g.LastRun.Valid
+Click 'BtnNext'
+$o.page2 = $g.Page; $o.title = $c.NextTitle.Text; $o.lead = $c.NextLead.Text
+$o.next = @($g.NextRows | ForEach-Object { $_.Text })
+$o.nextCmd = $c.NextCmd.Text
+Done $o
+'@
+    }
+    It 'shows the button on the Collect page only, and enabled when this computer can collect' {
+        $script:Scheduled.hiddenOnOtherTask | Should -BeFalse
+        $script:Scheduled.visible | Should -BeTrue
+        $script:Scheduled.enabled | Should -BeTrue
+        $script:Scheduled.label | Should -Be 'Schedule the daily Collect'
+    }
+    It 'asks one question, then runs the action Schedule in Apply mode like the others, with no objects and no preview' {
+        $script:Scheduled.question | Should -BeLike 'Schedule the daily Collect on this computer?*asks for the account that runs it*View-Only Organization Management*started as administrator*'
+        $script:Scheduled.action | Should -Be 'Schedule'
+        $script:Scheduled.mode | Should -Be 'Apply'
+        $script:Scheduled.force | Should -BeTrue
+        $script:Scheduled.batch | Should -BeNullOrEmpty
+        $script:Scheduled.identity | Should -BeNullOrEmpty
+        $script:Scheduled.runTitle | Should -Be 'Schedule the daily Collect'
+        @($script:Scheduled.steps) | Should -Be @('Configuration', 'Account', 'Exchange access', 'Batch logon right', 'Scheduled task')
+    }
+    It 'looks at the lights again when the run is over, and says what to do next' {
+        $script:Scheduled.refreshed | Should -BeGreaterOrEqual 1
+        $script:Scheduled.requestAction | Should -Be 'Schedule'
+        $script:Scheduled.valid | Should -BeTrue
+        $script:Scheduled.page2 | Should -Be 5
+        $script:Scheduled.title | Should -Be 'The daily Collect is scheduled'
+        ($script:Scheduled.next -join ' ') | Should -BeLike '*Start-ScheduledTask -TaskName ''PraCloudMailbox Collect''*Daily Collect*'
+        $script:Scheduled.nextCmd | Should -BeLike '*Invoke-PraCloudMailbox.ps1 -Action Check*'
+    }
+}
+
+Describe 'Console: the real window when Exchange cannot be reached from this computer' {
+    BeforeAll {
+        $script:Down = Invoke-GuiChild -Kind ExchangeDown -Body @'
+$o = [ordered]@{}
+$o.role = $c.RoleName.Text; $o.roleText = $c.RoleText.Text
+$o.exchangeLight = @($g.Detect.Lights | Where-Object { $_.Name -eq 'Exchange reachable' } | ForEach-Object { '{0}|{1}' -f $_.Status, $_.Detail })
+Click 'BtnNext'
+$o.tiles = @{ Collect = $c.T_Collect.IsEnabled; Convert = $c.T_Convert.IsEnabled; Check = $c.T_Check.IsEnabled }
+$o.collectPill = $c.NT_Collect.Text
+Check 'T_Collect'
+$o.blocker = Mod { Get-PcmGuiBlocker }
+Done $o
+'@
+        $script:Up = Invoke-GuiChild -Kind Cloud -Body @'
+$o = [ordered]@{}
+$o.role = $c.RoleName.Text
+$o.exchangeLight = @($g.Detect.Lights | Where-Object { $_.Name -eq 'Exchange reachable' } | ForEach-Object { '{0}|{1}' -f $_.Status, $_.Detail })
+Click 'BtnNext'
+$o.tiles = @{ Collect = $c.T_Collect.IsEnabled; Convert = $c.T_Convert.IsEnabled; Check = $c.T_Check.IsEnabled }
+Done $o
+'@
+    }
+    It 'lights Exchange reachable amber, keeps the cloud actions and greys Collect with the reason' {
+        $script:Down.role | Should -Be 'Cloud actions'
+        $script:Down.roleText | Should -BeLike '*Collect needs Exchange.Server to be set and reachable*'
+        @($script:Down.exchangeLight)[0] | Should -BeLike 'Warn|A remote session to ex01.contoso.com cannot be opened*The server did not answer.*'
+        $script:Down.tiles.Collect | Should -BeFalse
+        $script:Down.tiles.Convert | Should -BeTrue
+        $script:Down.tiles.Check | Should -BeTrue
+        $script:Down.collectPill | Should -Be 'Exchange not reachable'
+        $script:Down.blocker | Should -BeLike 'This computer cannot run Collect: A remote session to ex01.contoso.com cannot be opened*'
+    }
+    It 'lights Exchange reachable green and offers every action when the remote session opens' {
+        $script:Up.role | Should -Be 'Everything'
+        @($script:Up.exchangeLight)[0] | Should -BeLike 'Ok|Exchange answers on ex01.contoso.com*'
+        $script:Up.tiles.Collect | Should -BeTrue
+        $script:Up.tiles.Convert | Should -BeTrue
+    }
+}
+
+Describe 'Console: the real window, a follow-up check, the other sources, a failure and the theme' {
+    BeforeAll {
+        $script:Other = Invoke-GuiChild -Body @'
+$o = [ordered]@{}
+Click 'BtnNext'; Check 'T_Check'
+$o.modes = @($c.Mode_New.Content, $c.Mode_Continue.Content)
+Check 'Mode_Continue'
+$o.followBatches = $g.BatchRows.Count
+$c.BatchList.SelectedItem = ($g.BatchRows | Where-Object { $_.BatchId -eq '1a2b3c4d' } | Select-Object -First 1); Pump 50
+$o.expectVisible = $c.CheckPanel.Visibility.ToString()
+Check 'S_Expect_Deprovisioned'; $c.F_Once.IsChecked = $true; Pump 50
+$o.happen = $c.HappenText.Text
+Click 'BtnNext'
+$o.verifySummary = $c.SumTitle.Text; $o.previewVisible = $c.BtnPreview.Visibility.ToString(); $o.runLabel = $c.BtnNext.Content; $o.runEnabled = $c.BtnNext.IsEnabled
+Click 'BtnNext'
+WaitRun
+Click 'BtnNext'
+$a = Args_
+$o.checkArgs = @{ Action = $a.Action; Batch = $a.Batch; Expect = $a.Expect; Once = $a.Once; Force = $a.Force }
+$o.checkNext = $c.NextTitle.Text
+Click 'BtnNext'
+# The other ways to pick the objects of a new conversion.
+Check 'T_Convert'; Check 'S_Source_Single'
+Enter 'F_Identity' 'ADELE.VANCE@CONTOSO.COM'; Mod { Update-PcmGuiView }
+$o.single = @{ Info = $c.IdentityInfo.Text; Ready = [bool](Mod { Test-PcmGuiTaskReady }); Identity = (Mod { (Get-PcmGuiWindowRequest).Identity }) }
+Enter 'F_Identity' 'nobody@contoso.com'; Mod { Update-PcmGuiView }
+$o.unknown = @{ Info = $c.IdentityInfo.Text; Ready = [bool](Mod { Test-PcmGuiTaskReady }) }
+Check 'S_Source_Ou'
+Click 'BtnPickOu'
+$o.ou = @{ Picked = $c.F_Ou.Text; Info = $c.OuInfo.Text; SearchBase = (Mod { (Get-PcmGuiWindowRequest).SearchBase }) }
+Enter 'F_Ou' 'OU=Lyon,DC=contoso,DC=com'; Mod { Update-PcmGuiView }
+$o.ouDn = $c.OuInfo.Text
+Check 'S_Source_Csv'
+Enter 'F_Csv' (Join-Path $root 'missing.csv'); Mod { Update-PcmGuiView }
+$o.csvMissing = @{ Info = $c.CsvInfo.Text; Ready = [bool](Mod { Test-PcmGuiTaskReady }) }
+$list = Join-Path $root 'list.csv'; [IO.File]::WriteAllText($list, "identity;note`r`nadele.vance@contoso.com;a`r`nalex.wilber@contoso.com;b`r`n")
+Enter 'F_Csv' $list
+$o.csv = @{ Info = $c.CsvInfo.Text; Ready = [bool](Mod { Test-PcmGuiTaskReady }); CsvPath = (Mod { (Get-PcmGuiWindowRequest).CsvPath }) }
+Check 'S_Source_All'
+$o.all = @{ Text = $c.Row_All.Text; Ready = [bool](Mod { Test-PcmGuiTaskReady }) }
+# A run that fails: the engine cannot sign in.
+[IO.File]::WriteAllText((Join-Path $root 'fail.flag'), '1')
+Check 'S_Source_Single'; Enter 'F_Identity' 'adele.vance@contoso.com'
+Click 'BtnNext'; Click 'BtnPreview'; WaitRun
+$o.failedPreview = @{ Previewed = $g.Previewed; Error = $g.PreviewError; Summary = $c.SumTitle.Text; Confirm = $c.ConfirmBox.IsEnabled }
+Mod { Show-PcmGuiPage 2 }
+Check 'T_Check'; Check 'S_Source_All'
+Mod { Show-PcmGuiPage 3 }
+Click 'BtnNext'; WaitRun; Click 'BtnNext'
+$o.failed = @{ Valid = $g.LastRun.Valid; Level = $g.LastRun.Level; Pill = $c.NextPillText.Text; Title = $c.NextTitle.Text; Lead = $c.NextLead.Text; Steps = @($g.NextRows | ForEach-Object { $_.Text }); Status = @($g.Model.Steps | ForEach-Object { $_.Status }) }
+# Interactive sign-in and a chosen snapshot, for this run only.
+Remove-Item (Join-Path $root 'fail.flag') -ErrorAction SilentlyContinue
+Mod { Show-PcmGuiPage 2 }
+Check 'T_Check'; Check 'S_Source_All'
+$c.SettingsCard.Visibility = 'Visible'
+Check 'S_Signin_Interactive'; Enter 'F_Upn' 'admin@contoso.com'; Check 'S_Snap_Specific'; Enter 'F_SnapId' '41'
+$o.interactive = @{ Override = (Mod { (Get-PcmGuiOverride) | ConvertTo-Json -Compress -Depth 4 }); RowAppId = $c.Row_AppId.Visibility.ToString(); RowUpn = $c.Row_Upn.Visibility.ToString(); Changed = @(Mod { Get-PcmGuiChangedSetting }); Number = (Mod { Get-PcmGuiSnapshotNumber }) }
+Enter 'F_SnapId' 'abc'
+$o.badSnapshot = $c.SettingsError.Text; $o.badNext = $c.BtnNext.IsEnabled
+Enter 'F_SnapId' '41'
+Mod { Show-PcmGuiPage 3 }
+Click 'BtnNext'; WaitRun
+$a = Args_
+$o.interactiveArgs = @{ Snapshot = $a.Snapshot; Base = [bool]$a.BaseConfigPath }
+$o.effective = (Get-Content -LiteralPath (Join-Path $root 'effective-copy.psd1') -Raw)
+$o.configUnchanged = ((Get-FileHash -LiteralPath $fixture.Config -Algorithm SHA256).Hash -eq $configHash)
+# The theme.
+$light = $g.Form.TryFindResource('PraBrandText').Color.ToString()
+Check 'Th_Dark'; $dark = $g.Form.TryFindResource('PraBrandText').Color.ToString(); Check 'Th_Light'
+$o.theme = @{ Light = $light; Dark = $dark }
+Done $o
+'@
+    }
+    It 'follows a batch with the expectation and the one-pass choice, without a preview' {
+        @($script:Other.modes) | Should -Be @('Check the snapshot', 'Follow a batch')
+        $script:Other.followBatches | Should -Be 4
+        $script:Other.expectVisible | Should -Be 'Visible'
+        $script:Other.happen | Should -BeLike 'This computer follows batch 1a2b3c4d in Microsoft 365 and looks once. It changes nothing.'
+        $script:Other.previewVisible | Should -Be 'Collapsed'
+        $script:Other.runLabel | Should -Be 'Run the check'
+        $script:Other.runEnabled | Should -BeTrue
+        $script:Other.checkArgs.Action | Should -Be 'Check'
+        $script:Other.checkArgs.Batch | Should -Be '1a2b3c4d'
+        $script:Other.checkArgs.Expect | Should -Be 'Deprovisioned'
+        $script:Other.checkArgs.Once | Should -BeTrue
+        $script:Other.checkArgs.Force | Should -BeFalse
+        $script:Other.checkNext | Should -Be 'The check is finished'
+    }
+    It 'picks one mailbox from the snapshot in any letter case, and refuses one that is not there' {
+        $script:Other.single.Info | Should -BeLike 'Adele Vance * user mailbox'
+        $script:Other.single.Ready | Should -BeTrue
+        $script:Other.single.Identity | Should -Be 'ADELE.VANCE@CONTOSO.COM'
+        $script:Other.unknown.Info | Should -BeLike 'Not found in snapshot #42*'
+        $script:Other.unknown.Ready | Should -BeFalse
+    }
+    It 'picks an OU from the snapshot, by path or by distinguished name, and a CSV file with its identities' {
+        $script:Other.ou.Picked | Should -Be 'contoso.com/Lyon'
+        $script:Other.ou.SearchBase | Should -Be $script:Other.ou.Picked
+        $script:Other.ou.Info | Should -Be '8 mailboxes in snapshot #42, sub-OUs included.'
+        $script:Other.ouDn | Should -BeLike '8 mailboxes in snapshot #42*'
+        $script:Other.csvMissing.Ready | Should -BeFalse
+        $script:Other.csvMissing.Info | Should -BeLike 'This file cannot be read.'
+        $script:Other.csv.Info | Should -Be '2 identities'
+        $script:Other.csv.Ready | Should -BeTrue
+        $script:Other.csv.CsvPath | Should -BeLike '*list.csv'
+        $script:Other.all.Text | Should -BeLike 'Every mailbox of snapshot #42 (24 mailboxes)*'
+        $script:Other.all.Ready | Should -BeTrue
+    }
+    It 'tells a failed run plainly: the first reason, the failed step and what to do' {
+        $script:Other.failedPreview.Previewed | Should -BeFalse
+        $script:Other.failedPreview.Summary | Should -Be 'The preview did not complete'
+        $script:Other.failedPreview.Error | Should -BeLike '*not found in Cert:*'
+        $script:Other.failedPreview.Confirm | Should -BeFalse
+        $script:Other.failed.Valid | Should -BeFalse
+        $script:Other.failed.Level | Should -Be 'Failed'
+        $script:Other.failed.Pill | Should -Be 'Failed'
+        $script:Other.failed.Title | Should -Be 'The run stopped'
+        $script:Other.failed.Lead | Should -BeLike '*not found in Cert:*'
+        @($script:Other.failed.Status) | Should -Contain 'Fail'
+        $script:Other.failed.Steps[0] | Should -BeLike 'Go back to the Run page*'
+    }
+    It 'runs with the interactive sign-in and a chosen snapshot for this run only, and checks what was typed' {
+        $script:Other.interactive.Override | Should -BeLike '*"SignIn":"Interactive"*'
+        $script:Other.interactive.Override | Should -BeLike '*"UserPrincipalName":"admin@contoso.com"*'
+        $script:Other.interactive.Override | Should -Not -BeLike '*AppId*'
+        $script:Other.interactive.RowAppId | Should -Be 'Collapsed'
+        $script:Other.interactive.RowUpn | Should -Be 'Visible'
+        @($script:Other.interactive.Changed) | Should -Be @('Snapshot', 'Sign-in', 'Administrator')
+        $script:Other.interactive.Number | Should -Be 41
+        $script:Other.badSnapshot | Should -BeLike 'Snapshot: type the number*'
+        $script:Other.badNext | Should -BeFalse
+        $script:Other.interactiveArgs.Snapshot | Should -Be 41
+        $script:Other.interactiveArgs.Base | Should -BeTrue
+        $script:Other.effective | Should -Match "SignIn = 'Interactive'"
+        $script:Other.configUnchanged | Should -BeTrue
+    }
+    It 'switches between the light and the dark palette without rebuilding the window' {
+        $script:Other.theme.Light | Should -Be '#FFB11F4B'
+        $script:Other.theme.Dark | Should -Be '#FFFD8EA1'
+    }
+}
+
+Describe 'Console: the numeric settings of the waves (temporary licences, licences kept free, objects per rollback wave)' {
+    BeforeAll {
+        $script:Numbers = Invoke-GuiChild -Body @'
+$o = [ordered]@{}
+$o.defaults = @{ Parallel = $c.F_Parallel.Text; KeepFree = $c.F_KeepFree.Text; WaveSize = $c.F_WaveSize.Text }
+$o.rowsBefore = @{ Parallel = $c.Row_Parallel.Visibility.ToString(); KeepFree = $c.Row_KeepFree.Visibility.ToString(); WaveSize = $c.Row_WaveSize.Visibility.ToString() }
+$o.problemOf = @{}
+foreach ($pair in @(@('Parallel', ' 40 '), @('Parallel', '0'), @('Parallel', '1000'), @('Parallel', '1001'), @('Parallel', ''), @('Parallel', '4 0'), @('Parallel', '4.5'), @('Parallel', '-3'), @('KeepFree', '100000'), @('KeepFree', '100001'), @('KeepFree', 'ten'), @('KeepFree', ' 0 '))) {
+    Enter ('F_' + $pair[0]) $pair[1]
+    $o.problemOf[('{0}|{1}' -f $pair[0], $pair[1])] = $c.SettingsError.Text
+    Mod { Reset-PcmGuiField 'Parallel'; Reset-PcmGuiField 'KeepFree' }
+}
+Enter 'F_Parallel' ' 40 '; Enter 'F_KeepFree' ' 10 '
+$o.modified = @{ Parallel = $c.M_Parallel.Visibility.ToString(); KeepFree = $c.M_KeepFree.Visibility.ToString() }
+$o.changed = @(Mod { Get-PcmGuiChangedSetting })
+$o.override = Mod { (Get-PcmGuiOverride | ConvertTo-Json -Compress -Depth 5) }
+$o.overrideIsInt = (Mod { (Get-PcmGuiOverride).Licensing.Shared.Parallel -is [int] })
+Enter 'F_Parallel' '100'
+$o.sameNumberNotModified = @{ Marker = $c.M_Parallel.Visibility.ToString(); Changed = @(Mod { Get-PcmGuiChangedSetting }) }
+Enter 'F_Parallel' ' 40 '
+Click 'BtnNext'; Check 'T_Convert'; Check 'S_Source_All'
+$o.convertText = $c.HappenText.Text
+$o.waveRowConvert = $c.Row_WaveSize.Visibility.ToString()
+Click 'BtnNext'
+$o.used = $c.UsedText.Text
+Click 'BtnPreview'; WaitRun
+$o.effective = (Get-Content -LiteralPath (Join-Path $root 'effective-copy.psd1') -Raw)
+$o.configUnchanged = ((Get-FileHash -LiteralPath $fixture.Config -Algorithm SHA256).Hash -eq $configHash)
+$o.original = [IO.File]::ReadAllText($fixture.Config)
+Mod { Show-PcmGuiPage 2 }
+Check 'T_Recover'
+$o.waveRowRecover = $c.Row_WaveSize.Visibility.ToString()
+$o.recoverDefaultText = $c.HappenText.Text
+$o.waveProblems = @{}
+foreach ($text in @('0', '1001', 'x', ' 25 ', '')) { Enter 'F_WaveSize' $text; $o.waveProblems[$(if ($text) { $text } else { 'empty' })] = $c.SettingsError.Text }
+Enter 'F_WaveSize' ' 25 '
+$o.recoverText = $c.HappenText.Text
+$o.recoverOverride = Mod { (Get-PcmGuiOverride | ConvertTo-Json -Compress -Depth 5) }
+$o.changedRecover = @(Mod { Get-PcmGuiChangedSetting })
+Click 'BtnResetAll'
+$o.afterReset = @{ Parallel = $c.F_Parallel.Text; KeepFree = $c.F_KeepFree.Text; WaveSize = $c.F_WaveSize.Text }
+Done $o
+'@
+    }
+    It 'shows the values of the configuration, and the wave size only for a rollback' {
+        $script:Numbers.defaults.Parallel | Should -Be '100'
+        $script:Numbers.defaults.KeepFree | Should -Be '0'
+        $script:Numbers.defaults.WaveSize | Should -Be ''
+        $script:Numbers.rowsBefore.Parallel | Should -Be 'Visible'
+        $script:Numbers.rowsBefore.KeepFree | Should -Be 'Visible'
+        $script:Numbers.rowsBefore.WaveSize | Should -Be 'Collapsed'
+        $script:Numbers.waveRowConvert | Should -Be 'Collapsed'
+        $script:Numbers.waveRowRecover | Should -Be 'Visible'
+    }
+    It 'accepts whole numbers in their range, spaces around them ignored, and refuses the rest in plain words' {
+        $problems = $script:Numbers.problemOf
+        foreach ($ok in 'Parallel| 40 ', 'Parallel|1000', 'KeepFree|100000', 'KeepFree| 0 ') { $problems.$ok | Should -BeNullOrEmpty -Because $ok }
+        foreach ($bad in 'Parallel|0', 'Parallel|1001', 'Parallel|', 'Parallel|4 0', 'Parallel|4.5', 'Parallel|-3') { $problems.$bad | Should -Be 'Temporary licences: a whole number from 1 to 1000.' -Because $bad }
+        foreach ($bad in 'KeepFree|100001', 'KeepFree|ten') { $problems.$bad | Should -Be 'Licences kept free: a whole number from 0 to 100000.' -Because $bad }
+    }
+    It 'marks what changed and writes it, as numbers, to the settings of this run only' {
+        $script:Numbers.modified.Parallel | Should -Be 'Visible'
+        $script:Numbers.modified.KeepFree | Should -Be 'Visible'
+        @($script:Numbers.changed) | Should -Be @('Temporary licences', 'Licences kept free')
+        $script:Numbers.override | Should -Match '^\{"Licensing":\{"Shared":\{.*\}\}\}$'
+        $script:Numbers.override | Should -Match '"Parallel":40'
+        $script:Numbers.override | Should -Match '"KeepFree":10'
+        $script:Numbers.overrideIsInt | Should -BeTrue
+        $script:Numbers.sameNumberNotModified.Marker | Should -Be 'Collapsed'
+        @($script:Numbers.sameNumberNotModified.Changed) | Should -Be @('Licences kept free')
+    }
+    It 'never writes them to the configuration file, only to the generated copy' {
+        $script:Numbers.configUnchanged | Should -BeTrue
+        $script:Numbers.original | Should -Not -Match 'KeepFree'
+        $script:Numbers.original | Should -Not -Match 'Parallel'
+        $script:Numbers.effective | Should -Match 'Parallel = 40'
+        $script:Numbers.effective | Should -Match 'KeepFree = 10'
+        $script:Numbers.effective | Should -Match "SkuPartNumber = 'EXCHANGESTANDARD'"
+    }
+    It 'says the waves in the card of what will happen: temporary licences, the plan and the licences kept free' {
+        $script:Numbers.convertText | Should -BeLike '*Shared mailboxes in waves of up to 40 temporary licences (EXCHANGESTANDARD), 10 kept free.'
+        $script:Numbers.used | Should -BeLike '*Shared mailbox waves: 40 temporary licences, 10 kept free*'
+    }
+    It 'validates the wave size of a rollback (empty = the temporary licences) and says it in the card' {
+        $script:Numbers.waveProblems.'0' | Should -Be 'Wave size: a whole number from 1 to 1000.'
+        $script:Numbers.waveProblems.'1001' | Should -Be 'Wave size: a whole number from 1 to 1000.'
+        $script:Numbers.waveProblems.x | Should -Be 'Wave size: a whole number from 1 to 1000.'
+        $script:Numbers.waveProblems.' 25 ' | Should -BeNullOrEmpty
+        $script:Numbers.waveProblems.empty | Should -BeNullOrEmpty
+        $script:Numbers.recoverDefaultText | Should -BeLike '*Rollback in waves of up to 40 objects.'
+        $script:Numbers.recoverText | Should -BeLike '*Rollback in waves of up to 25 objects.'
+        $script:Numbers.recoverOverride | Should -BeLike '*"Recover":{"WaveSize":25}*'
+        @($script:Numbers.changedRecover) | Should -Contain 'Wave size'
+    }
+    It 'puts every number back to the value of the file with Reset everything' {
+        $script:Numbers.afterReset.Parallel | Should -Be '100'
+        $script:Numbers.afterReset.KeepFree | Should -Be '0'
+        $script:Numbers.afterReset.WaveSize | Should -Be ''
+    }
+}
+
+Describe 'Console: the group check asks the engine' {
+    BeforeAll {
+        $script:Lookup = Invoke-GuiChild -Body @'
+$o = [ordered]@{}
+Click 'BtnNext'
+Check 'T_Convert'; Check 'S_Source_Group'
+Enter 'F_Group' 'pra-WAVE1'; Click 'BtnCheckGroup'
+$o.runningText = $c.GroupInfo.Text; $o.buttonWhileRunning = $c.BtnCheckGroup.IsEnabled; $o.lookupWhileRunning = [bool]$g.GroupLookup
+$o.startRefused = ''
+try { Mod { Start-PcmGuiRun -Mode Preview } } catch { $o.startRefused = $_.Exception.Message }
+WaitFor { -not $g.GroupLookup }
+$a = Args_
+$o.args = @{ Action = $a.Action; Group = $a.Group; ResolveOnly = $a.ResolveOnly; Mode = $a.Mode; Force = $a.Force; Edition = $a.Edition }
+$o.found = $c.GroupInfo.Text; $o.buttonAfter = $c.BtnCheckGroup.IsEnabled; $o.glyph = $c.GroupGlyph.Visibility.ToString()
+Enter 'F_Group' 'Nobody'; Click 'BtnCheckGroup'; WaitFor { -not $g.GroupLookup }
+$o.missing = $c.GroupInfo.Text; $o.missingGlyph = $c.GroupGlyph.Visibility.ToString()
+$g.NetResult = [pscustomobject]@{ State = 'Fail'; Answers = @() }
+Enter 'F_Group' 'PRA-WAVE1'; Click 'BtnCheckGroup'
+$o.fallbackFound = $c.GroupInfo.Text; $o.fallbackLookup = [bool]$g.GroupLookup
+Enter 'F_Group' 'Nobody'; Click 'BtnCheckGroup'
+$o.fallbackMissing = $c.GroupInfo.Text
+Done $o
+'@
+    }
+    It 'runs the engine in a child process (Check -Group, with -ResolveOnly) and shows its answer, the group found in the snapshot' {
+        $script:Lookup.args.Action | Should -Be 'Check'
+        $script:Lookup.args.Group | Should -Be 'pra-WAVE1'
+        $script:Lookup.args.ResolveOnly | Should -BeTrue
+        $script:Lookup.args.Force | Should -BeFalse
+        $script:Lookup.found | Should -Be 'Found in the snapshot (captured by Collect): PRA-Wave1 · 26 members including nested groups, 2 skipped (the Preview says why)'
+        $script:Lookup.glyph | Should -Be 'Visible'
+    }
+    It 'says that it is looking, locks the button and refuses a run while the engine answers' {
+        $script:Lookup.runningText | Should -BeLike 'Looking up the group*'
+        $script:Lookup.buttonWhileRunning | Should -BeFalse
+        $script:Lookup.lookupWhileRunning | Should -BeTrue
+        $script:Lookup.startRefused | Should -BeLike '*group check is still going*'
+        $script:Lookup.buttonAfter | Should -BeTrue
+    }
+    It 'shows the reason of the engine when the group is nowhere' {
+        $script:Lookup.missing | Should -Be 'Could not check: Group Nobody is not in snapshot 42 nor in Microsoft Entra. Nothing was changed: check the name.'
+        $script:Lookup.missingGlyph | Should -Be 'Collapsed'
+    }
+    It 'falls back to the snapshot alone, and says so, when Microsoft 365 cannot be reached from this computer' {
+        $script:Lookup.fallbackLookup | Should -BeFalse
+        $script:Lookup.fallbackFound | Should -BeLike 'Found in the snapshot (captured by Collect): PRA-Wave1 · 26 members including nested groups, 2 skipped (the Preview says why). Only the snapshot was checked: *'
+        $script:Lookup.fallbackMissing | Should -BeLike 'Not in the snapshot. Microsoft Entra was not checked: *'
+    }
+}
+
+Describe 'Console: the engine behind the console (the real script, a synthetic snapshot)' {
+    BeforeAll {
+        $script:Engine = New-DocumentationToolCopy -Repository $script:Repo -Destination (Join-Path $TestDrive 'engine') -RealEngine
+        $script:EngineFixture = New-ConsoleFixture -ToolRoot $script:Engine -NoScenario
+        function script:Invoke-RealEngine {
+            param([string[]]$Arguments)
+            $events = Join-Path $TestDrive ('events-{0}.jsonl' -f [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $env:PRA_EVENT_FILE = $events
+            try { $output = (& pwsh -NoProfile -File (Join-Path $script:Engine 'Invoke-PraCloudMailbox.ps1') @Arguments -ConfigPath $script:EngineFixture.Config 2>&1 | Out-String) } finally { Remove-Item Env:\PRA_EVENT_FILE -ErrorAction SilentlyContinue }
+            return [pscustomobject]@{ Exit = $LASTEXITCODE; Output = $output; Events = @($(if (Test-Path -LiteralPath $events) { Get-Content -LiteralPath $events -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json } })) }
         }
-        $global:PraGuiConfirm | Should -BeLike 'CONVERT|pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply -Force'
-        & $script:Gui { [bool]$script:Gui.Run } | Should -BeFalse
-        $script:Window.Lines[$script:Window.Lines.Count - 1].Text | Should -Be 'Cancelled: nothing was run.'
+        $script:HashBefore = @(Get-ChildItem -LiteralPath (Join-Path $script:Engine 'data') -Filter '*.db' | Sort-Object Name | ForEach-Object { '{0}={1}' -f $_.Name, (Get-FileHash -LiteralPath $_.FullName).Hash })
+        $script:Resolved = Invoke-RealEngine -Arguments @('-Action', 'Check', '-Group', 'pra-WAVE1', '-ResolveOnly')
     }
-    It 'invalidates Apply when the configuration changes after Preview' {
-        & $script:Gui {
-            $selection = Get-PraGuiSelection -Page Convert
-            $script:Gui.Pending.Convert = @{ Key = $selection.Key; Guard = $selection.Key; Resume = $false; Batch = ''; Request = @{ Action = 'Convert'; Mode = 'Preview' }; Selection = $selection
-                Planned = 3; Tone = 'Success'; Confirm = 'three objects'; Hint = 'preview ok' }
-            Update-PraGuiApplyState
+    It 'looks a group of the snapshot up (any letter case), prints the line of the run and ends with exit code 0' {
+        $script:Resolved.Exit | Should -Be 0 -Because $script:Resolved.Output
+        $script:Resolved.Output | Should -Match 'Group PRA-Wave1 \(captured by Collect, snapshot 42\): 26 member\(s\) including nested groups, 2 skipped'
+    }
+    It 'tells the console which group, from where, with how many members and how many skipped (event target)' {
+        $target = @($script:Resolved.Events | Where-Object kind -eq 'target')
+        $target.Count | Should -Be 1
+        $target[0].name | Should -Be 'PRA-Wave1'
+        $target[0].source | Should -Be 'Snapshot'
+        $target[0].members | Should -Be 26
+        $target[0].skipped | Should -Be 2
+        $target[0].count | Should -Be 24
+        $target[0].text | Should -BeLike 'Group PRA-Wave1 (captured by Collect, snapshot 42): 26 member(s) including nested groups, 2 skipped'
+    }
+    It 'announces its plan, numbers its steps with the ids of the plan, ends them with a state and ends with a result' {
+        $kinds = @($script:Resolved.Events | ForEach-Object { $_.kind })
+        $kinds[0] | Should -Be 'start'
+        $kinds[1] | Should -Be 'plan'
+        $plan = $script:Resolved.Events[1]
+        @($plan.steps | ForEach-Object { '{0}={1}' -f $_.id, $_.label }) | Should -Be @('s1=Collect snapshot')
+        $step = @($script:Resolved.Events | Where-Object { $_.kind -eq 'step' -and $_.PSObject.Properties['title'] })
+        $step.Count | Should -Be 1
+        $step[0].id | Should -Be 's1'
+        @($script:Resolved.Events | Where-Object { $_.kind -eq 'step' -and $_.PSObject.Properties['state'] } | ForEach-Object { '{0}:{1}' -f $_.id, $_.state }) | Should -Be @('s1:ok')
+        $started = [array]::IndexOf(@($script:Resolved.Events | ForEach-Object { $_.kind }), 'step')
+        $items = @($script:Resolved.Events | Select-Object -Skip $started | Where-Object kind -eq 'item')
+        $items.Count | Should -BeGreaterThan 0
+        @($items | Where-Object { $_.stepId -ne 's1' }).Count | Should -Be 0
+        $result = @($script:Resolved.Events | Where-Object kind -eq 'result')
+        $result.Count | Should -Be 1
+        $result[0].exitCode | Should -Be 0
+        $result[0].csvReport | Should -BeNullOrEmpty
+        $result[0].PSObject.Properties.Name | Should -Contain 'globalReport'
+    }
+    It 'changes nothing: no report, no database written, no cloud sign-in' {
+        @(Get-ChildItem -LiteralPath (Join-Path $script:Engine 'reports') -File -ErrorAction SilentlyContinue).Count | Should -Be 0
+        $after = @(Get-ChildItem -LiteralPath (Join-Path $script:Engine 'data') -Filter '*.db' | Sort-Object Name | ForEach-Object { '{0}={1}' -f $_.Name, (Get-FileHash -LiteralPath $_.FullName).Hash })
+        $after | Should -Be $script:HashBefore
+        $script:Resolved.Output | Should -Not -Match 'Microsoft Graph'
+    }
+    It 'refuses -ResolveOnly without a group, and for another action, with exit code 1' -TestCases @(
+        @{ Arguments = @('-Action', 'Check', '-ResolveOnly') }, @{ Arguments = @('-Action', 'Convert', '-Group', 'PRA-Wave1', '-ResolveOnly') }) {
+        param($Arguments)
+        $run = Invoke-RealEngine -Arguments $Arguments
+        $run.Exit | Should -Be 1
+        $run.Output | Should -BeLike '*-ResolveOnly is for Check with -Group*'
+    }
+    It 'follows a rollback by the Convert batch ID, and says that a rollback batch ID is the rollback of its Convert batch' {
+        $journal = Open-PcmStore -Path (Join-Path $script:Engine 'data\PraCloudMailbox-journal.db') -Root $script:Engine -Kind Journal
+        try {
+            $null = Invoke-PcmSql $journal 'INSERT INTO batch (id, action, convert_batch, status, created_utc, updated_utc, snapshot_id, environment, computer, account, tool_version) VALUES (@id, @a, @c, @s, @t, @t, @n, @e, @m, @u, @v)' @{ id = 'ee11ee11'; a = 'Recover'; c = '1a2b3c4d'; s = 'Partial'; t = [datetime]::UtcNow; n = 42; e = 'PROD'; m = 'SRV-PRA01'; u = 'CONTOSO\pra.operator'; v = '2.0.0' }
+        } finally { Close-PcmStore $journal }
+        $run = Invoke-RealEngine -Arguments @('-Action', 'Recover', '-Batch', 'EE11EE11')
+        $run.Output | Should -Match 'Batch ee11ee11 is a rollback of Convert batch 1a2b3c4d: the rollback goes on with Convert batch 1a2b3c4d'
+        $run.Output | Should -Not -Match 'Convert batch EE11EE11 not found'
+    }
+}
+
+Describe 'Console: the window files' {
+    It 'keeps the layout and the code free of the old editions and of -NonInteractive' {
+        foreach ($name in 'PRA.Gui.psm1', 'PRA.Gui.View.ps1', 'PRA.Gui.Run.ps1', 'PRA.Gui.Data.ps1', 'PRA.Gui.Detect.ps1', 'PRA.Gui.Process.ps1', 'PRA.Gui.RunConfig.ps1', 'PRA.Gui.xaml') {
+            $text = [IO.File]::ReadAllText((Join-Path $script:Root "module\$name"))
+            $text | Should -Not -Match '7\.4' -Because $name
+            if ($name.EndsWith('.xaml')) { continue }
+            $tokens = $null; $null = [Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$null)
+            @($tokens | Where-Object { $_.Kind -in 'Parameter', 'StringLiteral', 'StringExpandable', 'Generic' -and $_.Text -match 'NonInteractive' }).Count | Should -Be 0 -Because $name
         }
-        $script:C.ConvertApply.IsEnabled | Should -BeTrue
-        Add-Content -LiteralPath $script:State.Config -Value "`r`n# resource recovery settings changed" -Encoding UTF8
-        & $script:Gui { Update-PraGuiApplyState }
-        $script:C.ConvertApply.IsEnabled | Should -BeFalse
-        & $script:Gui { $script:Gui.Pending.Convert } | Should -BeNullOrEmpty
     }
-    It 'refuses a preview result if its configuration changed while it ran' {
-        & $script:Gui {
-            $selection = Get-PraGuiSelection -Page Convert
-            Add-Content -LiteralPath $script:Gui.ConfigPath -Value "`r`n# changed during preview" -Encoding UTF8
-            Complete-PraGuiAction -Run @{ Request = @{ Action = 'Convert'; Mode = 'Preview' }; Selection = $selection } -Result ([pscustomobject]@{ planned = 3; csvReport = ''; exitCode = 0 })
+    It 'parses without error' {
+        foreach ($file in Get-ChildItem (Join-Path $script:Root 'module') -Filter 'PRA.Gui*' | Where-Object { $_.Extension -in '.ps1', '.psm1' }) {
+            $errors = $null; $null = [Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors)
+            @($errors).Count | Should -Be 0 -Because $file.Name
         }
-        $script:C.ConvertApply.IsEnabled | Should -BeFalse
-        $script:C.ConvertHint.Text | Should -BeLike '*configuration changed during Preview*'
     }
-    It 'rechecks the configuration after the typed confirmation' {
-        & $script:Gui {
-            $selection = Get-PraGuiSelection -Page Convert
-            $script:Gui.Pending.Convert = @{ Key = $selection.Key; Guard = $selection.Key; Resume = $false; Batch = ''; Request = @{ Action = 'Convert'; Mode = 'Preview' }; Selection = $selection
-                Planned = 3; Tone = 'Success'; Confirm = 'three objects'; Hint = 'preview ok' }
-            $script:Gui.Hooks.Confirm = {
-                Add-Content -LiteralPath $script:Gui.ConfigPath -Value "`r`n# changed during confirmation" -Encoding UTF8
-                $true
-            }
-            Start-PraGuiApply -Page Convert
-            [bool]$script:Gui.Run
-        } | Should -BeFalse
-        $script:C.ConvertApply.IsEnabled | Should -BeFalse
-        $script:C.ConvertHint.Text | Should -BeLike '*configuration changed*'
-    }
-    It 'follows the events of a run: steps, counters, questions answered in the named file only' {
-        $events = Join-Path $TestDrive 'stub.events.jsonl'
-        & $script:Gui {
-            param($events)
-            $script:Gui.Run = @{ Request = @{ Action = 'Convert'; Mode = 'Apply' }; Files = @{ Events = $events }; Counts = @{ Ok = 0; Warn = 0; Fail = 0 }; SubLines = 0
-                Asked = (New-Object 'Collections.Generic.HashSet[int]'); StopAsked = $false; LogFile = ''; Result = $null; Summary = $null }
-            foreach ($json in @(
-                    '{"kind":"step","index":2,"total":7,"title":"Users"}'
-                    '{"kind":"progress","phase":"Users","done":500,"total":3000,"percent":17,"eta":"about 2 h 30 min left at this pace"}'
-                    '{"kind":"item","status":"Ok","text":"alice done","identity":"alice@contoso.com"}'
-                    '{"kind":"item","status":"Warn","text":"bob pending","identity":"bob@contoso.com"}'
-                    ('{{"kind":"ask","id":1,"title":"Entra Connect","text":"Run a delta sync. Done?","answer":"{0}"}}' -f ("$events.answer-1" -replace '\\', '\\'))
-                    ('{{"kind":"ask","id":2,"title":"x","text":"elsewhere","answer":"{0}"}}' -f ((Join-Path $TestDrive 'elsewhere.txt') -replace '\\', '\\'))
-                    '{"kind":"result","exitCode":0,"planned":0}')) { Invoke-PraGuiEvent -Record ($json | ConvertFrom-Json) }
-        } $events
-        $script:C.RunStep.Text | Should -Be 'Step 2/7 · Users'
-        $script:C.RunProgress.Value | Should -BeGreaterThan 0.14
-        $script:C.RunObjects.Text | Should -Be 'Users: 500 of 3000 (17%) · about 2 h 30 min left at this pace'
-        $script:C.RunObjects.Visibility | Should -Be ([Windows.Visibility]::Visible)
-        $script:C.RunObjectsBar.Value | Should -BeGreaterThan 0.16
-        $script:C.RunOk.Text | Should -Be '1'
-        $script:C.RunWarn.Text | Should -Be '1'
-        $script:C.RunCurrent.Text | Should -Be 'Object: bob@contoso.com'
-        Get-Content -LiteralPath "$events.answer-1" -Raw | Should -Be 'yes'
-        $global:PraGuiAsked | Should -Be 'elsewhere'
-        Test-Path -LiteralPath (Join-Path $TestDrive 'elsewhere.txt') | Should -BeFalse
-        (& $script:Gui { $script:Gui.Run.Result }).exitCode | Should -Be 0
-    }
-    It 'hides the object progress of the previous step when a new step starts' {
-        & $script:Gui {
-            Invoke-PraGuiEvent -Record (@{ kind = 'progress'; phase = 'Shared mailboxes'; done = 1; total = 5; percent = 20; eta = '' } | ConvertTo-Json | ConvertFrom-Json)
+    It 'has no trace of the classic controls, of Windows PowerShell 5.1 or of a local Exchange mode' {
+        foreach ($name in 'PRA.Gui.psm1', 'PRA.Gui.View.ps1', 'PRA.Gui.Run.ps1', 'PRA.Gui.Data.ps1', 'PRA.Gui.Detect.ps1', 'PRA.Gui.Process.ps1', 'PRA.Gui.RunConfig.ps1', 'PRA.Gui.xaml') {
+            $text = [IO.File]::ReadAllText((Join-Path $script:Root "module\$name"))
+            $text | Should -Not -Match 'classic controls|ConnectionMode|Exchange tools|\.Fluent\b' -Because $name
+            $text | Should -Not -Match 'WindowsPowerShell\\v1\.0' -Because $name
         }
-        $script:C.RunObjects.Visibility | Should -Be ([Windows.Visibility]::Visible)
-        & $script:Gui {
-            Invoke-PraGuiEvent -Record (@{ kind = 'step'; index = 3; total = 7; title = 'Shared mailboxes' } | ConvertTo-Json | ConvertFrom-Json)
-        }
-        $script:C.RunObjects.Text | Should -BeNullOrEmpty
-        $script:C.RunObjects.Visibility | Should -Be ([Windows.Visibility]::Collapsed)
-        $script:C.RunObjectsBar.Visibility | Should -Be ([Windows.Visibility]::Collapsed)
-    }
-    It 'refuses to close while a run is going' {
-        $global:PraGuiNotice = ''
-        $script:Window.Form.Close()
-        $script:Window.Form.IsVisible | Should -BeTrue
-        $global:PraGuiNotice | Should -BeLike 'An action is running*'
-        & $script:Gui { $script:Gui.Run = $null; Set-PraGuiBusy -Busy $false }
-    }
-    It 'runs Check in its own PowerShell and shows its result (the sign-in fails: test tenant)' {
-        if (-not (Get-PraGuiEngine -Action Check).Ok) { Set-ItResult -Skipped -Because 'PowerShell 7.4 or later is not installed'; return }
-        & $script:Gui { Start-PraGuiCheck }
-        $script:C.CheckRun.IsEnabled | Should -BeFalse
-        $script:C.StopRun.Visibility | Should -Be 'Visible'
-        $clock = [Diagnostics.Stopwatch]::StartNew()
-        while ((& $script:Gui { [bool]$script:Gui.Run }) -and $clock.Elapsed.TotalSeconds -lt 240) { Invoke-TestPump; Start-Sleep -Milliseconds 100 }
-        & $script:Gui { [bool]$script:Gui.Run } | Should -BeFalse
-        $script:C.ResultCard.Visibility | Should -Be 'Visible'
-        $script:C.ResultTitle.Text | Should -Not -BeNullOrEmpty
-        $script:C.CheckRun.IsEnabled | Should -BeTrue
-        $events = @(Get-ChildItem -LiteralPath (Join-Path $script:State.Data 'gui') -Filter 'run-*-check.events.jsonl')
-        $events.Count | Should -Be 1
-        @(Get-Content -LiteralPath $events[0].FullName | ForEach-Object { ($_ | ConvertFrom-Json).kind }) | Should -Contain 'start'
-        @($script:Window.Lines | Where-Object { $_.Text -like 'Started: pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Check*' }).Count | Should -Be 1
     }
 }
