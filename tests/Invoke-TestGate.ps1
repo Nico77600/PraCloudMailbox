@@ -2,19 +2,16 @@
 .SYNOPSIS
     Runs the PRA Cloud Mailbox test gate offline and keeps the evidence.
 .DESCRIPTION
-    Pester 5+ (imported explicitly) and PSScriptAnalyzer (errors fail the gate). Run it in both editions:
-    Collect runs in Windows PowerShell 5.1, the cloud actions in PowerShell 7.
+    Pester 5+ (imported explicitly) and PSScriptAnalyzer (errors fail the gate). PowerShell 7.5 or later runs every action of the tool, so it runs the gate.
 .PARAMETER EvidenceDirectory
     Evidence folder; default tests\evidence\gate\<edition>-<timestamp>.
-.EXAMPLE
-    powershell.exe -NoProfile -File .\tests\Invoke-TestGate.ps1
 .EXAMPLE
     pwsh -NoProfile -File .\tests\Invoke-TestGate.ps1
 .NOTES
     Author : Nicolas Fabert
     Version: 0.1.0
 #>
-#Requires -Version 5.1
+#Requires -Version 7.5
 [CmdletBinding()]
 param([string]$EvidenceDirectory)
 Set-StrictMode -Version Latest
@@ -56,12 +53,7 @@ try {
         $summary.Analyzer = [string](Get-Module PSScriptAnalyzer).Version
         $files = @(Get-ChildItem $root -Recurse -File -Include *.ps1, *.psm1 | Where-Object { $_.FullName -notmatch '\\tests\\' })
         $excluded = @('PSAvoidUsingWriteHost', 'PSUseSingularNouns', 'PSUseShouldProcessForStateChangingFunctions', 'PSAvoidUsingPositionalParameters')
-        # PSScriptAnalyzer 1.25 in Windows PowerShell 5.1 now and then throws a NullReferenceException on a file it analyses
-        # without trouble the next time: one more try before the gate fails.
-        $findings = @(foreach ($file in $files) {
-                try { Invoke-ScriptAnalyzer -Path $file.FullName -ExcludeRule $excluded -ErrorAction Stop }
-                catch { Write-Warning ("Analyzer, second try on {0}: {1}" -f $file.Name, $_.Exception.Message); Invoke-ScriptAnalyzer -Path $file.FullName -ExcludeRule $excluded -ErrorAction Stop }
-            })
+        $findings = @(foreach ($file in $files) { Invoke-ScriptAnalyzer -Path $file.FullName -ExcludeRule $excluded -ErrorAction Stop })
         $findings | Select-Object ScriptName, Line, Severity, RuleName, Message | Export-Csv (Join-Path $EvidenceDirectory 'analyzer.csv') -NoTypeInformation -Encoding UTF8
         $summary.AnalyzerErrors = @($findings | Where-Object Severity -eq 'Error').Count
         $summary.AnalyzerWarnings = @($findings | Where-Object Severity -eq 'Warning').Count

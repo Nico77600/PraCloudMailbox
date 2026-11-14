@@ -2,7 +2,7 @@
 .SYNOPSIS
     In-memory Microsoft 365 tenant for the end-to-end tests of Convert and Recover (PowerShell 7).
 .DESCRIPTION
-    Imitates what the lab showed (developer guide, chapter 3), not the whole service: Microsoft Graph (users, licence group,
+    Imitates the behaviours of the service that the tool depends on (administrator guide, chapter 3), not the whole service: Microsoft Graph (users, licence group,
     licences, source of authority, recycle bin), Exchange Online (recipients, mailbox provisioning, Teams storage,
     holds, permissions, inactive mailboxes), the eDiscovery case hold and Entra Connect.
     What takes time in Microsoft 365 happens on the next tick (Step-PraFake): the tests mock Start-Sleep and the
@@ -10,11 +10,13 @@
     Faults: LicenceAssign400 (number of refused assignments), NeverMailbox (user IDs never provisioned),
     NoHoldStamp (the case hold is never stamped), DeleteFails (DELETE /users refused), NoRecreate (Entra Connect
     does not recreate deleted objects), SendAsFails (Add-RecipientPermission refused),
-    CaseHoldDeployError (Set-CaseHoldPolicy records the change but reports 'failed to be deployed', lab 7-8 Oct),
+    CaseHoldDeployError (Set-CaseHoldPolicy records the change but reports 'failed to be deployed'),
     CaseHoldFails (Set-CaseHoldPolicy refuses every change),
     StopAfter (@{ Pattern; Path }: the stop file of the window is created after the first call that matches),
     BatchThrottle (number of requests of a Graph batch answered 429 before the next ones succeed), ExoFilterFails (the
     filtered Exchange Online reads fail: the tool reads one object at a time). PageSize: users per page of /users.
+    Microsoft Entra groups (Add-PraFakeEntraGroup): /groups by display name, e-mail address or mail nickname (the letter case ignored, as Graph does), /groups/{id}
+    and /groups/{id}/transitiveMembers with paging (GroupPageSize members per page); the fault GroupReadDenied refuses them.
 .NOTES
     Author  : Nicolas Fabert
 #>
@@ -47,6 +49,8 @@ function global:New-PraFakeTenant {
         Group = @{ Id = '11111111-1111-1111-1111-111111111111'; Name = 'LIC-EXO'; Synced = $false; CloudManaged = $false
             Licences = @(@{ skuId = 'sku-e5'; disabledPlans = @('plan-teams') }); Members = [System.Collections.Generic.List[string]]::new() }
         Users = [ordered]@{}
+        EntraGroups = [ordered]@{}
+        GroupPageSize = 999
         Contacts = [ordered]@{}
         RoomLists = [ordered]@{}
         Recycle = [ordered]@{}
@@ -66,7 +70,7 @@ function global:New-PraFakeTenant {
             CalendarEnableFails = $false; CalendarEnabledReadMismatch = $false; BookingDisableFails = $false; HiddenFinalFails = $false
             NewRoomListFails = $false; CrashAfterNewRoomList = $false; RoomListConfigFails = $false; CrashAfterRoomListConfig = $false; RoomListConfigMismatch = $false
             RoomListExchangeOnly = $false; RoomListReadAfterCreateFails = $false; ResourceReadAfterCreateFails = $false; ContactReadAfterCreateFails = $false
-            SignInPropagationReads = 0; SignInReadFault = ''
+            SignInPropagationReads = 0; SignInReadFault = ''; GroupReadDenied = $false
             NoLicenseReads = $false; NoSoftDeleted = $false; SoftDeletedAddressBlocks = $false; OrganizationReadFails = $false }
         PageSize = 999; FilterCalls = 0; CaseHoldCalls = 0
         OrgHolds = @()
@@ -123,6 +127,15 @@ function global:Add-PraFakeUser {
     return $user
 }
 
+function global:Add-PraFakeEntraGroup {
+    <# A Microsoft Entra group. Members: @{ Type = 'user'|'group'|'device'|'orgContact'; User = <fake user>; Id; Name } - a user member shows the identity of the fake user. #>
+    param([Parameter(Mandatory)][string]$Name, [string]$Mail = '', [string]$Nickname = '', [string]$Id = ([guid]::NewGuid().ToString()), [hashtable[]]$Members = @())
+    $group = @{ Id = $Id; Name = $Name; Mail = $Mail; Nickname = $Nickname; Members = [System.Collections.Generic.List[hashtable]]::new() }
+    foreach ($member in $Members) { $group.Members.Add($member) }
+    $global:PraFake.EntraGroups[$Id] = $group
+    return $group
+}
+
 function global:Write-PraFakeCall {
     param([string]$Text)
     $global:PraFake.Calls.Add(('{0:000} {1}' -f $global:PraFake.Tick, $Text))
@@ -159,19 +172,19 @@ function global:Step-PraFake {
         if ($user.CloudManaged -and $user.DirSynced) { $user.DirSynced = $false }
         $plan = Test-PraFakeExchangePlan $user
         if ($user.Type -eq 'MailUser' -and $user.ExchangeGuid -eq [guid]::Empty.ToString() -and -not $user.DirSynced -and $plan -and $user.UsageLocation -and $fake.Faults.NeverMailbox -notcontains $user.Id) {
-            # The Teams storage (ComponentShared) becomes the primary mailbox when there is one (lab test A).
+            # The Teams storage (ComponentShared) becomes the primary mailbox when there is one.
             $user.Type = 'UserMailbox'; $user.ExchangeGuid = $(if ($user.Component) { $user.Component } else { [guid]::NewGuid().ToString() }); $user.Component = $null
             Write-PraFakeCall "Mailbox $($user.Upn) $($user.ExchangeGuid)"
         } elseif ($user.Type -eq 'UserMailbox' -and -not $plan -and $user.DirSynced -and $user.Holds.Count) {
-            # Exchange cannot disable a mailbox on hold: the switch back is blocked (lab T8, H).
+            # Exchange cannot disable a mailbox on hold: the switch back is blocked.
             if (-not $user.ContainsKey('Blocked')) { $user['Blocked'] = $true; Write-PraFakeCall "BlockedByHold $($user.Upn)" }
         } elseif ($user.Type -eq 'UserMailbox' -and -not $plan -and $user.DirSynced) {
             # Plan removed after the source of authority went back to AD: MailUser with the on-premises GUID,
-            # the cloud mailbox stays as ComponentShared with its content (lab T8, T13).
+            # the cloud mailbox stays as ComponentShared with its content.
             $user.Component = $user.ExchangeGuid; $user.ExchangeGuid = $user.OnPremGuid; $user.Type = 'MailUser'
             Write-PraFakeCall "BackOnPremises $($user.Upn)"
         } elseif ($user.Type -eq 'UserMailbox' -and -not $plan) {
-            # Licence removed before the conversion to shared is effective: disabled at once (lab SH2).
+            # Licence removed before the conversion to shared is effective: disabled at once.
             $user.Type = 'DisabledUser'; $user.PendingShared = $false
             Write-PraFakeCall "Disabled $($user.Upn)"
         } elseif ($user.Type -eq 'UserMailbox' -and $user.PendingShared) {
@@ -210,11 +223,11 @@ function global:Invoke-PraFakeEntraConnect {
             }
             if ($fake.Faults.NoRecreate) { return 'fake Delta (objects not recreated)' }
             foreach ($ad in @($fake.Ad)) {
-                if ([bool](Get-PraValue $ad 'SyncExcluded' $false)) { continue }
+                if ([bool](Get-PcmValue $ad 'SyncExcluded' $false)) { continue }
                 if (@($fake.Users.Values | Where-Object { $_.ImmutableId -eq $ad.ImmutableId }).Count) { continue }
                 $deleted = @($fake.Recycle.Values | Where-Object { $_.ImmutableId -eq $ad.ImmutableId }) | Select-Object -First 1
                 if ($deleted) {
-                    # Same immutableId still in the recycle bin: the sync restores the deleted object (lab SH).
+                    # Same immutableId still in the recycle bin: the sync restores the deleted object.
                     $fake.Recycle.Remove($deleted.Id); $fake.Users[$deleted.Id] = $deleted
                     Write-PraFakeCall "Restored $($deleted.Upn) $($deleted.Id)"
                     continue
@@ -229,7 +242,7 @@ function global:Invoke-PraFakeEntraConnect {
 }
 
 function global:Invoke-PraFakeWait {
-    <# Deterministic Wait-Pra2Condition: one tick per poll, at most 40 polls. #>
+    <# Deterministic Wait-PcmCondition: one tick per poll, at most 40 polls. #>
     param([scriptblock]$Test, [int]$TimeoutSeconds, [int]$IntervalSeconds = 20)
     $interval = [Math]::Max(1, $IntervalSeconds)
     $polls = [Math]::Max(1, [Math]::Min(40, [int][Math]::Ceiling($TimeoutSeconds / $interval)))
@@ -268,7 +281,7 @@ function global:ConvertTo-PraFakeGraphUser {
     }
     $plans = @(Get-PraFakeMailboxPlan $User | ForEach-Object { [pscustomobject]@{ service = 'exchange'; servicePlanId = $_; capabilityStatus = $(if ($global:PraFake.Faults.NoEnterprise -and $_ -eq 'plan-exo') { 'Suspended' } else { 'Enabled' }) } })
     if ($User.Direct.Count -or $group.Members.Contains($User.Id)) { $plans += [pscustomobject]@{ service = 'exchange'; servicePlanId = 'plan-foundation-other'; capabilityStatus = 'Enabled' } }
-    return [pscustomobject]@{ id = $User.Id; userPrincipalName = $User.Upn; accountEnabled = $User.AccountEnabled; mail = (Get-PraValue $User 'Mail' $User.Upn); mailNickname = $User.Alias; proxyAddresses = @($User.Addresses)
+    return [pscustomobject]@{ id = $User.Id; userPrincipalName = $User.Upn; accountEnabled = $User.AccountEnabled; mail = (Get-PcmValue $User 'Mail' $User.Upn); mailNickname = $User.Alias; proxyAddresses = @($User.Addresses)
         onPremisesSyncEnabled = $(if ($User.Synced -and -not $User.CloudManaged) { $true } else { $null }); onPremisesImmutableId = $User.ImmutableId
         usageLocation = $(if ($User.UsageLocation) { $User.UsageLocation } else { $null }); assignedLicenses = $licences; licenseAssignmentStates = $states
         assignedPlans = $plans; serviceProvisioningErrors = @() }
@@ -330,7 +343,7 @@ function global:Test-PraFakeGraphFilter {
         Atom {
             switch ($Expression.Property) {
                 userPrincipalName { return ($User.Upn -ieq $Expression.Value) }
-                mail { return ((Get-PraValue $User 'Mail' $User.Upn) -ieq $Expression.Value) }
+                mail { return ((Get-PcmValue $User 'Mail' $User.Upn) -ieq $Expression.Value) }
                 mailNickname { return ($User.Alias -ieq $Expression.Value) }
                 onPremisesImmutableId { return ($User.ImmutableId -ceq $Expression.Value) }
                 proxyAddresses {
@@ -420,10 +433,54 @@ function global:Invoke-MgGraphRequest {
             return [pscustomobject]@{ value = @($skus) }
         }
         '^organization$' { return [pscustomobject]@{ value = @([pscustomobject]@{ id = 'org'; displayName = 'Contoso'; onPremisesSyncEnabled = $true; onPremisesLastSyncDateTime = '2026-10-07T08:00:00Z' }) } }
+        '^groups$' {
+            if ($fake.Faults.GroupReadDenied) { Stop-PraFakeGraph 403 'Authorization_RequestDenied' 'Group read denied.' }
+            $parameters = @{}
+            foreach ($pair in @(([string]$query) -split '&' | Where-Object { $_ })) { $name, $value = $pair -split '=', 2; $parameters[[uri]::UnescapeDataString($name)] = [uri]::UnescapeDataString([string]$value) }
+            $filter = [string]$parameters['$filter']
+            $wanted = @([regex]::Matches($filter, "(displayName|mail|mailNickname) eq '((?:[^']|'')*)'") | ForEach-Object { @{ Property = $_.Groups[1].Value; Value = $_.Groups[2].Value.Replace("''", "'") } })
+            if (-not $wanted.Count) { Stop-PraFakeGraph 400 'Request_UnsupportedQuery' 'Fake Graph: only equality filters on displayName, mail and mailNickname are supported for groups.' }
+            $found = foreach ($group in $fake.EntraGroups.Values) {
+                foreach ($one in $wanted) {
+                    $actual = switch ($one.Property) { displayName { $group.Name } mail { $group.Mail } mailNickname { $group.Nickname } }
+                    if ($actual -and $actual -ieq $one.Value) { $group; break }
+                }
+            }
+            return [pscustomobject]@{ value = @($found | ForEach-Object { [pscustomobject]@{ id = $_.Id; displayName = $_.Name; mail = $(if ($_.Mail) { $_.Mail } else { $null }); mailNickname = $_.Nickname; onPremisesSyncEnabled = $null; groupTypes = @() } }) }
+        }
+        '^groups/[^/]+/transitiveMembers$' {
+            if ($fake.Faults.GroupReadDenied) { Stop-PraFakeGraph 403 'Authorization_RequestDenied' 'Group read denied.' }
+            if (-not $fake.EntraGroups.Contains($parts[1])) { Stop-PraFakeGraph 404 'Request_ResourceNotFound' 'Group not found.' }
+            $members = @($fake.EntraGroups[$parts[1]].Members)
+            $skip = 0
+            foreach ($pair in @(([string]$query) -split '&' | Where-Object { $_ })) { $name, $value = $pair -split '=', 2; if ([uri]::UnescapeDataString($name) -eq '$skiptoken') { $skip = [int]$value } }
+            $size = [Math]::Max(1, [int]$fake.GroupPageSize)
+            $page = @($members | Select-Object -Skip $skip -First $size | ForEach-Object {
+                    $member = $_
+                    $type = if ($member.ContainsKey('Type')) { [string]$member.Type } else { 'user' }
+                    $user = if ($member.ContainsKey('User')) { $member.User } else { $null }
+                    $item = [ordered]@{ '@odata.type' = ('#microsoft.graph.' + $type); id = $(if ($user) { $user.Id } elseif ($member.ContainsKey('Id')) { $member.Id } else { [guid]::NewGuid().ToString() })
+                        displayName = $(if ($member.ContainsKey('Name')) { $member.Name } elseif ($user) { $user.Name } else { $null }) }
+                    if ($type -eq 'user') {
+                        $item.userPrincipalName = $(if ($user) { $user.Upn } elseif ($member.ContainsKey('Upn')) { $member.Upn } else { $null })
+                        $item.mail = $(if ($user) { $user.Mail } elseif ($member.ContainsKey('Mail')) { $member.Mail } else { $null })
+                        $item.onPremisesImmutableId = $(if ($user) { $user.ImmutableId } elseif ($member.ContainsKey('ImmutableId')) { $member.ImmutableId } else { $null })
+                    }
+                    [pscustomobject]$item
+                })
+            $answer = [ordered]@{ value = $page }
+            if ($skip + $size -lt $members.Count) { $answer['@odata.nextLink'] = 'https://graph.microsoft.com/v1.0/groups/{0}/transitiveMembers?$select=id,userPrincipalName,mail,onPremisesImmutableId,displayName&$top=999&$skiptoken={1}' -f $parts[1], ($skip + $size) }
+            return [pscustomobject]$answer
+        }
         '^groups/[^/]+$' {
+            if ($fake.EntraGroups.Contains($parts[1])) {
+                if ($fake.Faults.GroupReadDenied) { Stop-PraFakeGraph 403 'Authorization_RequestDenied' 'Group read denied.' }
+                $entra = $fake.EntraGroups[$parts[1]]
+                return [pscustomobject]@{ id = $entra.Id; displayName = $entra.Name; mail = $(if ($entra.Mail) { $entra.Mail } else { $null }); mailNickname = $entra.Nickname; onPremisesSyncEnabled = $null; groupTypes = @() }
+            }
             if ($parts[1] -ne $fake.Group.Id) { Stop-PraFakeGraph 404 'Request_ResourceNotFound' 'Group not found.' }
             $group = $fake.Group
-            return [pscustomobject]@{ id = $group.Id; displayName = $group.Name; securityEnabled = (Get-PraValue $group 'SecurityEnabled' $true); mailEnabled = (Get-PraValue $group 'MailEnabled' $false); groupTypes = (Get-PraValue $group 'GroupTypes' @())
+            return [pscustomobject]@{ id = $group.Id; displayName = $group.Name; securityEnabled = (Get-PcmValue $group 'SecurityEnabled' $true); mailEnabled = (Get-PcmValue $group 'MailEnabled' $false); groupTypes = (Get-PcmValue $group 'GroupTypes' @())
                 onPremisesSyncEnabled = $(if ($group.Synced -and -not $group.CloudManaged) { $true } else { $null })
                 onPremisesLastSyncDateTime = $(if ($group.Synced) { '2026-10-07T08:00:00Z' } else { $null })
                 onPremisesSecurityIdentifier = $(if ($group.Synced) { 'S-1-5-21-100-200-300-400' } else { $null })
@@ -466,7 +523,7 @@ function global:Invoke-MgGraphRequest {
             switch ($Method) {
                 'GET' {
                     $result = ConvertTo-PraFakeGraphUser $user
-                    if (Get-PraValue $user 'SignInVerificationActive' $false) {
+                    if (Get-PcmValue $user 'SignInVerificationActive' $false) {
                         $user.SignInPollReads++
                         if ($user.SignInPendingReads -gt 0) { $result.accountEnabled = $true; $user.SignInPendingReads-- }
                         switch ($fake.Faults.SignInReadFault) {
@@ -664,10 +721,10 @@ function global:Set-User {
     $user = Get-PraFakeUserOrError $Identity
     Write-PraFakeCall "Set-User $($user.Upn)"
     $parameters = @{}
-    foreach ($entry in $PSBoundParameters.GetEnumerator()) { $parameters[$entry.Key] = $entry.Value }
+    foreach ($entry in $PSBoundParameters.GetEnumerator()) { if ($entry.Key -notin [System.Management.Automation.PSCmdlet]::CommonParameters) { $parameters[$entry.Key] = $entry.Value } }
     $global:PraFake.UserWrites.Add($parameters)
     $fields = @('Office','StreetAddress','City','StateOrProvince','PostalCode','CountryOrRegion','Phone','Notes')
-    # Model the observed noninteractive failure of Set-User's built-in pause without prompting the test host.
+    # Model the noninteractive failure of Set-User's built-in pause without prompting the test host.
     if (@($fields | Where-Object { $PSBoundParameters.ContainsKey($_) }).Count -and -not $Force -and
         (-not $PSBoundParameters.ContainsKey('Confirm') -or [bool]$PSBoundParameters['Confirm'])) {
         throw 'A server side error has occurred because of which the operation could not be completed.'
@@ -725,7 +782,7 @@ function global:Set-DistributionGroup {
     $read = Get-DistributionGroup -Identity $Identity
     $group = $global:PraFake.RoomLists[$read.Guid]
     foreach ($key in $PSBoundParameters.Keys) {
-        if ($key -notin @('Identity','BypassSecurityGroupManagerCheck','ErrorAction')) { $group[$key] = $PSBoundParameters[$key] }
+        if ($key -notin @('Identity','BypassSecurityGroupManagerCheck') -and $key -notin [System.Management.Automation.PSCmdlet]::CommonParameters) { $group[$key] = $PSBoundParameters[$key] }
     }
     Write-PraFakeCall "Set-RoomList $($group.PrimarySmtpAddress)"
     if ($global:PraFake.Faults.CrashAfterRoomListConfig) { $global:PraFake.Faults.CrashAfterRoomListConfig = $false; throw 'Interrupted after room-list configuration.' }
@@ -792,10 +849,10 @@ function global:Get-Mailbox {
     if (-not $user) { return }
     if ($user.Type -notmatch 'Mailbox$') { Write-Error "$Identity isn't a mailbox."; return }
     $result = @{ ExchangeGuid = $user.ExchangeGuid; ExternalDirectoryObjectId = $user.Id; InPlaceHolds = @($user.Holds); LitigationHoldEnabled = $false; GrantSendOnBehalfTo = @($user.SendOnBehalf)
-        CustomAttribute1 = $user.Tag; CustomAttribute15 = $user.Marker; CustomAttribute14 = (Get-PraValue $user 'Marker14' ''); DelayHoldApplied = $false; DelayReleaseHoldApplied = $false
+        CustomAttribute1 = $user.Tag; CustomAttribute15 = $user.Marker; CustomAttribute14 = (Get-PcmValue $user 'Marker14' ''); DelayHoldApplied = $false; DelayReleaseHoldApplied = $false
         PrimarySmtpAddress = $user.Upn; EmailAddresses = @($user.Addresses); ResourceCapacity = $user.ResourceCapacity; ResourceCustom = @($user.ResourceCustom); HiddenFromAddressListsEnabled = $user.Hidden }
     foreach ($field in @('LitigationHoldEnabled','RetentionHoldEnabled','DelayHoldApplied','DelayReleaseHoldApplied','ComplianceTagHoldApplied')) {
-        $result[$field] = Get-PraValue $user $field $false
+        $result[$field] = Get-PcmValue $user $field $false
     }
     foreach ($field in $user.Delivery.Keys) { $result[$field] = $user.Delivery[$field] }
     [pscustomobject]$result
@@ -876,7 +933,7 @@ function global:Set-CalendarProcessing {
     $user = Get-PraFakeUserOrError $Identity
     if ($AutomateProcessing -eq 'None' -and $global:PraFake.Faults.BookingDisableFails) { throw 'Booking disable refused.' }
     if ($AutomateProcessing -ne 'None' -and $global:PraFake.Faults.CalendarEnableFails) { throw 'Booking activation refused.' }
-    foreach ($key in $PSBoundParameters.Keys) { if ($key -notin @('Identity', 'ErrorAction')) { $user.Calendar[$key] = $PSBoundParameters[$key] } }
+    foreach ($key in $PSBoundParameters.Keys) { if ($key -notin @('Identity') -and $key -notin [System.Management.Automation.PSCmdlet]::CommonParameters) { $user.Calendar[$key] = $PSBoundParameters[$key] } }
     Write-PraFakeCall "Set-CalendarProcessing $($user.Upn) AutomateProcessing=$($user.Calendar.AutomateProcessing) AllBookInPolicy=$($user.Calendar.AllBookInPolicy)"
 }
 
@@ -982,15 +1039,15 @@ function global:Get-ResourceConfig {
 }
 
 function global:Get-CaseHoldPolicy {
-    <# -Identity: one policy with its locations (by object ID, as the lab shows). -Case: the policies of a case, WITHOUT their locations (lab 8 Oct). #>
+    <# -Identity: one policy with its locations (by object ID). -Case: the policies of a case, WITHOUT their locations. #>
     [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [string]$Case)
     $global:PraFake.Reads.Add('Get-CaseHoldPolicy')
     if ($Case) {
-        return @($global:PraFake.CasePolicies | Where-Object { $_.CaseId -eq $Case } | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Guid = [guid]$_.Guid; CaseId = $_.CaseId; Mode = (Get-PraValue $_ 'Mode' 'Enforce'); ExchangeLocation = @() } })
+        return @($global:PraFake.CasePolicies | Where-Object { $_.CaseId -eq $Case } | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Guid = [guid]$_.Guid; CaseId = $_.CaseId; Mode = (Get-PcmValue $_ 'Mode' 'Enforce'); ExchangeLocation = @() } })
     }
     $policy = $global:PraFake.CasePolicies | Where-Object { $_.Name -eq $Identity } | Select-Object -First 1
     if (-not $policy) { Write-Error "Policy $Identity not found."; return }
-    [pscustomobject]@{ Name = $policy.Name; Guid = [guid]$policy.Guid; CaseId = $policy.CaseId; Mode = (Get-PraValue $policy 'Mode' 'Enforce')
+    [pscustomobject]@{ Name = $policy.Name; Guid = [guid]$policy.Guid; CaseId = $policy.CaseId; Mode = (Get-PcmValue $policy 'Mode' 'Enforce')
         ExchangeLocation = @($policy.Locations | ForEach-Object { $u = Resolve-PraFakeUser $_; [pscustomobject]@{ Name = $(if ($u) { $u.Upn } else { $_ }); ImmutableIdentity = $_ } }) }
 }
 
@@ -1034,7 +1091,7 @@ function global:New-CaseHoldRule {
 }
 #endregion
 
-$global:PraFakeCommands = @('Get-MgContext', 'Get-MgRequestContext', 'Set-MgRequestContext', 'Reset-PraFakeGraphTransport', 'Invoke-MgGraphRequest', 'Get-Recipient', 'Get-User', 'Get-MailUser', 'Get-Mailbox', 'Get-MailboxLocation', 'Set-MailUser', 'Set-Mailbox', 'Get-OrganizationConfig', 'Get-PraFakeMailboxPlan',
+$global:PraFakeCommands = @('Add-PraFakeEntraGroup', 'Get-MgContext', 'Get-MgRequestContext', 'Set-MgRequestContext', 'Reset-PraFakeGraphTransport', 'Invoke-MgGraphRequest', 'Get-Recipient', 'Get-User', 'Get-MailUser', 'Get-Mailbox', 'Get-MailboxLocation', 'Set-MailUser', 'Set-Mailbox', 'Get-OrganizationConfig', 'Get-PraFakeMailboxPlan',
     'New-Mailbox', 'Set-CalendarProcessing', 'Get-CalendarProcessing', 'Set-MailboxCalendarConfiguration', 'Get-MailboxCalendarConfiguration', 'New-MailContact', 'Get-MailContact', 'Set-MailContact', 'Get-ResourceConfig',
     'Set-User', 'Get-DistributionGroup', 'Get-DistributionGroupMember', 'Add-DistributionGroupMember',
     'New-DistributionGroup', 'Set-DistributionGroup',

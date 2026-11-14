@@ -1,70 +1,24 @@
 # Changelog
 
-## 1.3.0 - Unreleased
+## 2.0.0 - 2026-11-14
 
-### Added
-- Optional `Scope.ResourceMode = 'CloudResource'` lifecycle for native rooms/equipment excluded from Entra
-  synchronisation: true cloud resource mailboxes instead of shared-mailbox conversion; sign-in disabled.
-- Resource capacity, custom properties, supported booking policies/delegates and working hours captured by
-  Collect; snapshot schema 2 with read-only compatibility and writable migration of schema 1.
-- Native resource metadata now includes Office, postal address, country/region, phone, notes and room-list
-  identity/membership metadata (resource JSON schema 2; a new Collect is required). Convert restores descriptive
-  properties and creates missing true cloud RoomLists before their rooms, then adds the selected owned room
-  members. Lists shared by rooms are deduplicated; creation intent, token and immutable cloud identity are journaled
-  for crash-safe resume. Original aliases/display names, SMTP/X500 addresses, visibility, delivery and membership
-  controls are captured. Earlier room-list metadata needs a new Collect.
-- Compatible existing cloud-only room lists can be reused without replacing settings/members. Conflicting
-  recipients/aliases/proxies, synchronised or replaced groups, inconsistent snapshot metadata and failed readbacks
-  block dependent rooms. No ordinary group is converted and no out-of-scope room is created.
-- Recover retains room lists and never inserts routing MailContacts into them or automatically deletes groups.
-- Native PCA resources no longer collect or replay general FullAccess/SendAs/SendOnBehalf permissions, including
-  permission rows from older snapshots. Directory visibility and booking restrictions/delegates remain preserved;
-  calendar-folder ACLs and old mailbox contents remain excluded. Legacy synced-resource permissions are unchanged.
-- Invitation delivery controls (allowed/rejected senders or groups, authenticated senders and moderation)
-  are captured with portable SMTP references and restored/read back; unresolved controls never become permissive defaults.
-- New native journals persist `protectionMode = 'None'`: standard room/equipment mailboxes up to 50 GB
-  require no assigned licences, licensing group, licensing usageLocation, enterprise capacity or case hold.
-  Native-only Check/Preview/Convert/Recover do not need a Compliance connection or licensing inventory.
-- `Resources.AllowUnprotectedDeletion` defaults to `$false`; Recover preview and the single Apply
-  confirmation warn of no hold/no inactive copy and loss of cloud-created reservations/messages.
-  Explicit consent and verified native routing are required before deleting only the journal-owned identity.
-- Unprotected Recover verifies the exact deleted identity and non-inactive soft-deleted mailbox, then foreign
-  address collisions before contact creation. Pending deletion/address collisions are resumable; no purge shortcuts,
-  automatic hold removal or licence revocation. Unexpected assigned licences/active or organisation holds fail closed.
-- Old native journals lacking protection mode retain the licensed `CaseHold`/exact inactive-copy lifecycle;
-  explicit protected journals are also preserved, including Convert resume. Recover resume rejects changed ownership/mode.
-- Window facts distinguish disabled, legacy synced, unprotected native and old protected journal paths.
+Highlights, in plain words:
 
-### Fixed
-- Unprotected Recover no longer treats retained proxies on its exact freshly verified journal-owned tombstone
-  as an automatic contact blocker. Both immutable IDs, the exact resource type, valid `WhenSoftDeleted` and
-  durable verified deletion are required; foreign/active recipients still block. Exchange contact uniqueness
-  failures remain explicit errors in a Partial journal, never Done, without purge or tombstone changes.
-  A returned contact GUID is persisted before configuration so a failed configuration resumes the same contact.
-- Native readiness and journal protection modes fail closed when missing, unknown or non-scalar; old
-  journals without a mode still explicitly retain the `CaseHold` contract.
-- Unprotected deletion records intent, request-in-flight, returned and verified stages. Ambiguous requests
-  are not retried automatically, including after a crash and restoration of the same immutable identity;
-  definitively rejected requests remain resumable. A final ID read precedes routing contact creation/configuration.
-- Both routing and destructive-recovery consents stay `$false` in packaged configuration.
-- Corrected deletion-progress test-case expansion under Pester 6 strict mode.
-- A native room is added to its lists only after its final ownership/disabled-sign-in/licence checks succeed;
-  each room still completes independently, with no global resource-staging pass.
-- Native descriptive restoration explicitly passes `Set-User -Confirm:$false` for its built-in pause in unattended
-  sessions, without `-Force`; all eight captured fields, including full Notes, still require Exchange readback.
-
-### Lab qualification
-- The native-resource path was exercised on 13-14 October 2026 with two synthetic rooms, one equipment
-  mailbox and one RoomList: real Collect, Check, Convert, descriptive/booking/work-hours readbacks and
-  memberships, five delivered assistant responses (three acceptances and two expected refusals), and Recover.
-- Recover created and verified the three routing contacts while the exact owned soft-deleted mailboxes
-  remained intact, without a licence, hold, purge or proxy removal. Interrupted provisioning and delayed
-  contact visibility resumed the same journaled objects.
-- Individual calendar-item diagnostics, client Room Finder/Places discovery and a new message delivered
-  through the recovery contacts were not qualified. SMTP recipient acceptance and contact routing properties
-  were verified; this is not a substitute for testing the full mail path in the target tenant.
-
-Published 1.2.0 assets and the legacy synced-resource lifecycle are unchanged.
+- **PowerShell 7.5 for everything.** Collect and the console run in PowerShell 7.5 or later; Windows PowerShell 5.1 is no longer used. Collect reads Exchange through a remote session (Kerberos), so it can run from any domain-joined server. Set `Exchange.Server`; `Exchange.ConnectionMode` is gone.
+- **The snapshot is protected.** Collect writes a `.sha256` file beside the snapshot and its backup. Check, Convert and Recover verify it and stop, with nothing changed, when the file was changed after its Collect (`-AcceptUnverifiedSnapshot` runs it anyway and says so). A snapshot without a `.sha256` file only gives a warning. The guides explain how to back it up off-site and restrict access.
+- **A new guided console.** Five pages (Setup, Task, Verify, Run, Next steps), a mandatory preview, a typed confirmation, run-only settings that never write the configuration file, an interactive sign-in option, and a light, dark or system theme.
+- **Choose the objects of a run.** `-CsvPath` (`-IdentityPath` still works), `-SearchBase` (an OU), `-Group` and `-MaxObjects`, one source per run. A group is read from what Collect kept (`Collect.TargetGroups`), then from Microsoft Entra ID; a member that is not a mailbox is skipped and the run says why. `Convert -Batch` honours these options too.
+- **Follow a batch.** `Check -Batch <id> [-Expect Provisioned|Deprovisioned|Retained] [-Once]` tells whether the objects are in the state the batch should give. One global report per batch follows every run and every object end to end.
+- **Interactive sign-in.** `Cloud.SignIn = 'Interactive'` lets an administrator sign in instead of the certificate; Check says which permissions and roles are missing.
+- **Safer commands.** Nothing you type is case sensitive. Every change goes through `-WhatIf`, `-Confirm` and `-Force`; a Preview never writes. Without `-Action` the script prints how to use it and stops. A failed run always ends with the next step, with the exact command to run again; options that cannot go together get one command for each choice. The last line of a run is `RESULT: PASS`, `PENDING`, `FAIL` or `CANCELLED` (you answered no to the confirmation). Lists with a duplicate, an empty line or an unknown object are refused before any change. The cloud modules are checked first (`Microsoft.Graph.Authentication` 2.41.1, `ExchangeOnlineManagement` 3.10.1).
+- **Schedule the daily Collect.** `-Action Schedule` checks the account (a domain user that Exchange accepts) and registers the daily task, from the command line or from the console. Preview first.
+- **No more waiting for ever.** Every call to Microsoft 365 has a time limit (`Polling.CallTimeoutMinutes`, 5 minutes by default). When Microsoft 365 does not answer, the run stops with a plain message and the command to run again; a Convert or Recover batch continues from its journal.
+- **One error per cause.** When the log folder cannot be created, the run says so once, with the cause, instead of repeating the error.
+- **Licences.** `Licensing.Shared.KeepFree` keeps units of the shared mailbox licence out of Convert; `Recover.WaveSize` sets the Recover wave size.
+- **Native rooms and equipment (opt-in).** With `Scope.ResourceMode = 'CloudResource'`, rooms and equipment excluded from synchronisation get real cloud resources with their booking settings and room lists. Recover has no hold and no inactive copy for them, and needs two explicit consents (`Resources.OnPremisesReady`, `Resources.AllowUnprotectedDeletion`). Shared mailboxes and users are unchanged.
+- **A signed package.** The runtime is in the `package` folder, with `PackageIntegrity.psd1` and a check at every start. Modules are named `PRA.*`; every command has the prefix `Pcm`, so this tool and PRA Remote Mailbox can be loaded in the same PowerShell session.
+- **New guides.** A beginner user guide (console and command line side by side, a picture of every page) and an administrator guide with the minimum permissions of each action.
+- **Upgrading from 1.x.** Recreate the scheduled task of Collect with `pwsh.exe`, set `Exchange.Server`, remove `Exchange.ConnectionMode`. Keep your snapshot and journal files: older ones are still read (snapshots written before 2.0.0 have no `.sha256` file: run a Collect to get one).
 
 ## 1.2.0 - 2026-10-09
 
@@ -128,15 +82,15 @@ A window for every action, and waves of objects. The engine is unchanged when it
   questions of Entra Connect `Manual` mode are asked in the window. Fluent theme with PowerShell 7.5 and later.
 - `-IdentityPath`: Check, Convert and Recover on a list of objects (one identity per line, or a CSV file with an
   `Identity` column); the identities found nowhere are listed as a warning.
-- `PRA2.Common`: events of the run for the window (`PRA_EVENT_FILE`), stop request (`PRA_STOP_FILE`), questions
-  to the operator in the window or in the console (`Request-PraOperator`).
+- `PRA.Common`: events of the run for the window (`PRA_EVENT_FILE`), stop request (`PRA_STOP_FILE`), questions
+  to the operator in the window or in the console (`Request-PcmOperator`).
 - Tests: `PraCloudMailbox.Gui.Tests.ps1` (both editions, a real child run included); end-to-end scenarios for waves
   with `-IdentityPath`, a stop of Convert and of Recover followed by their resume, and the events of a run.
 
 ### Changed
-- Entra Connect `Manual` mode asks through `Request-PraOperator`: in the window when the run belongs to it,
+- Entra Connect `Manual` mode asks through `Request-PcmOperator`: in the window when the run belongs to it,
   otherwise in the console as before.
-- The package contains `module\PRA2.Gui.psm1` and `module\PRA2.Gui.xaml`.
+- The package contains `module\PRA.Gui.psm1` and `module\PRA.Gui.xaml`.
 
 ### Fixed
 - Microsoft Graph calls are sent again when the connection failed without an answer (timeout, reset): seen in the

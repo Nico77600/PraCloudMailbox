@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+﻿#Requires -Version 7.5
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][ValidateSet('Analyze', 'Test', 'Package')][string]$Stage,
@@ -8,11 +8,6 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-if ($PSVersionTable.PSEdition -eq 'Desktop') {
-    foreach ($name in 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Security') {
-        Import-Module (Join-Path $PSHOME ('Modules\{0}\{0}.psd1' -f $name)) -ErrorAction Stop
-    }
-}
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $configuration = Get-Content -LiteralPath (Join-Path $root '.github\ci.json') -Raw | ConvertFrom-Json
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
@@ -39,11 +34,14 @@ switch ($Stage) {
         $tracked = @(git -C $root ls-files -- '*.ps1' '*.psm1' '*.psd1')
         if ($LASTEXITCODE -ne 0) { throw 'Cannot enumerate the tracked PowerShell sources.' }
         $runtime = [string]$configuration.runtimeRoot
-        $files = @($tracked | Where-Object {
+        $runtimeFiles = @($tracked | Where-Object {
             ($_ -notmatch '^(tests|tools|lib|\.github)/') -and
             ($runtime -eq '.' -or $_.StartsWith($runtime.TrimEnd('/') + '/', [StringComparison]::Ordinal))
         })
-        if ($files.Count -eq 0) { throw 'No tracked runtime PowerShell sources were found.' }
+        if ($runtimeFiles.Count -eq 0) { throw 'No tracked runtime PowerShell sources were found.' }
+        # Tests and tools are analysed too (advisory, same policy as the runtime); they are not part of the package.
+        $supportFiles = @($tracked | Where-Object { $_ -match '^(tests|tools)/' })
+        $files = @($runtimeFiles) + @($supportFiles)
         $parseFailures = @()
         $findings = @(foreach ($relative in $files) {
             $path = Resolve-RepositoryFile $relative
@@ -57,7 +55,7 @@ switch ($Stage) {
             }
             foreach ($finding in @(Invoke-ScriptAnalyzer -Path $path -ErrorAction Stop)) {
                 [pscustomobject]@{
-                    File = $relative; Line = $finding.Line; Column = $finding.Column
+                    File = $relative; Scope = $(if ($relative -in $runtimeFiles) { 'runtime' } else { 'tests-tools' }); Line = $finding.Line; Column = $finding.Column
                     Severity = [string]$finding.Severity; Rule = $finding.RuleName; Message = $finding.Message
                 }
             }
@@ -67,7 +65,7 @@ switch ($Stage) {
         ConvertTo-Json -InputObject $parseFailures -Depth 5 |
             Out-File -LiteralPath (Join-Path $OutputDirectory 'syntax-errors.json') -Encoding utf8
         $summary = [ordered]@{
-            Files = $files.Count; Analyzer = '1.25.0'; SyntaxErrors = $parseFailures.Count
+            Files = $files.Count; RuntimeFiles = $runtimeFiles.Count; TestAndToolFiles = $supportFiles.Count; Analyzer = '1.25.0'; SyntaxErrors = $parseFailures.Count
             Errors = @($findings | Where-Object Severity -eq 'Error').Count
             Warnings = @($findings | Where-Object Severity -eq 'Warning').Count
             Informative = @($findings | Where-Object Severity -eq 'Information').Count
@@ -76,15 +74,13 @@ switch ($Stage) {
         $summary | ConvertTo-Json |
             Out-File -LiteralPath (Join-Path $OutputDirectory 'analysis-summary.json') -Encoding utf8
         Write-Output ($summary | ConvertTo-Json -Compress)
-        if ($parseFailures.Count) { throw 'Runtime PowerShell sources contain syntax errors.' }
+        if ($parseFailures.Count) { throw 'PowerShell sources (runtime, tests or tools) contain syntax errors.' }
     }
     'Test' {
         Import-Module Pester -RequiredVersion 6.1.0 -Force -ErrorAction Stop
         if ($configuration.testMode -eq 'gate') {
             $gate = Resolve-RepositoryFile $configuration.testEntry
-            $executable = if ($PSVersionTable.PSEdition -eq 'Desktop') {
-                Join-Path $PSHOME 'powershell.exe'
-            } else { Join-Path $PSHOME 'pwsh.exe' }
+            $executable = Join-Path $PSHOME 'pwsh.exe'
             & $executable -NoProfile -NonInteractive -File $gate
             if ($LASTEXITCODE -ne 0) { throw "The existing project test gate failed with exit code $LASTEXITCODE." }
         } elseif ($configuration.testMode -eq 'runner') {

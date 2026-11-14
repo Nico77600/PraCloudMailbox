@@ -1,9 +1,21 @@
-#Requires -Version 5.1
+﻿#Requires -Version 7.5
+
+BeforeAll {
+    . (Join-Path $PSScriptRoot 'GlobalState.ps1')
+    $script:GlobalBefore = Save-PcmGlobalState
+}
+
+AfterAll {
+    Restore-PcmGlobalState $script:GlobalBefore
+}
+
 
 Describe 'Graph transport lifecycle (offline context model)' {
     BeforeAll {
-        Import-Module (Join-Path $PSScriptRoot '..\module\PRA2.Common.psm1') -Force
-        Import-Module (Join-Path $PSScriptRoot '..\module\PRA2.Cloud.psm1') -Force
+        . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
+        $script:Package = New-PcmTestPackage -Repository ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')))
+        Import-Module (Join-Path $script:Package 'module\PRA.Common.psm1') -Force
+        Import-Module (Join-Path $script:Package 'module\PRA.Cloud.psm1') -Force
         . (Join-Path $PSScriptRoot 'GraphRequestContext.Fake.ps1')
         function global:Connect-MgGraph {
             [CmdletBinding()]
@@ -17,21 +29,22 @@ Describe 'Graph transport lifecycle (offline context model)' {
     }
     BeforeEach {
         Reset-PraFakeGraphTransport
-        & (Get-Module PRA2.Cloud) {
+        & (Get-Module PRA.Cloud) {
             $script:GraphRequestOwner = $null
             $script:GraphTransportReady = $false
         }
         $global:PraFakeGraphRequest.MaxRetry = 3
-        $context = @{ Config = @{ Cloud = @{ TenantId = 'synthetic'; Organization = 'synthetic'; AppId = 'synthetic'; CertificateThumbprint = '12345678' }; Scope = @{} } }
-        Mock Import-Module -ModuleName PRA2.Cloud { }
-        Mock Get-ChildItem -ModuleName PRA2.Cloud { [pscustomobject]@{ HasPrivateKey = $true; NotAfter = (Get-Date).AddYears(1) } }
-        Mock Connect-ExchangeOnline -ModuleName PRA2.Cloud { }
-        Mock Connect-MgGraph -ModuleName PRA2.Cloud {
+        $context = @{ Config = @{ Cloud = @{ TenantId = 'synthetic'; Organization = 'synthetic'; AppId = 'synthetic'; CertificateThumbprint = '12345678' }; Scope = @{} }
+            Approval = { param($Target, $Operation) $true } }
+        Mock Import-Module -ModuleName PRA.Cloud { }
+        Mock Get-ChildItem -ModuleName PRA.Cloud { [pscustomobject]@{ HasPrivateKey = $true; NotAfter = (Get-Date).AddYears(1) } }
+        Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { }
+        Mock Connect-MgGraph -ModuleName PRA.Cloud {
             $global:PraFakeGraphRequest.MaxRetry | Should -Be 0
             $ContextScope | Should -BeExactly Process
             $global:PraFakeGraphAuth = [pscustomobject]@{ ClientId = $ClientId }
         }
-        Mock Disconnect-MgGraph -ModuleName PRA2.Cloud { $global:PraFakeGraphAuth = $null }
+        Mock Disconnect-MgGraph -ModuleName PRA.Cloud { $global:PraFakeGraphAuth = $null }
     }
     AfterAll {
         foreach ($name in @('Get-MgContext', 'Get-MgRequestContext', 'Set-MgRequestContext', 'Reset-PraFakeGraphTransport', 'Connect-MgGraph', 'Disconnect-MgGraph', 'Connect-ExchangeOnline')) {
@@ -40,61 +53,61 @@ Describe 'Graph transport lifecycle (offline context model)' {
     }
     It 'initializes before authentication and restores only after disconnect, preserving other request settings' {
         $before = $global:PraFakeGraphRequest | ConvertTo-Json -Compress
-        Connect-Pra2Cloud -Context $context | Should -Not -BeNullOrEmpty
+        Connect-PcmCloud -Context $context | Should -Not -BeNullOrEmpty
         $global:PraFakeGraphClientGeneration | Should -Be 2
-        Disconnect-Pra2Cloud -Context $context
+        Disconnect-PcmCloud -Context $context
         ($global:PraFakeGraphRequest | ConvertTo-Json -Compress) | Should -BeExactly $before
         $global:PraFakeGraphClientGeneration | Should -Be 3
-        Should -Invoke Connect-MgGraph -ModuleName PRA2.Cloud -Times 1 -Exactly
+        Should -Invoke Connect-MgGraph -ModuleName PRA.Cloud -Times 1 -Exactly
     }
     It 'rejects an existing SDK context even with MaxRetry=<Retry>, without replacing its cached client' -TestCases @(@{ Retry = 0 }, @{ Retry = 3 }) {
         param($Retry)
         $global:PraFakeGraphAuth = [pscustomobject]@{ ClientId = 'external' }
         $global:PraFakeGraphRequest.MaxRetry = $Retry
-        { Connect-Pra2Cloud -Context $context } | Should -Throw '*existing SDK session*'
+        { Connect-PcmCloud -Context $context } | Should -Throw '*existing SDK session*'
         $global:PraFakeGraphClientGeneration | Should -Be 1
         $global:PraFakeGraphAuth.ClientId | Should -BeExactly external
-        Should -Invoke Connect-MgGraph -ModuleName PRA2.Cloud -Times 0 -Exactly
-        Should -Invoke Disconnect-MgGraph -ModuleName PRA2.Cloud -Times 0 -Exactly
+        Should -Invoke Connect-MgGraph -ModuleName PRA.Cloud -Times 0 -Exactly
+        Should -Invoke Disconnect-MgGraph -ModuleName PRA.Cloud -Times 0 -Exactly
     }
     It 'fails before authentication when <Fault> prevents initialization' -TestCases @(
         @{ Fault = 'MissingCommand' }, @{ Fault = 'InitialReadFails' }, @{ Fault = 'InitialContextMissing' }
         @{ Fault = 'SetFails' }, @{ Fault = 'ReadbackNonzero' }, @{ Fault = 'ReadbackMissing' }) {
         param($Fault)
         switch ($Fault) {
-            MissingCommand { Mock Get-Command -ModuleName PRA2.Cloud { throw 'Missing SDK context command' } -ParameterFilter { $Name -eq 'Set-MgRequestContext' } }
-            InitialReadFails { Mock Get-MgRequestContext -ModuleName PRA2.Cloud { throw 'Initial SDK context read failed' } }
+            MissingCommand { Mock Get-Command -ModuleName PRA.Cloud { throw 'Missing SDK context command' } -ParameterFilter { $Name -eq 'Set-MgRequestContext' } }
+            InitialReadFails { Mock Get-MgRequestContext -ModuleName PRA.Cloud { throw 'Initial SDK context read failed' } }
             InitialContextMissing { $global:PraFakeGraphRequest = $null }
-            SetFails { Mock Set-MgRequestContext -ModuleName PRA2.Cloud { throw 'SDK setting failed' } }
-            ReadbackNonzero { Mock Set-MgRequestContext -ModuleName PRA2.Cloud { $global:PraFakeGraphRequest } }
-            ReadbackMissing { Mock Set-MgRequestContext -ModuleName PRA2.Cloud { $global:PraFakeGraphRequest = $null } }
+            SetFails { Mock Set-MgRequestContext -ModuleName PRA.Cloud { throw 'SDK setting failed' } }
+            ReadbackNonzero { Mock Set-MgRequestContext -ModuleName PRA.Cloud { $global:PraFakeGraphRequest } }
+            ReadbackMissing { Mock Set-MgRequestContext -ModuleName PRA.Cloud { $global:PraFakeGraphRequest = $null } }
         }
-        { Connect-Pra2Cloud -Context $context -WarningAction SilentlyContinue } | Should -Throw
-        Should -Invoke Connect-MgGraph -ModuleName PRA2.Cloud -Times 0 -Exactly
+        { Connect-PcmCloud -Context $context -WarningAction SilentlyContinue } | Should -Throw
+        Should -Invoke Connect-MgGraph -ModuleName PRA.Cloud -Times 0 -Exactly
     }
     It 'cleans up failed authentication without resetting an authenticated cached client' {
-        Mock Connect-MgGraph -ModuleName PRA2.Cloud {
+        Mock Connect-MgGraph -ModuleName PRA.Cloud {
             $global:PraFakeGraphAuth = [pscustomobject]@{ ClientId = 'synthetic' }
             throw 'Synthetic authentication failure'
         }
-        { Connect-Pra2Cloud -Context $context } | Should -Throw '*Synthetic authentication failure*'
+        { Connect-PcmCloud -Context $context } | Should -Throw '*Synthetic authentication failure*'
         $global:PraFakeGraphAuth | Should -BeNullOrEmpty
         $global:PraFakeGraphRequest.MaxRetry | Should -Be 3
     }
     It 'does not restore request settings when SDK disconnect fails' {
-        Connect-Pra2Cloud -Context $context | Out-Null
-        Mock Disconnect-MgGraph -ModuleName PRA2.Cloud { throw 'Synthetic disconnect failure' }
-        Disconnect-Pra2Cloud -Context $context -WarningAction SilentlyContinue
+        Connect-PcmCloud -Context $context | Out-Null
+        Mock Disconnect-MgGraph -ModuleName PRA.Cloud { throw 'Synthetic disconnect failure' }
+        Disconnect-PcmCloud -Context $context -WarningAction SilentlyContinue
         $global:PraFakeGraphClientGeneration | Should -Be 2
         $global:PraFakeGraphRequest.MaxRetry | Should -Be 0
-        & (Get-Module PRA2.Cloud) { $script:GraphTransportReady } | Should -BeFalse
+        & (Get-Module PRA.Cloud) { $script:GraphTransportReady } | Should -BeFalse
     }
     It 'does not relinquish ownership when restoration cannot be verified' {
-        Connect-Pra2Cloud -Context $context | Out-Null
-        Mock Set-MgRequestContext -ModuleName PRA2.Cloud { $global:PraFakeGraphRequest }
-        Disconnect-Pra2Cloud -Context $context -WarningAction SilentlyContinue
-        & (Get-Module PRA2.Cloud) { $null -ne $script:GraphRequestOwner } | Should -BeTrue
-        & (Get-Module PRA2.Cloud) { $script:GraphTransportReady } | Should -BeFalse
+        Connect-PcmCloud -Context $context | Out-Null
+        Mock Set-MgRequestContext -ModuleName PRA.Cloud { $global:PraFakeGraphRequest }
+        Disconnect-PcmCloud -Context $context -WarningAction SilentlyContinue
+        & (Get-Module PRA.Cloud) { $null -ne $script:GraphRequestOwner } | Should -BeTrue
+        & (Get-Module PRA.Cloud) { $script:GraphTransportReady } | Should -BeFalse
     }
 }
 
@@ -105,7 +118,7 @@ Describe 'Installed Graph SDK transport (in-memory HTTP, no authentication)' -Sk
         $savedRetry = $null
         try {
             Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-            Import-Module (Join-Path $PSScriptRoot '..\module\PRA2.Cloud.psm1') -Force
+            Import-Module (Join-Path $script:Package 'module\PRA.Cloud.psm1') -Force
             # SDK 2.41 isolates Core in its own load context; resolve the session through
             # the imported cmdlet's metadata rather than PowerShell's default type lookup.
             $sdkAssembly = (Get-Command Get-MgRequestContext).ImplementingType.Assembly
@@ -198,7 +211,8 @@ public sealed class PraGraphOfflineHandler : HttpMessageHandler {
         $sdkSession.AuthContext = $null
         $sdkSession.GraphHttpClient = $null
         $null = Set-MgRequestContext -MaxRetry 3
-        & (Get-Module PRA2.Cloud) {
+        Set-PcmWriteApproval -Approval { param($Target, $Operation) $true }
+        & (Get-Module PRA.Cloud) {
             $script:GraphRequestOwner = $null
             $script:GraphTransportReady = $false
         }
@@ -225,11 +239,11 @@ public sealed class PraGraphOfflineHandler : HttpMessageHandler {
     It 'sends exactly one DELETE through the real SDK on HTTP <Status> after initialization (cached client=<Warm>)' -TestCases @(
         foreach ($status in 503, 504, 400, 403) { foreach ($warm in $false, $true) { @{ Status = $status; Warm = $warm } } }) {
         param($Status, $Warm)
-        & (Get-Module PRA2.Cloud) { Initialize-Pra2GraphTransport -Context @{} }
+        & (Get-Module PRA.Cloud) { Initialize-PcmGraphTransport -Context @{} }
         $fixture = New-OfflineSdkClient $(if ($Warm) { @(204, $Status, 204) } else { @($Status, 204) })
-        if ($Warm) { $null = Invoke-Pra2Graph -Method GET -Uri 'v1.0/users/offline-id' }
+        if ($Warm) { $null = Invoke-PcmGraph -Method GET -Uri 'v1.0/users/offline-id' }
         [object]::ReferenceEquals($sdkSession.GraphHttpClient, $fixture.Client) | Should -BeTrue
-        $failure = try { Invoke-Pra2Graph -Method DELETE -Uri 'v1.0/users/offline-id' -NoRetry } catch { $_ }
+        $failure = try { Invoke-PcmGraph -Method DELETE -Uri 'v1.0/users/offline-id' -NoRetry } catch { $_ }
         $failure | Should -Not -BeNullOrEmpty
         $failure.FullyQualifiedErrorId | Should -Match 'InvokeGraphHttpResponseException'
         [int]$failure.Exception.Response.StatusCode | Should -Be $Status
@@ -243,25 +257,25 @@ public sealed class PraGraphOfflineHandler : HttpMessageHandler {
         $fixture = New-OfflineSdkClient @(204)
         # Model a stale context/client mismatch: changing a context property alone cannot rebuild middleware.
         $sdkSession.RequestContext.MaxRetry = $Reported
-        { & (Get-Module PRA2.Cloud) { Initialize-Pra2GraphTransport -Context @{} } } | Should -Throw '*existing SDK session*'
+        { & (Get-Module PRA.Cloud) { Initialize-PcmGraphTransport -Context @{} } } | Should -Throw '*existing SDK session*'
         [object]::ReferenceEquals($sdkSession.GraphHttpClient, $fixture.Client) | Should -BeTrue
         $fixture.Terminal.Count | Should -Be 0
         (Get-MgRequestContext).MaxRetry | Should -Be $Reported
     }
     It 'fails closed with no wire attempt when retry settings change after initialization' {
-        & (Get-Module PRA2.Cloud) { Initialize-Pra2GraphTransport -Context @{} }
+        & (Get-Module PRA.Cloud) { Initialize-PcmGraphTransport -Context @{} }
         $fixture = New-OfflineSdkClient @(503, 204)
         $sdkSession.RequestContext.MaxRetry = 3
-        { Invoke-Pra2Graph -Method DELETE -Uri 'v1.0/users/offline-id' -NoRetry } | Should -Throw '*retry settings changed*'
+        { Invoke-PcmGraph -Method DELETE -Uri 'v1.0/users/offline-id' -NoRetry } | Should -Throw '*retry settings changed*'
         $fixture.Terminal.Count | Should -Be 0
         [object]::ReferenceEquals($sdkSession.GraphHttpClient, $fixture.Client) | Should -BeTrue
     }
     It 'keeps the ordinary <Method> retry budget at five wire attempts rather than multiplying SDK retries' -TestCases @(@{ Method = 'GET' }, @{ Method = 'PATCH' }, @{ Method = 'DELETE' }) {
         param($Method)
-        & (Get-Module PRA2.Cloud) { Initialize-Pra2GraphTransport -Context @{} }
+        & (Get-Module PRA.Cloud) { Initialize-PcmGraphTransport -Context @{} }
         $fixture = New-OfflineSdkClient @(503)
-        Mock Start-Sleep -ModuleName PRA2.Cloud { }
-        { Invoke-Pra2Graph -Method $Method -Uri 'v1.0/users/offline-id' } | Should -Throw
+        Mock Start-Sleep -ModuleName PRA.Cloud { }
+        { Invoke-PcmGraph -Method $Method -Uri 'v1.0/users/offline-id' } | Should -Throw
         $fixture.Terminal.Count | Should -Be 5
     }
 }

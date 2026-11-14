@@ -1,0 +1,477 @@
+<!doctype html>
+<!--
+    PRA Cloud Mailbox - HTML report template
+    Author  : Nicolas Fabert
+    Version : 2.0.0
+    PRA2.Common.psm1 (Write-PraReportHtml) replaces the markers below. Texts are HTML-encoded by the code:
+      {{TITLE}} {{SUBTITLE}} {{VERSION}}  texts of the header
+      {{META}}         run details (action, environment, objects, skipped members, batch, snapshot, computer, start, duration, run ID, run settings changed)
+      {{TILES}}        result tiles (Result, Objects, Done, Pending, Errors, Warnings, Planned, Skipped)
+      {{NEXT}}         "Next step" card (empty when there is none)
+      {{DATA_NOTICE}}  plain sentence for the no-JavaScript fallback: how many rows, errors and warnings the data holds
+      {{DATA}}         (the LAST occurrence in the file) the data, streamed by the code: the compressed chunks, then a JSON header (script elements)
+    The object rows, the run errors and the warnings are NOT HTML tables: they are stored as dictionary-indexed
+    columns in gzip+base64 chunks (compression is not encryption), decoded by the script at the end of this file and
+    displayed through virtual grids (at most 200 data rows exist in the page at any time, whatever the row count).
+    Everything else is static: edit texts, colours or layout here.
+-->
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<script>
+  (() => {
+    const theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", theme);
+  })();
+</script>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f7f4ef; --surface: #ffffff; --soft: #f5f5f5; --border: #dedede; --text: #242424; --muted: #5c5c5c;
+  --accent: #b11f4b; --accent-2: #9a1a41; --accent-soft: rgba(177, 31, 75, 0.08); --accent-fg: #ffffff; --highlight: rgba(177, 31, 75, 0.12);
+  --ok: #16a34a; --warn: #d97706; --fail: #dc2626; --info: #0078d4;
+}
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #3d3b3a; --surface: #292929; --soft: #2e2e2e; --border: #474747; --text: #dedede; --muted: #a0a0a0;
+  --accent: #fd8ea1; --accent-2: #fb7b91; --accent-soft: rgba(253, 142, 161, 0.14); --accent-fg: #1a1a1a; --highlight: rgba(253, 142, 161, 0.12);
+  --ok: #4ade80; --warn: #fbbf24; --fail: #f87171; --info: #4da6ff;
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 28px 32px; background: var(--bg); color: var(--text); font: 14px "Segoe UI", Aptos, Calibri, -apple-system, sans-serif; }
+header { position: relative; overflow: hidden; border: 1px solid var(--border); border-top: 4px solid var(--accent); border-radius: 16px; padding: 24px; margin-bottom: 20px; background: linear-gradient(125deg, var(--surface) 35%, var(--accent-soft)); }
+header::before { content: ""; position: absolute; width: 280px; height: 280px; right: -100px; top: -160px; border: 40px solid var(--highlight); border-radius: 50%; pointer-events: none; }
+.origin { color: var(--accent); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; }
+h1 { font-size: 30px; font-weight: 650; letter-spacing: -0.02em; margin: 8px 0 6px; }
+h2 { font-size: 16px; font-weight: 600; margin: 0 0 12px; }
+.subtitle { color: var(--muted); margin: 0 0 16px; }
+.meta { position: relative; display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 6px 24px; font-size: 13px; }
+.meta span { display: block; font-size: 11px; color: var(--accent); font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+.tiles { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 14px; margin: 0 0 20px; }
+.tile { position: relative; overflow: hidden; padding: 16px 18px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); transition: transform 160ms ease, border-color 160ms ease; }
+.tile:hover { transform: translateY(-3px); border-color: var(--accent); }
+.tile::after { content: ""; position: absolute; width: 70px; height: 70px; right: -26px; bottom: -30px; border: 12px solid var(--highlight); border-radius: 50%; }
+.tile-label { font-size: 12px; font-weight: 600; color: var(--muted); }
+.tile-value { font-size: 28px; font-weight: 650; margin-top: 8px; font-variant-numeric: tabular-nums; }
+.tile.ok .tile-value { color: var(--ok); } .tile.warn .tile-value { color: var(--warn); } .tile.fail .tile-value { color: var(--fail); } .tile.info .tile-value { color: var(--info); }
+.tile:first-child { background: linear-gradient(125deg, var(--accent-2), var(--accent)); border-color: var(--accent); }
+.tile:first-child .tile-label, .tile:first-child .tile-value { color: var(--accent-fg); }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 20px; margin-bottom: 20px; }
+.next { border-left: 4px solid var(--warn); }
+.warnings { border-left: 4px solid var(--warn); } .warnings h2 { color: var(--warn); }
+.next pre { background: var(--soft); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; white-space: pre-wrap; font: 13px Consolas, "Cascadia Mono", monospace; margin: 6px 0; }
+.loading { border-left: 4px solid var(--info); }
+.loading.error { border-left-color: var(--fail); }
+.loading.error #loading-text { color: var(--fail); font-weight: 600; }
+.progress { height: 8px; border-radius: 999px; background: var(--soft); border: 1px solid var(--border); overflow: hidden; margin-top: 10px; }
+.progress div { height: 100%; width: 0; background: var(--accent); }
+.nojs { border-left: 4px solid var(--fail); }
+.controls { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px 14px; margin-bottom: 12px; }
+.controls label, .filters-extra label { display: block; font-size: 11px; color: var(--accent); font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; margin-bottom: 3px; }
+.controls .wide { grid-column: span 2; }
+input, select, button { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); padding: 7px 10px; border-radius: 10px; min-width: 0; width: 100%; }
+button { width: auto; cursor: pointer; font-weight: 600; }
+button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+button:disabled { opacity: 0.55; cursor: default; }
+:focus-visible { outline: 2px solid var(--info); outline-offset: 1px; }
+details.filters-extra { margin: 0 0 12px; } details.filters-extra summary { cursor: pointer; color: var(--accent); font-weight: 600; margin-bottom: 8px; }
+.filters-extra .controls { margin-bottom: 0; }
+.bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 0 0 12px; }
+.bar .grow { flex: 1 1 260px; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { font-size: 12px; padding: 1px 9px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); font-variant-numeric: tabular-nums; }
+.tabs { display: inline-flex; gap: 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.tabs button { border: 0; border-radius: 0; background: var(--surface); }
+.tabs button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); }
+.viewport { position: relative; height: min(68vh, 640px); min-height: 280px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.grid-head, .grid-row { display: grid; grid-template-columns: var(--cols); min-width: var(--gridw); }
+.grid-head { position: sticky; top: 0; z-index: 2; background: var(--soft); border-bottom: 1px solid var(--border); font-weight: 600; font-size: 12.5px; }
+.grid-head > div { padding: 8px 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.spacer { position: relative; min-width: var(--gridw); }
+.grid-row { position: absolute; left: 0; right: 0; height: var(--rowh); border-bottom: 1px solid var(--border); font-size: 12.5px; cursor: pointer; align-items: center; }
+.grid-row:hover, .grid-row.active { background: var(--accent-soft); }
+.grid-row.active { outline: 2px solid var(--accent); outline-offset: -2px; }
+.grid-row > div { padding: 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.grid-row.has-warn > div:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+.grid-row small { display: block; color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+.grid-row .row-warn { color: var(--warn); font-weight: 600; }
+.mono { font-family: Consolas, "Cascadia Mono", monospace; font-size: 11.5px; }
+.empty { padding: 28px; text-align: center; color: var(--muted); }
+.badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-weight: 600; font-size: 11.5px; border: 1px solid currentColor; white-space: nowrap; }
+.badge.success, .badge.alreadydone { color: var(--ok); } .badge.pending { color: var(--warn); } .badge.error { color: var(--fail); }
+.badge.planned { color: var(--info); } .badge.skipped { color: var(--muted); }
+.pager { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 0 0 10px; }
+.pager input { max-width: 320px; }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th { background: var(--soft); text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; font-weight: 600; }
+td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; overflow-wrap: anywhere; cursor: pointer; }
+tr:hover td { background: var(--accent-soft); }
+dialog { max-width: min(900px, 94vw); width: 100%; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); color: var(--text); padding: 20px; }
+dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+dl { display: grid; grid-template-columns: minmax(130px, 220px) 1fr; gap: 6px 14px; margin: 0 0 14px; max-height: 60vh; overflow: auto; }
+dt { color: var(--accent); font-weight: 700; font-size: 12px; } dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12.5px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+footer { color: var(--muted); font-size: 12px; margin-top: 8px; }
+@media (max-width: 1100px) { .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@media (max-width: 700px) {
+  body { padding: 14px 12px; } h1 { font-size: 24px; }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; } .tile-value { font-size: 22px; }
+  .controls { grid-template-columns: 1fr; } .controls .wide { grid-column: auto; }
+  header { padding: 16px; } .card { padding: 14px; } dl { grid-template-columns: 1fr; }
+}
+@media print { body { padding: 0; background: #fff; } .controls, .bar, .pager, .filters-extra { display: none; } .tile:hover { transform: none; } }
+</style></head>
+<body>
+<header>
+  <div class="origin">PRA Cloud Mailbox &middot; v{{VERSION}}</div>
+  <h1>{{TITLE}}</h1>
+  <p class="subtitle">{{SUBTITLE}}</p>
+  <div class="meta">{{META}}</div>
+</header>
+<div class="tiles">{{TILES}}</div>
+{{NEXT}}
+<noscript><section class="card nojs"><h2>JavaScript is required to read the rows</h2>
+<p>{{DATA_NOTICE}}</p>
+<p>The run summary above is complete. The rows, run errors and warnings are stored compressed and are displayed by the page script. Enable JavaScript (current desktop Microsoft Edge or Google Chrome), or open the CSV file with the same name, which holds every row.</p></section></noscript>
+<section class="card loading" id="loading" role="status" aria-live="polite" hidden>
+  <h2>Report data</h2>
+  <div id="loading-text">Loading the report data...</div>
+  <div class="progress" aria-hidden="true"><div id="loading-fill"></div></div>
+</section>
+<section class="card" id="objects-card" hidden>
+  <h2>Objects</h2>
+  <div class="controls" role="group" aria-label="Filters of the objects">
+    <div class="wide"><label for="f-search">Search (all fields)</label><input id="f-search" type="search" autocomplete="off" placeholder="Text found in any field of the row"></div>
+    <div><label for="f-status">Status</label><select id="f-status"></select></div>
+    <div><label for="f-type">Type</label><select id="f-type"></select></div>
+    <div><label for="f-action">Action</label><select id="f-action"></select></div>
+  </div>
+  <details class="filters-extra"><summary>Field filters (text, combined with AND)</summary>
+    <div class="controls" id="text-filters" role="group" aria-label="Text filters"></div>
+  </details>
+  <div class="bar">
+    <div class="tabs" role="group" aria-label="Display"><button type="button" id="tab-summary" aria-pressed="true">Summary</button><button type="button" id="tab-technical" aria-pressed="false">All fields</button></div>
+    <button type="button" id="reset">Reset filters</button>
+    <button type="button" id="export" class="primary">Export filtered CSV (all fields)</button>
+    <span id="result-state" class="grow" role="status" aria-live="polite"></span>
+  </div>
+  <div class="bar"><div class="chips" id="status-chips" aria-label="Filtered rows per status"></div></div>
+  <div id="viewport" class="viewport" tabindex="0" role="grid" aria-label="Objects of the run" aria-describedby="grid-help">
+    <div id="grid-head" class="grid-head" role="row"></div>
+    <div id="spacer" class="spacer" role="rowgroup"></div>
+    <div id="empty" class="empty" hidden>No row matches the filters.</div>
+  </div>
+  <p class="sr-only" id="grid-help">Use the arrow keys, Page Up, Page Down, Home and End to move between rows. Enter shows all the fields of the row.</p>
+  <footer id="grid-note"></footer>
+</section>
+<section class="card warnings" id="warnings-card" hidden>
+  <h2>&#9650; Warnings</h2>
+  <div class="pager" id="warnings-pager"></div>
+  <div class="scroll"><table><thead id="warnings-head"></thead><tbody id="warnings-body"></tbody></table></div>
+</section>
+<section class="card" id="issues-card" hidden>
+  <h2>Run errors</h2>
+  <div class="pager" id="issues-pager"></div>
+  <div class="scroll"><table><thead id="issues-head"></thead><tbody id="issues-body"></tbody></table></div>
+</section>
+<dialog id="detail" aria-labelledby="detail-title"><h2 id="detail-title">Details</h2><dl id="detail-fields"></dl><button type="button" id="detail-close">Close</button></dialog>
+<footer>Self-contained report (no external resource, no network access). The rows are stored compressed (gzip, not encrypted), all decoded when the page opens, and shown through virtual grids that keep at most 200 rows in the page. Reading them needs a current desktop Microsoft Edge or Google Chrome. Columns: see docs\PraCloudMailbox-Guide, chapter "Reading the results". The CSV file, the log and the transcript of the run hold every detail.</footer>
+{{DATA}}
+<script>
+(async () => {
+  "use strict";
+  const el = id => document.getElementById(id);
+  const root = document.documentElement;
+  const state = { phase: "loading", error: "", maxMounted: 0, maxIssueRows: 0, rows: 0, shown: 0, metrics: {} };
+  window.__praReportState = state;
+  const number = n => Number(n).toLocaleString("en-GB");
+  const fail = text => { el("loading").hidden = false; el("loading").classList.add("error"); el("loading-text").textContent = text; state.phase = "error"; state.error = text; root.dataset.state = "error"; };
+  const t0 = performance.now();
+  let meta;
+  try { meta = JSON.parse(el("pra-meta").textContent); } catch (error) { fail("The report data header is missing or damaged. Use the CSV file with the same name."); return; }
+  el("loading").hidden = false;
+  if (typeof DecompressionStream !== "function") {
+    fail("This browser cannot decompress the report data (DecompressionStream is required: use a current desktop Microsoft Edge or Google Chrome). The CSV file with the same name holds every row.");
+    return;
+  }
+
+  // ---- Data loading: JSON -> gzip -> base64 chunks, all decoded one after the other (eager, not lazy) ----
+  const KINDS = ["rows", "issues", "warnings"];
+  const data = {};
+  for (const k of KINDS) { const spec = meta[k]; data[k] = { fields: spec.fields, n: 0, count: spec.count, dict: spec.fields.map(() => []), col: spec.fields.map(() => new Uint32Array(spec.count)) }; }
+  async function decode(b64) {
+    const bin = atob(b64), bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+    return JSON.parse(await new Response(stream).text());
+  }
+  const blocks = Array.from(document.querySelectorAll('script[type="application/x-pra-chunk"]'));
+  const expected = meta.chunks.rows + meta.chunks.issues + meta.chunks.warnings;
+  if (blocks.length !== expected) { fail(`The report data is incomplete: ${blocks.length} of ${expected} chunks found. Use the CSV file with the same name.`); return; }
+  const totalItems = meta.rows.count + meta.issues.count + meta.warnings.count;
+  let done = 0;
+  try {
+    for (let b = 0; b < blocks.length; b++) {
+      const kind = blocks[b].dataset.kind, ds = data[kind];
+      if (!ds) throw new Error("unknown data kind");
+      const c = await decode(blocks[b].textContent);
+      blocks[b].remove();
+      if (ds.n + c.n > ds.count) throw new Error("more rows than announced");
+      for (let f = 0; f < ds.fields.length; f++) {
+        const add = c.d[f], dict = ds.dict[f];
+        for (let i = 0; i < add.length; i++) dict.push(add[i]);
+        ds.col[f].set(c.c[f], ds.n);
+      }
+      ds.n += c.n; done += c.n;
+      el("loading-text").textContent = `Loading ${number(done)} of ${number(totalItems)} item(s)...`;
+      el("loading-fill").style.width = `${totalItems ? done / totalItems * 100 : 100}%`;
+      await new Promise(r => setTimeout(r, 0));
+    }
+    for (const k of KINDS) if (data[k].n !== data[k].count) throw new Error(`${k}: ${data[k].n} of ${data[k].count}`);
+  } catch (error) {
+    fail("The compressed report data could not be read (" + (error && error.message ? error.message : "decoding error") + "). Nothing is displayed so that no partial result is mistaken for the full one. Use a current desktop Microsoft Edge or Google Chrome, or the CSV file with the same name.");
+    return;
+  }
+  state.metrics.decodeMs = Math.round(performance.now() - t0);
+  el("loading").hidden = true;
+
+  const R = data.rows, F = R.fields, TOTAL = R.n;
+  const X = {}; F.forEach((name, i) => { X[name] = i; });
+  const val = (f, i) => R.dict[f][R.col[f][i]];
+  const flagText = v => v === null || v === undefined ? "" : v === true ? "True" : v === false ? "False" : String(v);
+  const clip = (s, n) => s.length > n ? s.slice(0, n) + "\u2026" : s;
+  const statuses = meta.statuses;
+
+  // ---- Summary columns -------------------------------------------------------------------------------
+  const typeOf = i => { const k = flagText(val(X.Kind, i)); return k === "User" ? 1 : (k ? 2 : 0); };
+  const typeName = ["-", "User", "Shared"];
+  function summary(i) {
+    const s = n => flagText(val(X[n], i));
+    return {
+      name: s("Identity"), smtp: s("PrimarySmtpAddress"), kind: s("Kind") || "-", type: typeName[typeOf(i)], status: s("FinalStatus"),
+      entra: s("Entra") || "-", exo: s("ExchangeOnline") || "-", teams: s("TeamsStorage") || "-", licence: s("Licence") || "-", holds: s("Holds") || "-",
+      perm: s("Permissions") || "-", detail: s("Detail"), warn: s("Warnings")
+    };
+  }
+  const nodeText = (tag, text, cls) => { const n = document.createElement(tag); n.textContent = text; if (cls) n.className = cls; return n; };
+  const summaryColumns = [
+    { title: "#", width: "70px", cell: (i, d) => nodeText("div", String(i + 1), "mono") },
+    { title: "Object", width: "minmax(240px,1.2fr)", cell: (i, d) => { const c = document.createElement("div"); c.append(nodeText("strong", d.name)); c.append(nodeText("small", d.smtp)); return c; } },
+    { title: "Type", width: "90px", cell: (i, d) => nodeText("div", d.kind) },
+    { title: "Status", width: "120px", cell: (i, d) => { const c = document.createElement("div"); c.append(nodeText("span", d.status, "badge " + d.status.toLowerCase())); return c; } },
+    { title: "Entra ID", width: "150px", cell: (i, d) => nodeText("div", clip(d.entra, 120)) },
+    { title: "Exchange Online", width: "150px", cell: (i, d) => nodeText("div", clip(d.exo, 120)) },
+    { title: "Teams storage", width: "140px", cell: (i, d) => nodeText("div", clip(d.teams, 120)) },
+    { title: "Licence", width: "140px", cell: (i, d) => nodeText("div", clip(d.licence, 120)) },
+    { title: "Holds", width: "140px", cell: (i, d) => nodeText("div", clip(d.holds, 120)) },
+    { title: "Permissions", width: "180px", cell: (i, d) => nodeText("div", clip(d.perm, 200)) },
+    { title: "Detail", width: "minmax(320px,2fr)", cell: (i, d) => { const c = document.createElement("div"); if (d.warn) c.append(nodeText("small", "\u25B2 " + clip(d.warn, 300), "row-warn")); c.append(nodeText("small", clip(d.detail, 400))); return c; } }
+  ];
+  const wide = { ObjectGuid: "290px", ExchangeGuid: "290px", Detail: "340px", Permissions: "260px", Warnings: "260px", Identity: "240px", PrimarySmtpAddress: "240px" };
+  const technicalColumns = [{ title: "#", width: "70px", cell: (i) => nodeText("div", String(i + 1), "mono") }].concat(F.map((name, f) => ({
+    title: name, width: wide[name] || "150px", cell: (i) => nodeText("div", clip(flagText(val(f, i)), 400), f === X.ObjectGuid ? "mono" : "")
+  })));
+  const widthOf = cols => cols.reduce((sum, c) => sum + (/^(\d+)px$/.test(c.width) ? Number(RegExp.$1) : Number((/minmax\((\d+)px/.exec(c.width) || [0, 200])[1])), 0);
+
+  // ---- Filters (they read every row through the typed index arrays) -----------------------------------
+  const FLAGS = [];
+  const TEXTS = [["Identity", "Object (UPN or SMTP address)"], ["ObjectGuid", "Object GUID"], ["Entra", "Entra ID"], ["ExchangeOnline", "Exchange Online"], ["Licence", "Licence"], ["Holds", "Holds"], ["Permissions", "Permissions"], ["Detail", "Detail"], ["Warnings", "Row warnings"]];
+  const fill = (select, entries) => { select.replaceChildren(); for (const [v, t] of entries) { const o = document.createElement("option"); o.value = v; o.textContent = t; select.append(o); } };
+  fill(el("f-status"), [["", "All statuses"]].concat(statuses.map(s => [s, s])));
+  fill(el("f-type"), [["", "All types"], ["2", "Shared, room, equipment"], ["1", "User"], ["0", "Unknown (-)"]]);
+  { const actions = Array.from(new Set(R.dict[X.Action].filter(v => v !== null && v !== ""))).sort(); fill(el("f-action"), [["", "All actions"]].concat(actions.map(a => [a, a]))); }
+  const flagInputs = {}, textInputs = {};
+  for (const [name, title] of FLAGS) {
+    const wrap = document.createElement("div"), label = nodeText("label", title), select = document.createElement("select");
+    select.id = "flag-" + name; label.htmlFor = select.id; fill(select, [["", "Any"], ["true", "Yes (True)"], ["false", "No (False)"], ["null", "Not set"]]);
+    wrap.append(label, select); el("flag-filters").append(wrap); flagInputs[name] = select;
+  }
+  for (const [name, title] of TEXTS) {
+    const wrap = document.createElement("div"), label = nodeText("label", title), input = document.createElement("input");
+    input.id = "text-" + name; input.type = "search"; input.autocomplete = "off"; label.htmlFor = input.id;
+    wrap.append(label, input); el("text-filters").append(wrap); textInputs[name] = input;
+  }
+  const maskOf = (dict, q) => { const m = new Uint8Array(dict.length); for (let i = 0; i < dict.length; i++) { const v = dict[i]; if (v !== null && v !== undefined && String(v).toLowerCase().includes(q)) m[i] = 1; } return m; };
+  const exactMask = (dict, wanted) => { const m = new Uint8Array(dict.length); for (let i = 0; i < dict.length; i++) if (dict[i] === wanted) m[i] = 1; return m; };
+  let view = new Uint32Array(0), active = -1;
+  let mode = "summary";
+  function applyFilters() {
+    const t1 = performance.now(), conds = [];
+    const search = el("f-search").value.trim().toLowerCase();
+    const status = el("f-status").value, action = el("f-action").value, type = el("f-type").value;
+    if (status) conds.push([R.col[X.FinalStatus], exactMask(R.dict[X.FinalStatus], status)]);
+    if (action) conds.push([R.col[X.Action], exactMask(R.dict[X.Action], action)]);
+    for (const [name] of FLAGS) {
+      const w = flagInputs[name].value; if (!w) continue;
+      const wanted = w === "true" ? true : w === "false" ? false : null, dict = R.dict[X[name]], m = new Uint8Array(dict.length);
+      for (let i = 0; i < dict.length; i++) if (dict[i] === wanted) m[i] = 1;
+      conds.push([R.col[X[name]], m]);
+    }
+    for (const [name] of TEXTS) { const q = textInputs[name].value.trim().toLowerCase(); if (q) conds.push([R.col[X[name]], maskOf(R.dict[X[name]], q)]); }
+    const searchCols = search ? F.map((_, f) => [R.col[f], maskOf(R.dict[f], search)]) : [];
+    const out = new Uint32Array(TOTAL), perStatus = {}; let n = 0;
+    const statusCol = R.col[X.FinalStatus], statusDict = R.dict[X.FinalStatus];
+    outer: for (let i = 0; i < TOTAL; i++) {
+      for (let c = 0; c < conds.length; c++) if (!conds[c][1][conds[c][0][i]]) continue outer;
+      if (type && String(typeOf(i)) !== type) continue;
+      if (searchCols.length) { let hit = false; for (let s = 0; s < searchCols.length; s++) if (searchCols[s][1][searchCols[s][0][i]]) { hit = true; break; } if (!hit) continue; }
+      out[n++] = i;
+      const sv = statusDict[statusCol[i]]; perStatus[sv] = (perStatus[sv] || 0) + 1;
+    }
+    view = out.slice(0, n); active = -1; state.shown = n;
+    const chips = el("status-chips"); chips.replaceChildren();
+    for (const s of statuses) if (perStatus[s]) chips.append(nodeText("span", `${s}: ${number(perStatus[s])}`, "chip"));
+    el("result-state").textContent = n === TOTAL ? `${number(n)} object row(s), no filter.` : `${number(n)} of ${number(TOTAL)} object row(s) match the filters.`;
+    state.metrics.lastFilterMs = Math.round(performance.now() - t1);
+    render(true);
+  }
+
+  // ---- Virtual grid: only the visible rows (never more than 200) exist in the page --------------------
+  const viewport = el("viewport"), spacer = el("spacer"), head = el("grid-head");
+  const OVERSCAN = 10, MAX_MOUNT = 200;
+  let columns = summaryColumns, ROW = 52;
+  function setMode(next) {
+    mode = next; columns = next === "summary" ? summaryColumns : technicalColumns; ROW = next === "summary" ? 52 : 34;
+    root.style.setProperty("--cols", columns.map(c => c.width).join(" ")); root.style.setProperty("--gridw", widthOf(columns) + "px"); root.style.setProperty("--rowh", ROW + "px");
+    head.replaceChildren();
+    columns.forEach((c, k) => { const d = nodeText("div", c.title); d.setAttribute("role", "columnheader"); d.setAttribute("aria-colindex", String(k + 1)); head.append(d); });
+    el("tab-summary").setAttribute("aria-pressed", String(next === "summary")); el("tab-technical").setAttribute("aria-pressed", String(next !== "summary"));
+    viewport.setAttribute("aria-colcount", String(columns.length));
+    render(false);
+  }
+  function render(reset) {
+    if (reset) viewport.scrollTop = 0;
+    spacer.style.height = view.length * ROW + "px";
+    el("empty").hidden = view.length > 0;
+    viewport.setAttribute("aria-rowcount", String(view.length + 1));
+    const height = viewport.clientHeight || 600, headHeight = head.offsetHeight || 36;
+    const first = Math.max(0, Math.floor(Math.max(0, viewport.scrollTop - headHeight) / ROW) - OVERSCAN);
+    const last = Math.min(view.length, first + Math.min(MAX_MOUNT, Math.ceil(height / ROW) + 2 * OVERSCAN));
+    const fragment = document.createDocumentFragment();
+    for (let p = first; p < last; p++) {
+      const i = view[p], d = mode === "summary" ? summary(i) : null, line = document.createElement("div");
+      line.className = "grid-row" + (p === active ? " active" : "") + (mode === "summary" ? " st-" + d.status.toLowerCase() + (d.warn ? " has-warn" : "") : "");
+      line.setAttribute("role", "row"); line.setAttribute("aria-rowindex", String(p + 2)); line.id = "row-" + p; line.style.top = p * ROW + "px"; line.dataset.pos = String(p);
+      columns.forEach((c, k) => { const cell = c.cell(i, d); cell.setAttribute("role", "gridcell"); cell.setAttribute("aria-colindex", String(k + 1)); line.append(cell); });
+      fragment.append(line);
+    }
+    spacer.replaceChildren(fragment);
+    const mounted = last - first; state.mounted = mounted; if (mounted > state.maxMounted) state.maxMounted = mounted;
+    if (active >= 0) viewport.setAttribute("aria-activedescendant", "row-" + active); else viewport.removeAttribute("aria-activedescendant");
+    el("grid-note").textContent = view.length ? `Rows ${number(first + 1)} to ${number(last)} of ${number(view.length)} are in the page. Click a row or press Enter for all its fields.` : "";
+  }
+  let ticking = false;
+  viewport.addEventListener("scroll", () => { if (!ticking) { ticking = true; requestAnimationFrame(() => { render(false); ticking = false; }); } });
+  window.addEventListener("resize", () => render(false));
+  function showRow(p) {
+    const i = view[p], pairs = F.map((name, f) => [name, flagText(val(f, i))]);
+    el("detail-title").textContent = `Row ${number(i + 1)} - ${flagText(val(X.Identity, i)) || "(no identity)"}`;
+    const dl = el("detail-fields"); dl.replaceChildren();
+    for (const [k, v] of pairs) { dl.append(nodeText("dt", k), nodeText("dd", v)); }
+    el("detail").showModal();
+  }
+  function moveTo(p) {
+    if (!view.length) return;
+    active = Math.max(0, Math.min(view.length - 1, p));
+    const top = active * ROW, bottom = top + ROW, hh = head.offsetHeight || 36;
+    if (top < viewport.scrollTop) viewport.scrollTop = top; else if (bottom + hh > viewport.scrollTop + viewport.clientHeight) viewport.scrollTop = bottom + hh - viewport.clientHeight;
+    render(false);
+  }
+  viewport.addEventListener("keydown", e => {
+    const page = Math.max(1, Math.floor((viewport.clientHeight || 600) / ROW) - 1);
+    const keys = { ArrowDown: () => moveTo(active + 1), ArrowUp: () => moveTo(active < 0 ? 0 : active - 1), PageDown: () => moveTo(active + page), PageUp: () => moveTo(active - page), Home: () => moveTo(0), End: () => moveTo(view.length - 1) };
+    if (keys[e.key]) { e.preventDefault(); keys[e.key](); }
+    else if ((e.key === "Enter" || e.key === " ") && active >= 0) { e.preventDefault(); showRow(active); }
+  });
+  spacer.addEventListener("click", e => { const r = e.target.closest(".grid-row"); if (r) { active = Number(r.dataset.pos); render(false); viewport.focus(); showRow(active); } });
+  el("detail-close").addEventListener("click", () => el("detail").close());
+
+  // ---- Export of the filtered rows: ALL matching rows, every field, in batches ----------------------------
+  const csvCell = v => {
+    let s = flagText(v);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return '"' + s.replace(/"/g, '""') + '"';
+  };
+  el("export").addEventListener("click", async () => {
+    const button = el("export"), started = performance.now(), snapshot = view.slice(); button.disabled = true;
+    try {
+      const parts = ["\ufeff" + F.map(csvCell).join(";") + "\r\n"]; let lines = [];
+      for (let p = 0; p < snapshot.length; p++) {
+        const i = snapshot[p], cells = new Array(F.length);
+        for (let f = 0; f < F.length; f++) cells[f] = csvCell(val(f, i));
+        lines.push(cells.join(";"));
+        if (lines.length === 5000) { parts.push(lines.join("\r\n") + "\r\n"); lines = []; el("result-state").textContent = `Exporting ${number(p + 1)} of ${number(snapshot.length)} row(s)...`; await new Promise(r => setTimeout(r, 0)); }
+      }
+      if (lines.length) parts.push(lines.join("\r\n") + "\r\n");
+      const blob = new Blob(parts, { type: "text/csv;charset=utf-8" });
+      const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "pra-report-filtered.csv"; document.body.append(a); a.click();
+      state.lastExport = { rows: snapshot.length, bytes: blob.size, ms: Math.round(performance.now() - started) };
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+      el("result-state").textContent = `${number(snapshot.length)} row(s) exported (${number(blob.size)} bytes).`;
+    } catch (error) { el("result-state").textContent = "The export failed: " + (error && error.message ? error.message : "error") + ". The report data is unchanged."; }
+    finally { button.disabled = false; }
+  });
+
+  // ---- Wiring -----------------------------------------------------------------------------------------------
+  let timer = null;
+  const later = () => { clearTimeout(timer); timer = setTimeout(applyFilters, 250); };
+  el("f-search").addEventListener("input", later);
+  for (const k in textInputs) textInputs[k].addEventListener("input", later);
+  for (const id of ["f-status", "f-type", "f-action"]) el(id).addEventListener("change", applyFilters);
+  for (const k in flagInputs) flagInputs[k].addEventListener("change", applyFilters);
+  el("reset").addEventListener("click", () => {
+    el("f-search").value = ""; for (const id of ["f-status", "f-type", "f-action"]) el(id).value = "";
+    for (const k in textInputs) textInputs[k].value = ""; for (const k in flagInputs) flagInputs[k].value = "";
+    applyFilters();
+  });
+  el("tab-summary").addEventListener("click", () => setMode("summary"));
+  el("tab-technical").addEventListener("click", () => setMode("technical"));
+
+  // ---- Warnings and run errors: pages of 100 rows (no row is dropped), text filter on all columns ------------
+  function pager(kind, title, headTitles, bodyId, headId, pagerId, cardId) {
+    const ds = data[kind], card = el(cardId);
+    if (!ds.n) return;
+    card.hidden = false;
+    const PAGE = 100; let list = new Uint32Array(0), page = 0;
+    const search = document.createElement("input"); search.type = "search"; search.setAttribute("aria-label", "Filter the " + title); search.placeholder = "Filter the " + title; search.autocomplete = "off";
+    const prev = nodeText("button", "Previous"), next = nodeText("button", "Next"), info = nodeText("span", "", "subtitle"); info.setAttribute("role", "status"); info.setAttribute("aria-live", "polite");
+    prev.type = next.type = "button";
+    el(pagerId).append(search, prev, next, info);
+    const tr = document.createElement("tr"); for (const h of headTitles) tr.append(nodeText("th", h)); el(headId).append(tr);
+    const cell = (f, i) => flagText(ds.dict[f][ds.col[f][i]]);
+    const draw = () => {
+      const pages = Math.max(1, Math.ceil(list.length / PAGE)); page = Math.max(0, Math.min(page, pages - 1));
+      const from = page * PAGE, to = Math.min(list.length, from + PAGE), body = el(bodyId), frag = document.createDocumentFragment();
+      for (let p = from; p < to; p++) {
+        const i = list[p], row = document.createElement("tr"); row.tabIndex = 0;
+        for (let f = 0; f < ds.fields.length; f++) row.append(nodeText("td", clip(cell(f, i), 1500)));
+        const open = () => { el("detail-title").textContent = `${title} ${number(i + 1)}`; const dl = el("detail-fields"); dl.replaceChildren(); for (let f = 0; f < ds.fields.length; f++) dl.append(nodeText("dt", headTitles[f]), nodeText("dd", cell(f, i))); el("detail").showModal(); };
+        row.addEventListener("click", open); row.addEventListener("keydown", e => { if (e.key === "Enter") open(); });
+        frag.append(row);
+      }
+      body.replaceChildren(frag); if (to - from > state.maxIssueRows) state.maxIssueRows = to - from;
+      prev.disabled = page === 0; next.disabled = page >= pages - 1;
+      info.textContent = list.length ? `${number(from + 1)} to ${number(to)} of ${number(list.length)}` + (list.length !== ds.n ? ` (filtered from ${number(ds.n)})` : "") + `, page ${page + 1} of ${pages}` : `No ${title} match (${number(ds.n)} in total).`;
+    };
+    const refilter = () => {
+      const q = search.value.trim().toLowerCase(), masks = q ? ds.fields.map((_, f) => maskOf(ds.dict[f], q)) : null, out = new Uint32Array(ds.n); let n = 0;
+      for (let i = 0; i < ds.n; i++) { let hit = !masks; if (masks) for (let f = 0; f < masks.length; f++) if (masks[f][ds.col[f][i]]) { hit = true; break; } if (hit) out[n++] = i; }
+      list = out.slice(0, n); page = 0; draw();
+    };
+    let t = null; search.addEventListener("input", () => { clearTimeout(t); t = setTimeout(refilter, 250); });
+    prev.addEventListener("click", () => { page--; draw(); }); next.addEventListener("click", () => { page++; draw(); });
+    refilter();
+  }
+  pager("warnings", "warnings", meta.warnings.titles, "warnings-body", "warnings-head", "warnings-pager", "warnings-card");
+  pager("issues", "run errors", meta.issues.titles, "issues-body", "issues-head", "issues-pager", "issues-card");
+
+  el("objects-card").hidden = false;
+  el("grid-note").textContent = TOTAL ? "" : "This run produced no object row.";
+  state.rows = TOTAL;
+  setMode("summary");
+  applyFilters();
+  state.metrics.readyMs = Math.round(performance.now() - t0);
+  state.phase = "ready"; root.dataset.state = "ready";
+})();
+</script>
+</body></html>

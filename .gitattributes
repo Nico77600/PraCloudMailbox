@@ -1,8 +1,123 @@
-# Preserve the exact Authenticode bytes, including CRLF, on these signed scripts.
-Invoke-PraCloudMailbox.ps1 -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
-module/PRA2.Common.psm1 -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
-module/PRA2.Store.psm1 -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
-module/PRA2.Collect.psm1 -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
-module/PRA2.Cloud.psm1 -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
-module/PRA2.Gui.psm1 -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
-config/EntraConnect.sample.ps1 -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+# Signed and hashed package files are byte-exact: no end-of-line conversion, so the Authenticode signature and the manifest SHA256 stay valid.
+# Do not add a global autocrlf rule for these paths.
+package/docs/** linguist-documentation
+
+# Frozen fixtures (legacy snapshot and journal stores): byte-exact, never converted.
+tests/fixtures/** -text
+
+# Owner-signed files (the PowerShell files, the module manifest included, and the inventory manifest); cr-at-eol because their working-tree line endings are CRLF.
+package/Invoke-PraCloudMailbox.ps1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/PraCloudMailbox.psd1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/PraCloudMailbox.psm1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Common.psm1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Store.psm1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Collect.psm1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Cloud.psm1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Gui.psm1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Gui.Data.ps1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Gui.Detect.ps1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Gui.Process.ps1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Gui.Run.ps1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Gui.RunConfig.ps1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Gui.View.ps1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/Test-PackageIntegrity.ps1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/config/EntraConnect.sample.ps1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/PackageIntegrity.psd1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+
+# Stable hashed files (SHA256 in the signed manifest) and the distribution copy of the changelog.
+package/module/PRA.Gui.xaml -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/templates/Report.template.html -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/config/Targets.sample.csv -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/lib/sqlite/README.txt -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/README.md -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/LICENSE -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/THIRD-PARTY-NOTICES.md -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/docs/PraCloudMailbox-Guide.html -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/docs/PraCloudMailbox-Guide.md -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/docs/PraCloudMailbox-UserGuide.html -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/docs/PraCloudMailbox-UserGuide.md -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/lib/sqlite/netstandard2.0/System.Data.SQLite.dll -text
+package/lib/sqlite/netstandard2.0/x64/SQLite.Interop.dll -text
+package/docs/images/cli-check-dark.png -text
+package/docs/images/cli-check-light.png -text
+package/docs/images/cli-convert-dark.png -text
+package/docs/images/cli-convert-group-dark.png -text
+package/docs/images/cli-convert-group-light.png -text
+package/docs/images/cli-convert-light.png -text
+package/docs/images/cli-follow-dark.png -text
+package/docs/images/cli-follow-light.png -text
+package/docs/images/cli-recover-dark.png -text
+package/docs/images/cli-recover-light.png -text
+package/docs/images/console-collect-next-dark.png -text
+package/docs/images/console-collect-next-light.png -text
+package/docs/images/console-collect-run-done-dark.png -text
+package/docs/images/console-collect-run-done-light.png -text
+package/docs/images/console-collect-setup-dark.png -text
+package/docs/images/console-collect-setup-light.png -text
+package/docs/images/console-collect-task-dark.png -text
+package/docs/images/console-collect-task-light.png -text
+package/docs/images/console-collect-verify-preview-dark.png -text
+package/docs/images/console-collect-verify-preview-light.png -text
+package/docs/images/console-next-check-blocked-dark.png -text
+package/docs/images/console-next-check-blocked-light.png -text
+package/docs/images/console-next-dark.png -text
+package/docs/images/console-next-failed-dark.png -text
+package/docs/images/console-next-failed-light.png -text
+package/docs/images/console-next-light.png -text
+package/docs/images/console-run-check-blocked-dark.png -text
+package/docs/images/console-run-check-blocked-light.png -text
+package/docs/images/console-run-dark.png -text
+package/docs/images/console-run-done-dark.png -text
+package/docs/images/console-run-done-light.png -text
+package/docs/images/console-run-failed-dark.png -text
+package/docs/images/console-run-failed-light.png -text
+package/docs/images/console-run-light.png -text
+package/docs/images/console-setup-dark.png -text
+package/docs/images/console-setup-light.png -text
+package/docs/images/console-setup-settings-dark.png -text
+package/docs/images/console-setup-settings-light.png -text
+package/docs/images/console-setup-signin-dark.png -text
+package/docs/images/console-setup-signin-light.png -text
+package/docs/images/console-task-check-dark.png -text
+package/docs/images/console-task-check-light.png -text
+package/docs/images/console-task-continue-dark.png -text
+package/docs/images/console-task-continue-light.png -text
+package/docs/images/console-task-convert-csv-dark.png -text
+package/docs/images/console-task-convert-csv-light.png -text
+package/docs/images/console-task-convert-group-dark.png -text
+package/docs/images/console-task-convert-group-light.png -text
+package/docs/images/console-task-convert-one-dark.png -text
+package/docs/images/console-task-convert-one-light.png -text
+package/docs/images/console-task-convert-ou-dark.png -text
+package/docs/images/console-task-convert-ou-light.png -text
+package/docs/images/console-task-rollback-dark.png -text
+package/docs/images/console-task-rollback-light.png -text
+package/docs/images/console-task-rollback-wave-dark.png -text
+package/docs/images/console-task-rollback-wave-light.png -text
+package/docs/images/console-verify-before-dark.png -text
+package/docs/images/console-verify-before-light.png -text
+package/docs/images/console-verify-confirmed-dark.png -text
+package/docs/images/console-verify-confirmed-light.png -text
+package/docs/images/console-verify-preview-dark.png -text
+package/docs/images/console-verify-preview-light.png -text
+package/docs/images/readme-banner-dark.png -text
+package/docs/images/readme-banner-light.png -text
+package/docs/images/readme-flows-dark.png -text
+package/docs/images/readme-flows-light.png -text
+package/docs/images/readme-how-it-works-dark.png -text
+package/docs/images/readme-how-it-works-light.png -text
+package/docs/images/readme-permissions-dark.png -text
+package/docs/images/readme-permissions-light.png -text
+package/docs/images/readme-principles-dark.png -text
+package/docs/images/readme-principles-light.png -text
+package/docs/images/readme-resources-dark.png -text
+package/docs/images/readme-resources-light.png -text
+package/docs/images/readme-states-dark.png -text
+package/docs/images/readme-states-light.png -text
+package/docs/images/report-check-dark.png -text
+package/docs/images/report-check-light.png -text
+package/docs/images/report-convert-dark.png -text
+package/docs/images/report-convert-light.png -text
+package/docs/images/report-global-dark.png -text
+package/docs/images/report-global-light.png -text
+CHANGELOG.md -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol

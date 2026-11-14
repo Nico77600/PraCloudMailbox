@@ -1,11 +1,24 @@
 {
-  "runtimeRoot": ".",
+  "runtimeRoot": "package",
   "testMode": "gate",
   "testEntry": "tests/Invoke-TestGate.ps1",
   "tests": [
     "tests/PraCloudMailbox.Tests.ps1",
+    "tests/PraCloudMailbox.Collect.Tests.ps1",
+    "tests/PraCloudMailbox.Schedule.Tests.ps1",
+    "tests/PraCloudMailbox.CallTimeout.Tests.ps1",
+    "tests/PraCloudMailbox.Snapshot.Tests.ps1",
+    "tests/PraCloudMailbox.Casing.Tests.ps1",
     "tests/PraCloudMailbox.EndToEnd.Tests.ps1",
-    "tests/PraCloudMailbox.Gui.Tests.ps1"
+    "tests/PraCloudMailbox.FollowUp.Tests.ps1",
+    "tests/PraCloudMailbox.GraphTransport.Tests.ps1",
+    "tests/PraCloudMailbox.Gui.Tests.ps1",
+    "tests/PraCloudMailbox.Resources.Tests.ps1",
+    "tests/PackageIntegrity.Tests.ps1",
+    "tests/PraLegacyFixtures.Tests.ps1",
+    "tests/PraCloudMailbox.Coexistence.Tests.ps1",
+    "tests/PraCloudMailbox.Documentation.Tests.ps1",
+    "tests/PraCloudMailbox.Console.Tests.ps1"
   ],
   "packageBuilder": "tools/New-PraCloudPackage.ps1",
   "packageEntry": "Invoke-PraCloudMailbox.ps1"
