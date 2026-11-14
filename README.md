@@ -51,7 +51,7 @@ Done by hand, giving each user a cloud mailbox means changing the source of auth
 - **Same identity, Teams storage promoted.** `Convert` (PowerShell 7.5, certificate of an app registration or an administrator who signs in) moves the source of authority of each identity to the cloud and gives it an Exchange plan: the **Teams storage of the user becomes their mailbox**, with their chats. Shared mailboxes are converted in waves, one temporary licence unit each (`Licensing.Shared.Parallel`, 100 by default, never using the `Licensing.Shared.KeepFree` units), given back after each wave.
 - **Which objects, at run time.** Everything, or one mailbox (`-Identity`), a list (`-CsvPath`), an OU (`-SearchBase`) or a group (`-Group`, read from the snapshot first, then from Microsoft Entra ID), narrowed by `-Scope` and `-MaxObjects`. A member that is not a mailbox is skipped, and the run says why.
 - **Preview by default, one batch ID.** Without `-Mode Apply` nothing is changed. Apply asks one confirmation, journals the original state of every object, and prints the batch ID with the exact next command, also after a failure.
-- **Follow the batch.** `Check -Batch <ID> -Expect Provisioned|Deprovisioned|Retained [-Once]` reads the objects of a batch and tells whether they are in the state they should be in. One **global report** follows the batch from end to end: every object and every step of its journey, with no limit, in one page and in two CSV files.
+- **Follow the batch.** `Check -Batch <ID> -Expect Provisioned|Deprovisioned|Retained [-Once]` reads the objects of a batch and tells whether they are in the state they should be in. It follows **every** object of the batch, also the ones that Convert never started, and never says "provisioned" while the batch is not Complete. One **global report** follows the batch from end to end: every object and every step of its journey, with no limit, in one page and in two CSV files.
 - **Back without losing a mail.** `Recover -Batch <ID>` gives the identities back to AD in waves (one scheduler pause and one synchronisation per wave, not per object); the users' cloud data stays under an **eDiscovery case hold** (several policies in the same case once 1,000 mailboxes is reached), the cloud shared mailboxes become **inactive mailboxes**, and every licence is put back exactly as it was.
 - **What is not recreated.** Convert and Recover work on mailboxes: users, shared mailboxes and, if you turn it on, native rooms and equipment. **Contacts, distribution groups, mail-enabled security groups, dynamic distribution groups and Microsoft 365 groups are not recreated.** Collect can keep contacts, distribution groups and dynamic distribution groups in the snapshot, for reference only; Microsoft 365 groups are not collected. **Calendar settings are restored only for the native rooms and equipment** of the opt-in `CloudResource` mode.
 
@@ -183,14 +183,14 @@ Do these steps in order. Each one is explained, with pictures, in the [user guid
 >
 > - **Back it up every day and externalise the backup**: off-site, out of reach of the domain that can be compromised (offline, immutable, or separate credentials), in several generations.
 > - **Protect access to the file and to its backups.** They hold names, addresses, GUIDs and permissions: a restricted access list, no share open to *Domain Users*.
-> - **Copy the `.sha256` file with the snapshot.** Check, Convert and Recover verify the file against it. If it says the file **changed**, restore it from the external backup. `-AcceptUnverifiedSnapshot` is only for when you know why. A missing `.sha256` file only gives a warning.
+> - **Copy the `.sha256` file with the snapshot.** Check, Convert and Recover verify the file against it. If it says the file **changed**, restore it from the external backup. `-AcceptUnverifiedSnapshot` is only for when you know why. Without a `.sha256` file a Preview and a Check only warn, and a Convert or a Recover in Apply mode stops (`-AcceptUnverifiedSnapshot` accepts it).
 > - **Back up the journal too, during the operations.** `data\PraCloudMailbox-journal.db` is written by Convert and Recover themselves, so the hash does not cover it. It is the only input of the rollback.
 
 ## Upgrading from 1.x
 
 - Recreate the scheduled task of Collect with `pwsh.exe` (not `powershell.exe`): the tool runs in PowerShell 7.5 or later only.
 - Set `Exchange.Server` in the configuration and remove `Exchange.ConnectionMode`.
-- Your snapshot and journal files are read as before. A snapshot written before 2.0.0 has no `.sha256` file, so the first runs only warn: run a Collect to get one.
+- Your snapshot and journal files are read as before. A snapshot written before 2.0.0 has no `.sha256` file, so a Convert or a Recover in Apply mode stops until you run a Collect to get one (or add `-AcceptUnverifiedSnapshot`). A journal of an earlier version is upgraded when a Convert opens it; a batch made before 2.1.0 keeps working, and the tool warns that it cannot prove which snapshot it was made from.
 - The runtime now lives in the `package` folder of the repository (the release zip holds its content).
 
 ## Documentation

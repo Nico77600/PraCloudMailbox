@@ -46,13 +46,15 @@ This folder contains everything needed to run the tool: `Invoke-PraCloudMailbox.
    pwsh -STA -File .\Invoke-PraCloudMailbox.ps1 -Gui                             # the guided console
    ```
 
+`Check -Batch <id>` follows every object of a batch, also the ones Convert never started, and never says "provisioned" while the batch is not Complete. An object found in Microsoft Entra ID by its UPN only, with another mailbox GUID, is refused (`ENTRA_WRONG_OBJECT`). A run interrupted by Ctrl+C ends with `RESULT: FAIL`, and a Convert is not resumed once a Recover rolled it back. Recover uses the licence mode of the batch (`Licensing.Users.Mode`).
+
 Every command can be narrowed: `-Identity`, `-CsvPath`, `-SearchBase`, `-Group`, `-Scope`, `-MaxObjects`. Without `-Mode Apply` nothing is changed.
 
 What Convert and Recover handle: user mailboxes, shared mailboxes and, if you turn it on, native rooms and equipment. They do **not** recreate contacts, distribution groups, mail-enabled security groups, dynamic distribution groups or Microsoft 365 groups. Collect can keep contacts, distribution groups and dynamic distribution groups in the snapshot, for reference only; Microsoft 365 groups are not collected. The members of the groups you name are used only to choose the objects of a run with `-Group`. Calendar settings are restored only for the native rooms and equipment of the `CloudResource` mode.
 
 ## Protect the snapshot
 
-After the disaster the snapshot file is the **only copy** of the directory data. Back it up every day and **externalise the backup**: off-site, out of reach of the domain that can be compromised (offline, immutable, or separate credentials), in several generations. Restrict the access list of the file and of its backups (no share open to *Domain Users*). Copy the `.sha256` file with the snapshot: Check, Convert and Recover verify the file against it, and a **changed** file stops the run: restore it from the external backup (`-AcceptUnverifiedSnapshot` only when you know why). The journal, `data\PraCloudMailbox-journal.db`, is not covered by the hash because Convert and Recover write it: back it up during the operations.
+After the disaster the snapshot file is the **only copy** of the directory data. Back it up every day and **externalise the backup**: off-site, out of reach of the domain that can be compromised (offline, immutable, or separate credentials), in several generations. Restrict the access list of the file and of its backups (no share open to *Domain Users*). Copy the `.sha256` file with the snapshot: Check, Convert and Recover verify the file against it, and a **changed** file stops the run: restore it from the external backup (`-AcceptUnverifiedSnapshot` only when you know why). Without a `.sha256` file a Convert or a Recover in Apply mode stops too. A batch stays tied to its snapshot: Recover and `Check -Batch` stop when it is missing, and Collect never deletes the snapshot of a batch that is not rolled back. A Collect that lost its mailboxes (`Collect.MaxDropPercent`) is refused, so the good snapshot stays. The journal, `data\PraCloudMailbox-journal.db`, is not covered by the hash because Convert and Recover write it: back it up during the operations.
 
 ## Package integrity
 
