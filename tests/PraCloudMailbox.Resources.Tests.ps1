@@ -32,7 +32,8 @@ Describe 'Native resource safety rules' {
             function Start-ResourceCollectTest {
                 param([string]$ResourceMode, [string]$Kind, [string]$Mode = 'Preview')
                 $config = @{ Collect = @{ MailboxStatistics = $false; SharedPermissions = $false; Contacts = $false; DistributionGroups = $false }
-                    Scope = @{ ResourceMode = $ResourceMode }; Exchange = @{ DomainController = '' } }
+                    Scope = @{ ResourceMode = $ResourceMode; Mode = 'Auto'; SearchBase = ''; GroupDN = ''; CsvPath = ''; IncludeUsers = $true; IncludeShared = $true; IncludeRoom = $true; IncludeEquipment = $true }
+                    Exchange = @{ DomainController = '' }; Store = @{ Path = (Join-Path $TestDrive 'collect.db') } }
                 $run = @{ Config = $config; Mode = $Mode; Action = 'Collect'; CurrentOperation = ''; CurrentIdentity = ''
                     Excluded = [System.Collections.Generic.List[string]]::new(); Rows = [System.Collections.Generic.List[object]]::new(); NextSteps = @() }
                 $mailbox = [pscustomobject]@{ PrimarySmtpAddress = 'resource@contoso.com'; RecipientTypeDetails = $Kind; Guid = 'source-guid' }

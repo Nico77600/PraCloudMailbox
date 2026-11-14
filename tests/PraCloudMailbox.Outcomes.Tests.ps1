@@ -77,6 +77,8 @@ Describe 'Outcomes and batches of Check, Convert and Recover (fake tenant)' -Ski
             <# Sets, in the test, the script-level variables that the functions of the entry script read. #>
             param([ValidateSet('Check', 'Convert', 'Recover')][string]$Action, [string]$Mode = 'Apply', [string]$Batch = '', [string]$Identity = '', [string]$Scope = 'All', [string]$Expect = '', [switch]$Once)
             Close-E2E
+            # The snapshot file is the one that a Collect left, with its hash file (a Convert or a Recover in Apply mode stops on a snapshot that has none).
+            if (Test-Path -LiteralPath $global:PraE2E.Db -PathType Leaf) { $null = Write-PcmHashFile -Path $global:PraE2E.Db }
             $config = Import-PcmConfiguration -Path $global:PraE2E.Config -Root $global:PraE2E.Root
             $run = @{ Root = $global:PraE2E.Root; Version = 'test'; RunId = [guid]::NewGuid().ToString('N'); StartTime = Get-Date; Action = $Action; Mode = $Mode; Phase = ''
                 CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; StepTotal = 7; Warnings = 0

@@ -305,7 +305,7 @@ function Get-PcmGuiSnapshotInfo {
         # The file is hashed once, then again only when its length or its time of last write (or those of its .sha256 file) change: the window asks for this at every keystroke.
         $backupFolder = [string]$State.Config.Store.BackupFolder
         $stamp = '{0}|{1}' -f $backupFolder, (Get-PcmGuiFileStamp -Path @($info.Path, ($info.Path + '.sha256')))
-        if ($script:GuiIntegrityCache -and [string]::Equals($script:GuiIntegrityCache.Stamp, $stamp, [StringComparison]::Ordinal)) {
+        if ($script:GuiIntegrityCache -and [string]::Equals($script:GuiIntegrityCache.Stamp, $stamp, [StringComparison]::OrdinalIgnoreCase)) {
             $info.Integrity = $script:GuiIntegrityCache.Integrity; $info.IntegrityDetail = $script:GuiIntegrityCache.Detail
         }
         else {
