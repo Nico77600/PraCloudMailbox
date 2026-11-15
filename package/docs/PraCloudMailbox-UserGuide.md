@@ -763,6 +763,7 @@ Find what you **see** in the left column. The middle column says what it **means
 | **Part of the rollback remains** or *Some objects are not back yet. Fix what is named above, then resume them (nothing is rolled back twice):* | Some objects are not back yet. | Run the command given after the message. |
 | *no cloud mailbox yet after …: run Convert -Batch … again later* | Exchange Online is still creating the mailbox. | Wait a few minutes. Run the same command with `-Batch`. |
 | *not synchronised from AD yet: run Entra Connect, then Recover -Batch again* | Entra Connect has not yet sent the object back. | Run a synchronisation on Entra Connect. Then run again. |
+| *Entra Connect did not recreate it … run a full synchronisation on the Entra Connect server* | The tool tried a synchronisation of the object alone and it did not come back. | Run the command of the Next steps on the Entra Connect server and wait for it to end. Then run the Recover command of the Next steps again. |
 | *back on-premises; case hold not stamped yet* | The user is back. The hold is still being applied. | Run Recover again later to check it. The hold is never removed from an object that is back. |
 | *other hold(s) on the cloud mailbox block the rollback* | Another hold on the user's cloud mailbox stops the switch back. | Remove that hold. Run Recover again. |
 

@@ -947,6 +947,36 @@ Describe 'Entra Connect Script mode: the signed sample runs as it is' {
         { Invoke-PcmEntraConnect -Context (New-EntraContext -ScriptPath $script:sample -Server 'aadc01.contoso.com' -CredentialPath (Join-Path $TestDrive 'missing.xml')) -Operation Pause -Confirm:$false } |
             Should -Throw '*the credential file * does not exist: create it with Get-Credential | Export-Clixml, or set EntraConnect.CredentialPath.*'
     }
+    It 'gives -Operation SyncObject and -ObjectDn, once per object, to the unmodified sample' {
+        $credential = Join-Path $TestDrive 'object.cred.xml'
+        [IO.File]::WriteAllText($credential, '<Objs/>')
+        $answers = @(Invoke-PcmEntraConnectObject -Context (New-EntraContext -ScriptPath $script:sample -Server 'aadc01.contoso.com' -CredentialPath $credential) -ObjectDn @('CN=a,DC=contoso,DC=com', 'CN=b,DC=contoso,DC=com') -Confirm:$false)
+        $answers.Count | Should -Be 2
+        @($answers | Where-Object Ok).Count | Should -Be 2
+        $answers[0].Dn | Should -Be 'CN=a,DC=contoso,DC=com'
+        $answers[0].Detail | Should -BeLike 'SyncObject on aadc01.contoso.com: *'
+        @($script:invoked | Where-Object { $_[0] -eq 'Invoke-Command' }).Count | Should -Be 2
+    }
+    It 'does not call the script again for the objects that a full synchronisation of the connector, reported by the script, covers' {
+        $own = Join-Path $TestDrive 'covers.ps1'
+        Set-Content -LiteralPath $own -Value 'param([string]$Operation, [string]$ObjectDn) "${ObjectDn}: full synchronisation of the Active Directory connector"' -Encoding UTF8
+        $answers = @(Invoke-PcmEntraConnectObject -Context (New-EntraContext -ScriptPath $own -Server 'aadc01.contoso.com') -ObjectDn @('CN=a,DC=contoso,DC=com', 'CN=b,DC=contoso,DC=com', 'CN=c,DC=contoso,DC=com') -Confirm:$false)
+        @($answers | Where-Object Ok).Count | Should -Be 3
+        $answers[0].Detail | Should -Be 'CN=a,DC=contoso,DC=com: full synchronisation of the Active Directory connector'
+        $answers[2].Detail | Should -Be $answers[0].Detail
+    }
+    It 'fails the objects, with the reason, for a script that refuses SyncObject or does not take -ObjectDn' {
+        $refuses = Join-Path $TestDrive 'refuses.ps1'
+        Set-Content -LiteralPath $refuses -Value "param([ValidateSet('Pause', 'Resume', 'Delta')][string]`$Operation, [string]`$ObjectDn) 'x'" -Encoding UTF8
+        $answer = @(Invoke-PcmEntraConnectObject -Context (New-EntraContext -ScriptPath $refuses -Server 'aadc01.contoso.com') -ObjectDn @('CN=a,DC=contoso,DC=com') -Confirm:$false)[0]
+        $answer.Ok | Should -BeFalse
+        $answer.Detail | Should -BeLike '*SyncObject*'
+        $plain = Join-Path $TestDrive 'plain.ps1'
+        Set-Content -LiteralPath $plain -Value 'param([string]$Operation) "x"' -Encoding UTF8
+        $answer = @(Invoke-PcmEntraConnectObject -Context (New-EntraContext -ScriptPath $plain -Server 'aadc01.contoso.com') -ObjectDn @('CN=a,DC=contoso,DC=com') -Confirm:$false)[0]
+        $answer.Ok | Should -BeFalse
+        $answer.Detail | Should -Be 'EntraConnect.ScriptPath does not take -ObjectDn: it cannot synchronise one object'
+    }
     It 'calls a script of the administrator that does not declare -Server and -CredentialPath with -Operation only, as before' {
         $own = Join-Path $TestDrive 'own.ps1'
         Set-Content -LiteralPath $own -Value 'param([Parameter(Mandatory)][string]$Operation) "own $Operation"' -Encoding UTF8

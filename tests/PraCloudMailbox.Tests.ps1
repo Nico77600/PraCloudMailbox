@@ -1245,6 +1245,83 @@ Describe 'Entra Connect operator script' {
     }
 }
 
+Describe 'Entra Connect: the targeted synchronisation of single objects' {
+    BeforeAll {
+        function global:Get-ADSyncScheduler { [pscustomobject]@{ SyncCycleEnabled = $true; SyncCycleInProgress = $false } }
+        function global:Add-EoSleep { param([int]$Seconds) }
+        function global:Invoke-ADSyncSingleObjectSync {
+            [CmdletBinding()] param([string]$DistinguishedName, [switch]$NoHtmlReport)
+            $global:EoCalls.Add("Single $DistinguishedName")
+            $answer = $global:EoSingle[$DistinguishedName]
+            ([ordered]@{ Action = $answer.Action; StatusInfo = @{ Status = $answer.Status; ErrorCode = $answer.Code; Reason = '' } } | ConvertTo-Json)
+        }
+        function global:Get-ADSyncConnector { @([pscustomobject]@{ Name = 'contoso.com'; Type = 'AD'; Partitions = @([pscustomobject]@{ DN = 'DC=contoso,DC=com' }) }, [pscustomobject]@{ Name = 'contoso.onmicrosoft.com - AAD'; Type = 'Extensible2'; Partitions = @([pscustomobject]@{ DN = '' }) }) }
+        function global:Set-ADSyncSchedulerConnectorOverride { [CmdletBinding()] param([string]$ConnectorName, [bool]$FullSyncRequired) $global:EoCalls.Add("Override $ConnectorName $FullSyncRequired") }
+        function global:Start-ADSyncSyncCycle { [CmdletBinding()] param([string]$PolicyType) $global:EoCalls.Add("Cycle $PolicyType"); if ($global:EoCycleFails) { throw 'Access is denied.' } }
+    }
+    AfterAll { foreach ($name in 'Get-ADSyncScheduler', 'Add-EoSleep', 'Invoke-ADSyncSingleObjectSync', 'Get-ADSyncConnector', 'Set-ADSyncSchedulerConnectorOverride', 'Start-ADSyncSyncCycle') { Remove-Item -Path "Function:$name" -ErrorAction SilentlyContinue } }
+    BeforeEach {
+        $global:EoCalls = [System.Collections.Generic.List[string]]::new()
+        $global:EoCycleFails = $false
+        $global:EoSingle = @{
+            'CN=a,OU=Shared,DC=contoso,DC=com' = @{ Action = 'Create'; Status = 'Success'; Code = '' }
+            'CN=b,OU=Shared,DC=contoso,DC=com' = @{ Action = 'Other'; Status = 'Failure'; Code = 'Filtered Object' }
+            'CN=c,OU=Shared,DC=contoso,DC=com' = @{ Action = 'Other'; Status = 'Failure'; Code = 'Filtered Object' }
+            'CN=d,OU=Shared,DC=contoso,DC=com' = @{ Action = 'Create'; Status = 'Success'; Code = '' }
+        }
+        # The commands of the remote block run here: the object list the block takes from the caller ($using:) is put in the text, the module import is left out and the waits are skipped.
+        Mock Invoke-Command -ModuleName PRA.Cloud {
+            $text = $ScriptBlock.ToString().Replace('$using:ObjectDn', ('@(' + (($global:EoAsked | ForEach-Object { "'$_'" }) -join ', ') + ')'))
+            $text = $text.Replace('Import-Module ADSync -ErrorAction Stop', '').Replace('Start-Sleep -Seconds', 'Add-EoSleep')
+            & ([scriptblock]::Create($text))
+        }
+        Set-PcmWriteApproval -Approval { param($Target, $Operation) $true }
+        $script:eoContext = @{ Config = @{ EntraConnect = @{ Mode = 'Remoting'; Server = 'aadc' } } }
+        $script:eoDn = @('CN=a,OU=Shared,DC=contoso,DC=com', 'CN=b,OU=Shared,DC=contoso,DC=com')
+        $global:EoAsked = $script:eoDn
+    }
+    AfterEach { Set-PcmWriteApproval -Approval $null }
+    It 'Remoting: the object that Invoke-ADSyncSingleObjectSync synchronises is done by it alone, the one it refuses is covered by one cycle with a full synchronisation of its connector' {
+        $answers = @(Invoke-PcmEntraConnectObject -Context $script:eoContext -ObjectDn $script:eoDn)
+        $answers.Count | Should -Be 2
+        $answers[0].Ok | Should -BeTrue
+        $answers[0].Detail | Should -Be 'Create by Invoke-ADSyncSingleObjectSync'
+        $answers[1].Ok | Should -BeTrue
+        $answers[1].Detail | Should -Be 'full synchronisation of the Active Directory connector, one cycle for 1 object(s) (Filtered Object)'
+        @($global:EoCalls) | Should -Be @('Single CN=a,OU=Shared,DC=contoso,DC=com', 'Single CN=b,OU=Shared,DC=contoso,DC=com', 'Override contoso.com True', 'Cycle Delta')
+    }
+    It 'Remoting: after two refusals the next objects are not tried one by one, and all the objects that are left share one cycle' {
+        $global:EoAsked = @('CN=b,OU=Shared,DC=contoso,DC=com', 'CN=c,OU=Shared,DC=contoso,DC=com', 'CN=d,OU=Shared,DC=contoso,DC=com')
+        $answers = @(Invoke-PcmEntraConnectObject -Context $script:eoContext -ObjectDn $global:EoAsked)
+        @($answers | Where-Object Ok).Count | Should -Be 3
+        $answers[2].Detail | Should -BeLike 'full synchronisation of the Active Directory connector, one cycle for 3 object(s) (not tried: the objects before it were refused*'
+        @($global:EoCalls | Where-Object { $_ -like 'Single*' }).Count | Should -Be 2
+        @($global:EoCalls | Where-Object { $_ -like 'Cycle*' }).Count | Should -Be 1
+    }
+    It 'Remoting: without Invoke-ADSyncSingleObjectSync every object goes through the one cycle, and a cycle that cannot start fails them with the reason' {
+        Remove-Item -Path 'Function:Invoke-ADSyncSingleObjectSync'
+        $answers = @(Invoke-PcmEntraConnectObject -Context $script:eoContext -ObjectDn $script:eoDn)
+        @($answers | Where-Object Ok).Count | Should -Be 2
+        $answers[0].Detail | Should -Be 'full synchronisation of the Active Directory connector, one cycle for 2 object(s) (Invoke-ADSyncSingleObjectSync is not available on this server)'
+        @($global:EoCalls) | Should -Be @('Override contoso.com True', 'Cycle Delta')
+        $global:EoCalls.Clear(); $global:EoCycleFails = $true
+        $answers = @(Invoke-PcmEntraConnectObject -Context $script:eoContext -ObjectDn $script:eoDn)
+        @($answers | Where-Object Ok).Count | Should -Be 0
+        $answers[0].Detail | Should -BeLike '*full synchronisation of the connector: Access is denied.'
+    }
+    It 'Manual: gives the exact command of each object to the operator, who confirms; a refusal fails every object; no operator fails every object' {
+        $script:eoContext.Config.EntraConnect.Mode = 'Manual'
+        $script:asked = [System.Collections.Generic.List[string]]::new()
+        Mock Request-PcmOperator -ModuleName PRA.Cloud { $script:asked.Add($Question) | Out-Null; $true }
+        $answers = @(Invoke-PcmEntraConnectObject -Context $script:eoContext -ObjectDn $script:eoDn -Caller 'console')
+        @($answers | Where-Object Ok).Count | Should -Be 2
+        $script:asked[0] | Should -BeLike "*On aadc, run these commands*Invoke-ADSyncSingleObjectSync -DistinguishedName 'CN=a,OU=Shared,DC=contoso,DC=com' -NoHtmlReport*Invoke-ADSyncSingleObjectSync -DistinguishedName 'CN=b,OU=Shared,DC=contoso,DC=com' -NoHtmlReport*Set-ADSyncSchedulerConnectorOverride*-FullSyncRequired*Done?"
+        Mock Request-PcmOperator -ModuleName PRA.Cloud { $false }
+        @(Invoke-PcmEntraConnectObject -Context $script:eoContext -ObjectDn $script:eoDn -Caller 'console')[0].Detail | Should -Be 'not confirmed by the operator'
+        @(Invoke-PcmEntraConnectObject -Context $script:eoContext -ObjectDn $script:eoDn)[0].Detail | Should -Be 'EntraConnect.Mode = Manual needs the operator'
+    }
+}
+
 Describe 'Entra Connect: a connector that is busy' {
     BeforeAll {
         function global:Get-ADSyncScheduler { [pscustomobject]@{ SyncCycleEnabled = $true; SyncCycleInProgress = $false } }

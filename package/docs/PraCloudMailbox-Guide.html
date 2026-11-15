@@ -916,7 +916,7 @@ Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope AllUsers -
 </table></div>
 <p>In every mode Recover puts the licences back <strong>exactly</strong> as they were (direct assignments and disabled plans are recorded by Convert).</p>
 <h3 id="entra-connect">6.1 Entra Connect</h3>
-<p>Recover needs, on the rebuilt Entra Connect server: delta cycles, and the scheduler paused while shared identities are deleted (a cycle at the wrong moment restores a deleted object).</p>
+<p>Recover needs, on the rebuilt Entra Connect server: delta cycles, the scheduler paused while shared identities are deleted (a cycle at the wrong moment restores a deleted object), and, only when a delta cycle does not recreate a deleted identity, the synchronisation of that one object.</p>
 <div class="table-wrap"><table>
 <thead>
 <tr>
@@ -928,17 +928,17 @@ Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope AllUsers -
 <tbody>
 <tr>
 <td><code>Remoting</code></td>
-<td><code>Invoke-Command -ComputerName &lt;Server&gt;</code> with the current account, ADSync cmdlets</td>
+<td><code>Invoke-Command -ComputerName &lt;Server&gt;</code> with the current account, ADSync cmdlets (for one object: <code>Invoke-ADSyncSingleObjectSync</code>, from Entra Connect 2.x, then a full synchronisation of the Active Directory connector with <code>Set-ADSyncSchedulerConnectorOverride</code>)</td>
 <td>WinRM to the server, account in <code>ADSyncAdmins</code></td>
 </tr>
 <tr>
 <td><code>Script</code></td>
-<td><code>&lt;ScriptPath&gt; -Operation Pause \| Resume \| Delta</code>, plus <code>-Server &lt;EntraConnect.Server&gt;</code> and <code>-CredentialPath &lt;EntraConnect.CredentialPath&gt;</code> when the script declares those parameters</td>
+<td><code>&lt;ScriptPath&gt; -Operation Pause \| Resume \| Delta \| SyncObject</code> (<code>SyncObject</code> also gets <code>-ObjectDn &lt;distinguished name&gt;</code>, one call per object), plus <code>-Server &lt;EntraConnect.Server&gt;</code> and <code>-CredentialPath &lt;EntraConnect.CredentialPath&gt;</code> when the script declares those parameters</td>
 <td>any access path (another account, a jump host, Azure Run Command...). Output: one line of state, logged. <code>exit 0</code> = done, any other exit code or an exception = failed</td>
 </tr>
 <tr>
 <td><code>Manual</code></td>
-<td>the tool asks the operator, who confirms</td>
+<td>the tool asks the operator, who confirms; for one object it gives the exact <code>Invoke-ADSyncSingleObjectSync -DistinguishedName '&lt;dn&gt;' -NoHtmlReport</code> command and the connector full synchronisation to use when it fails</td>
 <td>interactive console (not with <code>-Force</code>)</td>
 </tr>
 </tbody>
@@ -1488,7 +1488,7 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Recover -Batch 5b21030d -Mode Ap
 </tr>
 <tr>
 <td>Shared identity deleted by an earlier run</td>
-<td>Recycle bin checked (purged if needed), delta cycle, recreated object checked</td>
+<td>Recycle bin checked (purged if needed), delta cycle, recreated object checked, then the targeted synchronisation below if it is still missing</td>
 </tr>
 <tr>
 <td>Shared mailbox whose Convert stopped half-way (MailUser or UserMailbox)</td>
@@ -1498,6 +1498,7 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Recover -Batch 5b21030d -Mode Ap
 </table></div>
 <ul>
 <li>One scheduler pause and one delta cycle serve all the shared mailboxes of a wave.</li>
+<li><strong>An identity that the delta cycle does not recreate.</strong> After the delta cycle the tool waits for the new objects (<code>Polling.SyncTimeoutMinutes</code>). A deleted identity that is still missing at the end of the wait is synchronised on its own, by its distinguished name in the snapshot, through the Entra Connect mode of the configuration (<code>Invoke-ADSyncSingleObjectSync</code> reads the object from Active Directory, synchronises it and exports it; a remote session often cannot reach the management service that this cmdlet needs, and then the objects that are left share one cycle in which the Active Directory connector runs a full synchronisation, <code>Set-ADSyncSchedulerConnectorOverride -FullSyncRequired</code> followed by <code>Start-ADSyncSyncCycle -PolicyType Delta</code>). The step is a line of the run (<em>Entra Connect, targeted synchronisation of the object</em>), an event of the journal and of the global report, so a resumed Recover never repeats it. The tool then waits again, for up to ten minutes. If the object is still missing, the object stays <em>Pending</em> and the run ends with <code>RESULT: PENDING</code>: the Next steps give the full synchronisation to run on the Entra Connect server (<code>Start-ADSyncSyncCycle -PolicyType Initial</code>; the tool never starts it by itself, it can take a long while) and the same Recover command to run after it.</li>
 <li><strong>Licence group</strong>: given back to AD only when no converted user of any Convert batch of the journal is left.</li>
 <li><strong>The licence mode is the one of the batch</strong>: Convert records the <code>Licensing.Users.Mode</code> (<code>Group</code>, <code>Kiosk</code> or <code>Direct</code>) it used. Recover takes the Exchange plan of the users back the way Convert gave it, so when the configuration says another mode now, the run stops <strong>before any change</strong>: <em>Convert batch … gave the Exchange plan of its users with Licensing.Users.Mode = … and the configuration now says …</em>. Set the mode back (with the same <code>GroupId</code> or <code>SkuPartNumber</code> as at Convert) and run the same command again. A batch without users, or made before the mode was recorded, is not concerned.</li>
 <li><strong>A shared mailbox whose identity was deleted</strong> is journaled around the deletion (<em>identity about to be deleted</em>, then <em>identity deleted</em>, with the cloud mailbox GUID). A run that stops during or after the deletion (the mailbox is not inactive within 15 minutes, a crash) therefore resumes at the wait for the inactive mailbox instead of saying that there is nothing to roll back: run <code>Recover -Batch &lt;id&gt;</code> again. A recycle bin that cannot be read is no longer taken for a purged identity: the object is reported as <em>Failed</em> (<em>the Entra ID recycle bin could not be read … run Recover -Batch again</em>) and the next run confirms it.</li>
@@ -1897,11 +1898,11 @@ Close-PcmStore $journal
 </tr>
 <tr>
 <td>Recreated shared object not found</td>
-<td>Entra Connect did not create it yet (or the AD object is missing): run a delta cycle, then Recover again</td>
+<td>Entra Connect did not create it yet (or the AD object is missing). The tool synchronises the object on its own after the delta cycle; if that does not bring it back, run a delta cycle, then Recover again</td>
 </tr>
 <tr>
-<td>An object stays <em>not recreated by Entra Connect yet</em> after several delta cycles</td>
-<td>In the Synchronization Service Manager on the Entra Connect server, check that the metaverse object of the AD object is linked to the Entra connector (the Microsoft Entra ID connector space)</td>
+<td>An object stays <em>Entra Connect did not recreate it … run a full synchronisation on the Entra Connect server</em></td>
+<td>A delta cycle and a synchronisation of the object alone did not bring the identity back. Run <code>Start-ADSyncSyncCycle -PolicyType Initial</code> on the Entra Connect server (the Next steps of the run say so), wait for it to end, then run the Recover command of the Next steps again. If the object is still missing, check in the Synchronization Service Manager that the metaverse object of the AD object is linked to the Entra connector (the Microsoft Entra ID connector space)</td>
 </tr>
 <tr>
 <td><em>Entra Connect is busy with another synchronization cycle</em></td>
@@ -2017,7 +2018,7 @@ Close-PcmStore $journal
 </div></section><section class="section" id="appendix-d-versions"><div class="section-head"><div class="section-icon"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12V4h8l10 10-8 8z"/><circle cx="7.5" cy="8" r="1.5"/></svg></div><div><div class="section-eyebrow">Start here</div><h2>Appendix D - Versions</h2></div></div><div class="section-body">
 <p>MAJOR.MINOR.PATCH: MAJOR for an incompatible change of the configuration, of the databases or of the procedure, MINOR for a feature, PATCH for a fix. See <code>CHANGELOG.md</code>.</p>
 </div></section>
-<footer>PRA Cloud Mailbox 2.1.0 · Nicolas Fabert · generated 2026-11-14 21:58 from PraCloudMailbox-Guide.md</footer></main>
+<footer>PRA Cloud Mailbox 2.1.0 · Nicolas Fabert · generated 2026-11-15 15:57 from PraCloudMailbox-Guide.md</footer></main>
 <button type="button" id="to-top" title="Back to top"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 14 6-6 6 6"/></svg></button>
 <dialog id="zoom"></dialog>
 <script>

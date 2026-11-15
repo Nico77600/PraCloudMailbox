@@ -5,14 +5,16 @@
     rebuilt server with an account other than the one running the tool.
 
 .DESCRIPTION
-    Recover needs three operations on the Entra Connect server: Pause and Resume of the scheduler (around the
-    deletion of the shared mailbox identities) and a Delta cycle that it waits for. EntraConnect.Mode =
+    Recover needs four operations on the Entra Connect server: Pause and Resume of the scheduler (around the
+    deletion of the shared mailbox identities), a Delta cycle that it waits for, and, only when a delta cycle did
+    not recreate a deleted identity, the synchronisation of that one object. EntraConnect.Mode =
     'Remoting' does them with Invoke-Command and the current account. When that is not possible (the cloud
     admin server is not in the domain, another account is needed, the server is reached through a jump host
     or an Azure Run Command...), write a script with this contract and set EntraConnect.Mode = 'Script' and
     EntraConnect.ScriptPath to its path:
 
-        -Operation Pause | Resume | Delta     the operation to run
+        -Operation Pause | Resume | Delta | SyncObject     the operation to run
+        -ObjectDn <distinguished name>     SyncObject only: the on-premises object to synchronise (one call per object)
         output                               a short state (one line is best): it goes to the log
         exit 0                               done; any other exit code (or an exception) = failed
 
@@ -28,7 +30,10 @@
     nothing to edit in it. A script of your own that declares -Server and -CredentialPath receives them too.
 
 .PARAMETER Operation
-    Pause, Resume or Delta.
+    Pause, Resume, Delta or SyncObject.
+
+.PARAMETER ObjectDn
+    The distinguished name of the on-premises object that SyncObject synchronises, as in the snapshot.
 
 .PARAMETER Server
     The Entra Connect server (EntraConnect.Server of the configuration).
@@ -45,7 +50,8 @@
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'CredentialPath', Justification = 'The path of a file, not a secret.')]
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('Pause', 'Resume', 'Delta')][string]$Operation,
+    [Parameter(Mandatory)][ValidateSet('Pause', 'Resume', 'Delta', 'SyncObject')][string]$Operation,
+    [string]$ObjectDn = '',
     [string]$Server = '',
     [string]$CredentialPath = ''
 )
@@ -57,6 +63,7 @@ $credentialFile = if ($CredentialPath.Trim()) { $CredentialPath.Trim() } else { 
 try {
     if (-not $server) { throw 'EntraConnect.Server is empty: set it to the host name of the Entra Connect server in the configuration file.' }
     if (-not (Test-Path -LiteralPath $credentialFile -PathType Leaf)) { throw "the credential file $credentialFile does not exist: create it with Get-Credential | Export-Clixml, or set EntraConnect.CredentialPath." }
+    if ($Operation -eq 'SyncObject' -and -not $ObjectDn.Trim()) { throw 'SyncObject needs -ObjectDn: the distinguished name of the object.' }
     $credential = Import-Clixml -LiteralPath $credentialFile
     $state = Invoke-Command -ComputerName $server -Credential $credential -ScriptBlock {
         Import-Module ADSync -ErrorAction Stop
@@ -71,6 +78,36 @@ try {
                 Start-Sleep -Seconds 10
                 $t0 = Get-Date
                 while ((Get-ADSyncScheduler).SyncCycleInProgress -and ((Get-Date) - $t0).TotalMinutes -lt 30) { Start-Sleep -Seconds 10 }
+            }
+            'SyncObject' {
+                # The object is read from Active Directory, synchronised and exported by Invoke-ADSyncSingleObjectSync. That cmdlet needs a session that can reach the management service of
+                # Entra Connect, which a remote session often cannot: then one cycle in which the Active Directory connector of the object runs a full synchronisation does the work.
+                $dn = [string]$using:ObjectDn
+                $retry = {
+                    param([scriptblock]$Call)
+                    for ($attempt = 1; $attempt -le 3; $attempt++) {
+                        $t0 = Get-Date; while ((Get-ADSyncScheduler).SyncCycleInProgress -and ((Get-Date) - $t0).TotalMinutes -lt 15) { Start-Sleep -Seconds 10 }
+                        try { return (& $Call) } catch { if ($attempt -ge 3) { throw }; Start-Sleep -Seconds 30 }
+                    }
+                }
+                $why = 'Invoke-ADSyncSingleObjectSync is not available on this server'
+                $done = $false
+                if (Get-Command -Name Invoke-ADSyncSingleObjectSync -ErrorAction SilentlyContinue) {
+                    try {
+                        $report = (& $retry { Invoke-ADSyncSingleObjectSync -DistinguishedName $dn -NoHtmlReport -ErrorAction Stop | Out-String }) | ConvertFrom-Json
+                        if ([string]$report.StatusInfo.Status -eq 'Success') { $done = $true } else { $why = (@($report.StatusInfo.ErrorCode, $report.StatusInfo.Reason) | Where-Object { $_ }) -join ' ' }
+                    } catch { $why = $_.Exception.Message }
+                }
+                if (-not $done) {
+                    $directory = @(Get-ADSyncConnector) | Where-Object { $_.Type -eq 'AD' -and @($_.Partitions | Where-Object { $_.DN -and $dn.EndsWith($_.DN, [StringComparison]::OrdinalIgnoreCase) }).Count } | Select-Object -First 1
+                    if (-not $directory) { throw "the object was not synchronised ($why) and its Active Directory connector was not found" }
+                    & $retry { Set-ADSyncSchedulerConnectorOverride -ConnectorName $directory.Name -FullSyncRequired $true -ErrorAction Stop | Out-Null }
+                    & $retry { Start-ADSyncSyncCycle -PolicyType Delta -ErrorAction Stop | Out-Null }
+                    Start-Sleep -Seconds 10
+                    $t0 = Get-Date
+                    while ((Get-ADSyncScheduler).SyncCycleInProgress -and ((Get-Date) - $t0).TotalMinutes -lt 30) { Start-Sleep -Seconds 10 }
+                    'full synchronisation of the Active Directory connector'
+                }
             }
         }
         $s = Get-ADSyncScheduler

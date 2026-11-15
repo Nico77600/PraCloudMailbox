@@ -1158,6 +1158,11 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Check -Batch 1a2b3c4d -Expect Re
 <td>Run a synchronisation on Entra Connect. Then run again.</td>
 </tr>
 <tr>
+<td><em>Entra Connect did not recreate it … run a full synchronisation on the Entra Connect server</em></td>
+<td>The tool tried a synchronisation of the object alone and it did not come back.</td>
+<td>Run the command of the Next steps on the Entra Connect server and wait for it to end. Then run the Recover command of the Next steps again.</td>
+</tr>
+<tr>
 <td><em>back on-premises; case hold not stamped yet</em></td>
 <td>The user is back. The hold is still being applied.</td>
 <td>Run Recover again later to check it. The hold is never removed from an object that is back.</td>
@@ -1480,7 +1485,7 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Check -Batch 1a2b3c4d -Expect Re
 </tbody>
 </table></div>
 </div></section>
-<footer>PRA Cloud Mailbox 2.1.0 · Nicolas Fabert · generated 2026-11-14 21:58 from PraCloudMailbox-UserGuide.md</footer></main>
+<footer>PRA Cloud Mailbox 2.1.0 · Nicolas Fabert · generated 2026-11-15 15:57 from PraCloudMailbox-UserGuide.md</footer></main>
 <button type="button" id="to-top" title="Back to top"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 14 6-6 6 6"/></svg></button>
 <dialog id="zoom"></dialog>
 <script>

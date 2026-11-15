@@ -9,7 +9,7 @@
     wait function so that every poll advances the tenant by one tick.
     Faults: LicenceAssign400 (number of refused assignments), NeverMailbox (user IDs never provisioned),
     NoHoldStamp (the case hold is never stamped), DeleteFails (DELETE /users refused), NoRecreate (Entra Connect
-    does not recreate deleted objects), SendAsFails (Add-RecipientPermission refused),
+    does not recreate deleted objects), ObjectSyncFails (the targeted synchronisation of an object is refused), ObjectSyncNoEffect (it answers Success and recreates nothing), SendAsFails (Add-RecipientPermission refused),
     CaseHoldDeployError (Set-CaseHoldPolicy records the change but reports 'failed to be deployed'),
     CaseHoldFails (Set-CaseHoldPolicy refuses every change),
     StopAfter (@{ Pattern; Path }: the stop file of the window is created after the first call that matches),
@@ -63,7 +63,7 @@ function global:New-PraFakeTenant {
         CasePolicy = $null
         CaseRules = [System.Collections.Generic.List[string]]::new()
         Scheduler = $true
-        Faults = @{ LicenceAssign400 = 0; NeverMailbox = @(); NoHoldStamp = $false; DeleteFails = $false; DeleteRejectedStatus = 0; DeleteAmbiguousStatus = 0; NoRecreate = $false; SendAsFails = $false; CaseHoldDeployError = $false; CaseHoldFails = $false; StopAfter = $null; BatchThrottle = 0; ExoFilterFails = $false
+        Faults = @{ LicenceAssign400 = 0; NeverMailbox = @(); NoHoldStamp = $false; DeleteFails = $false; DeleteRejectedStatus = 0; DeleteAmbiguousStatus = 0; NoRecreate = $false; ObjectSyncFails = $false; ObjectSyncNoEffect = $false; SendAsFails = $false; CaseHoldDeployError = $false; CaseHoldFails = $false; StopAfter = $null; BatchThrottle = 0; ExoFilterFails = $false
             NewMailboxFails = $false; CrashAfterNewMailbox = $false; CrashAfterDelete = $false; CrashAfterContact = $false; NoEnterprise = $false
             RecipientReadFails = $false; RecipientQueryFailsAt = 0; RecipientIdentityError = $null; RecipientIdentityEmpty = $false; RejectUnfilteredRecipientInventory = $false; GraphReadFails = $false
             RejectUnfilteredGraphInventory = $false; GraphQueryFailsAt = 0; GraphQueryUnsupported = $false; GraphAdvancedStatus = 0; GraphAdvancedFailsAt = 0; SignInDisableFails = $false; ContactFails = $false; ContactSoftDeletedAliasBlocks = $false; ContactSoftDeletedProxyBlocks = $false; NoInactive = $false; WrongInactiveHold = $false; WorkDaysAliasRead = $false; WorkTimeZoneObjectRead = $false
@@ -246,6 +246,26 @@ function global:Invoke-PraFakeEntraConnect {
         }
     }
     return "fake $Operation"
+}
+
+function global:Invoke-PraFakeEntraConnectObject {
+    <# The targeted synchronisation of single objects (by distinguished name): the object comes back from AD unless a fault says otherwise. One answer per object (Dn, Ok, Detail). #>
+    param([Parameter(Mandatory)][string[]]$ObjectDn)
+    $fake = $global:PraFake
+    foreach ($dn in $ObjectDn) {
+        Write-PraFakeCall "EntraConnect SyncObject $dn"
+        if ($fake.Faults.ObjectSyncFails) { [pscustomobject]@{ Dn = $dn; Ok = $false; Detail = 'Filtered Object' }; continue }
+        if (-not $fake.Faults.ObjectSyncNoEffect) {
+            $local = [regex]::Match($dn, '^CN=([^,]+)').Groups[1].Value
+            $ad = @($fake.Ad | Where-Object { ([string]$_.Upn -split '@')[0] -ieq $local }) | Select-Object -First 1
+            if ($ad -and -not @($fake.Users.Values | Where-Object { $_.ImmutableId -eq $ad.ImmutableId }).Count) {
+                $new = Add-PraFakeUser -Upn $ad.Upn -Kind $ad.Kind -OnPremGuid $ad.OnPremGuid -ImmutableId $ad.ImmutableId -UsageLocation ''
+                $fake.Ad.RemoveAt($fake.Ad.Count - 1)
+                Write-PraFakeCall "Recreated $($ad.Upn) $($new.Id)"
+            }
+        }
+        [pscustomobject]@{ Dn = $dn; Ok = $true; Detail = 'Create by Invoke-ADSyncSingleObjectSync' }
+    }
 }
 
 function global:Invoke-PraFakeWait {
@@ -1119,6 +1139,6 @@ $global:PraFakeCommands = @('Add-PraFakeEntraGroup', 'Get-MgContext', 'Get-MgReq
     'Get-MailboxPermission', 'Add-MailboxPermission', 'Get-RecipientPermission', 'Add-RecipientPermission', 'Get-CaseHoldPolicy', 'Set-CaseHoldPolicy', 'New-CaseHoldPolicy', 'New-CaseHoldRule',
     'New-PraFakeTenant', 'Get-PraFakeHoldTag', 'Add-PraFakeUser', 'Write-PraFakeCall', 'Resolve-PraFakeUser', 'Test-PraFakeExchangePlan', 'Step-PraFake',
     'New-PraFakeResourceSettings',
-    'Invoke-PraFakeEntraConnect', 'Invoke-PraFakeWait', 'Stop-PraFakeGraph', 'ConvertTo-PraFakeGraphUser', 'Get-PraFakeUserOrError',
+    'Invoke-PraFakeEntraConnect', 'Invoke-PraFakeEntraConnectObject', 'Invoke-PraFakeWait', 'Stop-PraFakeGraph', 'ConvertTo-PraFakeGraphUser', 'Get-PraFakeUserOrError',
     'ConvertFrom-PraFakeGraphFilter', 'Test-PraFakeGraphFilter', 'Get-PraFakeGraphPage',
     'Get-PraFakeFiltered', 'ConvertTo-PraFakeRecipient', 'Get-PraFakeLocationText', 'Get-EXORecipient', 'Get-EXOMailbox')

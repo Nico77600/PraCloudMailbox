@@ -169,6 +169,12 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
             try { return [pscustomobject]@{ Batch = (Get-PcmBatch $journal -Id $BatchId); Items = @(Get-PcmBatchItem $journal $BatchId); Changes = @(Get-PcmTenantChange $journal $BatchId) } }
             finally { Close-PcmStore $journal }
         }
+        function Get-E2EEvent {
+            param([string]$BatchId)
+            $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal -ReadOnly
+            try { return @(Invoke-PcmSql $journal 'SELECT step, outcome, detail FROM batch_event WHERE batch_id = @b' @{ b = $BatchId } -As Rows) }
+            finally { Close-PcmStore $journal }
+        }
         function Close-E2E {
             $runContext = Get-Variable context -ValueOnly -ErrorAction SilentlyContinue
             if ($runContext -and $runContext.Journal) { Close-PcmStore $runContext.Journal; $runContext.Journal = $null }
@@ -233,6 +239,7 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         Mock Connect-PcmCompliance { }
         Mock Get-PcmGraphRole { @('User.ReadWrite.All', 'User-OnPremisesSyncBehavior.ReadWrite.All', 'LicenseAssignment.ReadWrite.All', 'Organization.Read.All', 'GroupMember.ReadWrite.All', 'Group-OnPremisesSyncBehavior.ReadWrite.All') }
         Mock Invoke-PcmEntraConnect { Invoke-PraFakeEntraConnect -Operation $Operation }
+        Mock Invoke-PcmEntraConnectObject { Invoke-PraFakeEntraConnectObject -ObjectDn $ObjectDn }
         Mock Wait-PcmCondition { Invoke-PraFakeWait -Test $Test -TimeoutSeconds $TimeoutSeconds -IntervalSeconds $IntervalSeconds }
         Mock Wait-PcmCondition -ModuleName PRA.Cloud { Invoke-PraFakeWait -Test $Test -TimeoutSeconds $TimeoutSeconds -IntervalSeconds $IntervalSeconds }
         Mock Start-Sleep { Step-PraFake }
@@ -2655,11 +2662,13 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         $convert = $context.BatchId
         Close-E2E
         $global:PraFake.Faults.NoRecreate = $true
+        $global:PraFake.Faults.ObjectSyncFails = $true
         Start-E2E -Action Recover -Batch $convert
         Invoke-PcmRecover
         (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Pending'
         Close-E2E
         $global:PraFake.Faults.NoRecreate = $false
+        $global:PraFake.Faults.ObjectSyncFails = $false
         $global:PraFake.Calls.Clear()
         Start-E2E -Action Recover -Batch $convert
         Invoke-PcmRecover
@@ -2667,6 +2676,72 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         @($global:PraFake.Calls | Where-Object { $_ -match 'Graph DELETE|CaseHold' }) | Should -BeNullOrEmpty
         (Get-E2ECallIndex 'Recreated compta@') | Should -BeGreaterThan -1
         (Get-E2EJournal $context.BatchId).Batch.status | Should -Be 'Complete'
+    }
+
+    It 'synchronises on its own a shared identity that a delta cycle did not recreate, and records the step in the journal' {
+        Start-E2E -Action Convert -Scope SharedOnly
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        Close-E2E
+        $global:PraFake.Faults.NoRecreate = $true
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Success'
+        $sync = Get-E2ECallIndex 'EntraConnect SyncObject CN=compta,'
+        $sync | Should -BeGreaterThan (Get-E2ECallIndex 'EntraConnect Delta')
+        (Get-E2ECallIndex 'Recreated compta@') | Should -BeGreaterThan $sync
+        @($global:PraFake.Calls | Where-Object { $_ -match 'Initial' }) | Should -BeNullOrEmpty
+        $events = Get-E2EEvent $context.BatchId
+        @($events | Where-Object { $_.step -eq 'TargetedSync' -and $_.outcome -eq 'Ok' }).Count | Should -Be 1
+        (Get-E2EJournal $context.BatchId).Batch.status | Should -Be 'Complete'
+    }
+    It 'stops with PENDING and the exact full-synchronisation command when the targeted synchronisation fails, and never runs a full one itself' {
+        Start-E2E -Action Convert -Scope SharedOnly
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        Close-E2E
+        $global:PraFake.Faults.NoRecreate = $true
+        $global:PraFake.Faults.ObjectSyncFails = $true
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        $row = Get-E2ERow 'compta@contoso.com'
+        $row.FinalStatus | Should -Be 'Pending'
+        $row.Detail | Should -Match 'did not recreate it \(targeted synchronisation of the object: Filtered Object\): run a full synchronisation on the Entra Connect server, then run Recover -Batch'
+        $next = @($context.NextSteps)
+        $initial = [Array]::IndexOf($next, 'Start-ADSyncSyncCycle -PolicyType Initial')
+        $initial | Should -BeGreaterThan 0
+        $next[0] | Should -Match 'Run a full synchronisation on aadc'
+        ($next[($initial + 2)]) | Should -Match 'Recover -Mode Apply -Batch'
+        @($global:PraFake.Calls | Where-Object { $_ -match 'Initial' }) | Should -BeNullOrEmpty
+        @(Get-E2EEvent $context.BatchId | Where-Object { $_.step -eq 'TargetedSync' -and $_.outcome -eq 'Fail' }).Count | Should -Be 1
+        Close-E2E
+        $global:PraFake.Faults.NoRecreate = $false
+        $global:PraFake.Faults.ObjectSyncFails = $false
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Success'
+        (Get-E2EJournal $context.BatchId).Batch.status | Should -Be 'Complete'
+    }
+    It 'does not repeat a targeted synchronisation that was done: a resumed Recover goes to the PENDING message at once' {
+        Start-E2E -Action Convert -Scope SharedOnly
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        Close-E2E
+        $global:PraFake.Faults.NoRecreate = $true
+        $global:PraFake.Faults.ObjectSyncNoEffect = $true
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Pending'
+        @($global:PraFake.Calls | Where-Object { $_ -match 'EntraConnect SyncObject' }).Count | Should -Be 1
+        Close-E2E
+        $global:PraFake.Calls.Clear()
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        $row = Get-E2ERow 'compta@contoso.com'
+        $row.FinalStatus | Should -Be 'Pending'
+        $row.Detail | Should -Match 'targeted synchronisation of the object: done by an earlier run'
+        @($global:PraFake.Calls | Where-Object { $_ -match 'EntraConnect SyncObject' }) | Should -BeNullOrEmpty
+        @($context.NextSteps) | Should -Contain 'Start-ADSyncSyncCycle -PolicyType Initial'
     }
 
     It 'rolls back like a user a shared mailbox whose Convert stopped half-way, without deleting it (review 4)' {

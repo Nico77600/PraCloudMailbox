@@ -3086,6 +3086,106 @@ function Invoke-PcmEntraConnect {
         }
     }
 }
+
+function Invoke-PcmEntraConnectObject {
+    <#
+    .SYNOPSIS
+        Targeted synchronisation of single objects on the Entra Connect server, by their on-premises distinguished name.
+    .DESCRIPTION
+        Recover uses it for a deleted shared identity that a delta cycle did not recreate. It returns one answer per object (Dn, Ok, Detail) and does not throw for an object that failed.
+        EntraConnect.Mode:
+          Remoting  Invoke-Command to EntraConnect.Server. Invoke-ADSyncSingleObjectSync (Entra Connect 2.x) reads the object from Active Directory, synchronises it and exports it, one
+                    object after the other. That cmdlet needs a session that can reach the management service of Entra Connect, which a remote session often cannot: the objects it does
+                    not synchronise (and every object, once two were refused) are synchronised together by one cycle in which the Active Directory connector runs a full
+                    synchronisation (Set-ADSyncSchedulerConnectorOverride -FullSyncRequired, then Start-ADSyncSyncCycle -PolicyType Delta, waited for).
+          Script    EntraConnect.ScriptPath -Operation SyncObject -ObjectDn <dn>, one object after the other (the signed sample does it). An answer that says the full synchronisation of
+                    the connector ran covers the objects that are left. A script that does not take -ObjectDn, or that refuses the operation, gives a failed answer.
+          Manual    The operator is given the exact command for each object and confirms.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string[]]$ObjectDn, [object]$Caller)
+    $entra = $Context.Config.EntraConnect
+    $failed = { param($Detail) @($ObjectDn | ForEach-Object { [pscustomobject]@{ Dn = [string]$_; Ok = $false; Detail = [string]$Detail } }) }
+    if (-not $PSCmdlet.ShouldProcess("Entra Connect ($($entra.Mode))", 'SyncObject')) { return @(& $failed 'planned') }
+    if (-not (Test-PcmSameText $entra.Mode 'Manual')) { Confirm-PcmWrite -Target ("Entra Connect ({0})" -f $entra.Mode) -Operation 'SyncObject' }
+    switch ($entra.Mode) {
+        'Remoting' {
+            $rows = @(Invoke-Command -ComputerName $entra.Server -ErrorAction Stop -ScriptBlock {
+                    Import-Module ADSync -ErrorAction Stop
+                    $single = Get-Command -Name Invoke-ADSyncSingleObjectSync -ErrorAction SilentlyContinue
+                    # A cycle of the scheduler that is running is waited for; a call that Entra Connect refuses with an error (not with an answer) is tried again, as its services may be busy with that cycle.
+                    $retry = {
+                        param([scriptblock]$Call)
+                        for ($attempt = 1; $attempt -le 3; $attempt++) {
+                            $t0 = Get-Date; while ((Get-ADSyncScheduler).SyncCycleInProgress -and ((Get-Date) - $t0).TotalMinutes -lt 15) { Start-Sleep -Seconds 10 }
+                            try { return (& $Call) } catch { if ($attempt -ge 3) { throw }; Start-Sleep -Seconds 30 }
+                        }
+                    }
+                    $answers = @{}
+                    $left = [System.Collections.Generic.List[string]]::new()
+                    $refused = 0
+                    foreach ($dn in @($using:ObjectDn)) {
+                        $detail = 'Invoke-ADSyncSingleObjectSync is not available on this server'
+                        if ($single -and $refused -lt 2) {
+                            try {
+                                $report = (& $retry { Invoke-ADSyncSingleObjectSync -DistinguishedName $dn -NoHtmlReport -ErrorAction Stop | Out-String }) | ConvertFrom-Json
+                                if ([string]$report.StatusInfo.Status -eq 'Success') { $answers[$dn] = @{ Ok = $true; Detail = ('{0} by Invoke-ADSyncSingleObjectSync' -f $report.Action) }; continue }
+                                $detail = (@($report.StatusInfo.ErrorCode, $report.StatusInfo.Reason) | Where-Object { $_ }) -join ' '
+                            } catch { $detail = $_.Exception.Message }
+                            $refused++
+                        } elseif ($single) { $detail = 'not tried: the objects before it were refused by Invoke-ADSyncSingleObjectSync' }
+                        $left.Add($dn); $answers[$dn] = @{ Ok = $false; Detail = $detail }
+                    }
+                    if ($left.Count) {
+                        try {
+                            $connectors = @(Get-ADSyncConnector)
+                            $names = @($left | ForEach-Object {
+                                    $dn = $_
+                                    ($connectors | Where-Object { $_.Type -eq 'AD' -and @($_.Partitions | Where-Object { $_.DN -and $dn.EndsWith($_.DN, [StringComparison]::OrdinalIgnoreCase) }).Count } | Select-Object -First 1).Name
+                                } | Where-Object { $_ } | Select-Object -Unique)
+                            if (-not $names.Count) { throw 'the Active Directory connector of the objects was not found' }
+                            $null = & $retry { foreach ($name in $names) { Set-ADSyncSchedulerConnectorOverride -ConnectorName $name -FullSyncRequired $true -ErrorAction Stop } }
+                            $null = & $retry { Start-ADSyncSyncCycle -PolicyType Delta -ErrorAction Stop }
+                            Start-Sleep -Seconds 10
+                            $t0 = Get-Date; while ((Get-ADSyncScheduler).SyncCycleInProgress -and ((Get-Date) - $t0).TotalMinutes -lt 30) { Start-Sleep -Seconds 10 }
+                            foreach ($dn in $left) { $answers[$dn] = @{ Ok = $true; Detail = ('full synchronisation of the Active Directory connector, one cycle for {0} object(s) ({1})' -f $left.Count, $answers[$dn].Detail) } }
+                        } catch { foreach ($dn in $left) { $answers[$dn] = @{ Ok = $false; Detail = ('{0}; full synchronisation of the connector: {1}' -f $answers[$dn].Detail, $_.Exception.Message) } } }
+                    }
+                    foreach ($dn in @($using:ObjectDn)) { [pscustomobject]@{ Dn = $dn; Ok = [bool]$answers[$dn].Ok; Detail = [string]$answers[$dn].Detail } }
+                })
+            return @($rows | ForEach-Object { [pscustomobject]@{ Dn = [string]$_.Dn; Ok = [bool]$_.Ok; Detail = [string]$_.Detail } })
+        }
+        'Script' {
+            $declared = (Get-Command -Name $entra.ScriptPath -CommandType ExternalScript -ErrorAction Stop).Parameters
+            if (-not $declared.ContainsKey('ObjectDn')) { return @(& $failed 'EntraConnect.ScriptPath does not take -ObjectDn: it cannot synchronise one object') }
+            $rows = [System.Collections.Generic.List[object]]::new()
+            $covered = ''
+            foreach ($dn in $ObjectDn) {
+                if ($covered) { $rows.Add([pscustomobject]@{ Dn = [string]$dn; Ok = $true; Detail = $covered }); continue }
+                $global:LASTEXITCODE = 0
+                $scriptArguments = @{ Operation = 'SyncObject'; ObjectDn = [string]$dn }
+                if ($entra.Server -and $declared.ContainsKey('Server')) { $scriptArguments.Server = [string]$entra.Server }
+                if ((Get-PcmValue $entra 'CredentialPath' '') -and $declared.ContainsKey('CredentialPath')) { $scriptArguments.CredentialPath = [string]$entra.CredentialPath }
+                try {
+                    $output = & $entra.ScriptPath @scriptArguments
+                    $code = Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+                    $lines = (@($output | ForEach-Object { [string]$_ -split '\r?\n' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | ')
+                    $rows.Add([pscustomobject]@{ Dn = [string]$dn; Ok = (-not $code); Detail = $(if ($code) { "exit code $code$(if ($lines) { ': ' + $lines })" } else { $lines }) })
+                    if (-not $code -and $lines -match 'full synchronisation of the Active Directory connector') { $covered = $lines }
+                } catch { $rows.Add([pscustomobject]@{ Dn = [string]$dn; Ok = $false; Detail = $_.Exception.Message }) }
+            }
+            return @($rows)
+        }
+        'Manual' {
+            if (-not $Caller -and -not $env:PRA_EVENT_FILE) { return @(& $failed 'EntraConnect.Mode = Manual needs the operator') }
+            $where = if ($entra.Server) { $entra.Server } else { 'the Entra Connect server' }
+            $commands = @($ObjectDn | ForEach-Object { "Invoke-ADSyncSingleObjectSync -DistinguishedName '{0}' -NoHtmlReport" -f ([string]$_).Replace("'", "''") })
+            $question = "On $where, run these commands one after the other (each answer must show Status Success):`n" + ($commands -join "`n") + "`nIf one of them fails, run Start-ADSyncSyncCycle -PolicyType Delta after Set-ADSyncSchedulerConnectorOverride -ConnectorName <the Active Directory connector> -FullSyncRequired `$true.`nDone?"
+            if (-not (Request-PcmOperator -Question $question -Title 'PRA Cloud Mailbox - Entra Connect' -Caller $Caller)) { return @(& $failed 'not confirmed by the operator') }
+            return @($ObjectDn | ForEach-Object { [pscustomobject]@{ Dn = [string]$_; Ok = $true; Detail = 'confirmed by the operator' } })
+        }
+    }
+}
 #endregion
 
 Export-ModuleMember -Function Get-PcmRunningPipeline, Get-PcmCallTimeout, Get-PcmCallTimeoutSecond, Get-PcmCallTimeoutMessage, Start-PcmCallGuard, Stop-PcmCallGuard, Install-PcmCallGuard, Test-PcmClientTimeout,
@@ -3099,7 +3199,7 @@ Export-ModuleMember -Function Get-PcmRunningPipeline, Get-PcmCallTimeout, Get-Pc
     Wait-PcmCondition, Get-PcmExoState, Set-PcmSourceOfAuthority, Get-PcmSourceOfAuthority, Set-PcmUsageLocation, Set-PcmGroupMember,
     Test-PcmGroupMember, Get-PcmDisabledPlanForExchangeOnly, Set-PcmLicence, Get-PcmUserLicence, Get-PcmDirectLicence, Enable-PcmLicencePlan,
     Restore-PcmLicence, Remove-PcmIdentity, Test-PcmDeletedIdentity,
-    Connect-PcmCompliance, Get-PcmHoldPolicySet, Test-PcmToolHold, Add-PcmHoldLocationSet, Remove-PcmHoldLocationSet, Get-PcmKioskAssignment, Get-PcmSharedGrant, Grant-PcmSharedPermission, Invoke-PcmEntraConnect
+    Connect-PcmCompliance, Get-PcmHoldPolicySet, Test-PcmToolHold, Add-PcmHoldLocationSet, Remove-PcmHoldLocationSet, Get-PcmKioskAssignment, Get-PcmSharedGrant, Grant-PcmSharedPermission, Invoke-PcmEntraConnect, Invoke-PcmEntraConnectObject
 
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor

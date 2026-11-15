@@ -2846,6 +2846,36 @@ function Invoke-PcmRecoverUserWave {
     }
 }
 
+function Invoke-PcmRecoverObjectSync {
+    <#
+    The shared identities that a delta cycle did not recreate are synchronised one by one on the Entra Connect server (Invoke-PcmEntraConnectObject, by the distinguished name of
+    the snapshot). Each answer is a step of the journal, so that a resumed Recover does not repeat a synchronisation that was done. Returns the entries synchronised by this run.
+    #>
+    param([Parameter(Mandatory)][object[]]$Entries)
+    $todo = @($Entries | Where-Object { $_.TargetedSync -ne 'Done' })
+    if (-not $todo.Count) { return @() }
+    $context.CurrentOperation = 'EntraConnect-SyncObject'
+    $withDn = @($todo | Where-Object { [string]$_.Record.distinguished_name })
+    $answers = @()
+    if ($withDn.Count) {
+        try { $answers = @(Invoke-PcmEntraConnectObject -Context $context -ObjectDn ([string[]]@($withDn | ForEach-Object { [string]$_.Record.distinguished_name })) -Caller $caller) }
+        catch { $failure = $_.Exception.Message; $answers = @($withDn | ForEach-Object { [pscustomobject]@{ Dn = [string]$_.Record.distinguished_name; Ok = $false; Detail = $failure } }) }
+    }
+    $synced = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in $todo) {
+        $dn = [string]$entry.Record.distinguished_name
+        $answer = $answers | Where-Object { Test-PcmSameText ([string]$_.Dn) $dn } | Select-Object -First 1
+        $ok = [bool]($answer -and $answer.Ok)
+        $detail = if (-not $dn) { 'the snapshot holds no distinguished name for this object' } elseif ($answer) { [string]$answer.Detail } else { 'no answer from Entra Connect' }
+        $entry.TargetedSync = if ($ok) { 'Done' } else { 'Failed' }
+        $entry.TargetedSyncDetail = $detail
+        Write-PcmJournal -ObjectGuid ([string]$entry.Item.object_guid) -Step 'TargetedSync' -Outcome $(if ($ok) { 'Ok' } else { 'Fail' }) -Detail $detail -Item @{ step = 'TargetedSync'; result_json = (@{ cloudGuid = [string]$entry.CloudGuid; state = [string]$entry.TargetedSync } | ConvertTo-Json -Compress) }
+        Write-PcmItem -Context $context -Status $(if ($ok) { 'Ok' } else { 'Warn' }) -Icon Sync -Text ('{0}: Entra Connect, targeted synchronisation of the object: {1}' -f $entry.Row.Identity, $detail)
+        if ($ok) { $synced.Add($entry) }
+    }
+    return @($synced)
+}
+
 function Invoke-PcmRecoverSharedWave {
     <#
     A wave of shared mailboxes, phase by phase: case hold and ONE wait for the stamps (an identity is never deleted
@@ -2960,7 +2990,7 @@ function Invoke-PcmRecoverSharedWave {
     Write-PcmItem -Context $context -Status Ok -Icon Sync -Text "Entra Connect delta cycle: $state"
     $waiting = [System.Collections.Generic.List[object]]::new()
     foreach ($entry in $toPurge) { $waiting.Add($entry) }
-    $null = Wait-PcmCondition -Phase 'Waiting for Entra Connect to recreate the identities' -TimeoutSeconds (Get-PcmWaitSeconds 'SyncTimeoutMinutes') -IntervalSeconds $interval -Test {
+    $recreated = {
         $answers = Invoke-PcmGraphBatch -Requests @($waiting | ForEach-Object {
                 @{ Method = 'GET'; Url = ('/users?$filter={0}&$select=id' -f [uri]::EscapeDataString(("onPremisesImmutableId eq '{0}'" -f ([string]$_.Record.immutable_id).Replace("'", "''")))) } })
         $found = @{}
@@ -2980,7 +3010,19 @@ function Invoke-PcmRecoverSharedWave {
         }
         -not $waiting.Count
     }
-    foreach ($entry in $waiting) { Set-PcmRowResult -Row $entry.Row -Status Pending -Detail "identity deleted permanently, mailbox inactive; not recreated by Entra Connect yet: run a delta sync, then Recover -Batch $Batch again" }
+    $null = Wait-PcmCondition -Phase 'Waiting for Entra Connect to recreate the identities' -TimeoutSeconds (Get-PcmWaitSeconds 'SyncTimeoutMinutes') -IntervalSeconds $interval -Test $recreated
+    if ($waiting.Count) {
+        # A delta cycle does not recreate an identity that Entra Connect still holds as exported: each object that is still missing is synchronised on its own, then the wait goes on.
+        $synced = @(Invoke-PcmRecoverObjectSync -Entries @($waiting))
+        if ($synced.Count) {
+            $null = Wait-PcmCondition -Phase 'Waiting for Entra Connect to recreate the identities' -TimeoutSeconds ([Math]::Min(600, (Get-PcmWaitSeconds 'SyncTimeoutMinutes'))) -IntervalSeconds $interval -Test $recreated
+        }
+    }
+    foreach ($entry in $waiting) {
+        $tried = if ($entry.TargetedSyncDetail) { " (targeted synchronisation of the object: $($entry.TargetedSyncDetail))" } else { '' }
+        Set-PcmRowResult -Row $entry.Row -Status Pending -Detail "identity deleted permanently, mailbox inactive; Entra Connect did not recreate it${tried}: run a full synchronisation on the Entra Connect server, then run Recover -Batch $Batch again"
+        $context.FullSyncNeeded = $true
+    }
 }
 
 function Get-PcmOwnedResourceContact {
@@ -3309,18 +3351,19 @@ function Invoke-PcmRecover {
             }
             continue
         }
-        $entry = [pscustomobject]@{ Item = $item; Record = $record; Row = $row; EntraId = [string]$item.entra_id; Exo = $null; Path = ''; CloudGuid = ''; AwaitInactive = $false; Original = @(Get-PcmOriginalLicence $item) }
+        $entry = [pscustomobject]@{ Item = $item; Record = $record; Row = $row; EntraId = [string]$item.entra_id; Exo = $null; Path = ''; CloudGuid = ''; AwaitInactive = $false; Original = @(Get-PcmOriginalLicence $item); TargetedSync = ''; TargetedSyncDetail = '' }
         $exo = $exoStates[$entry.EntraId]
         if (-not $exo) { $exo = Get-PcmExoState -Identity $entry.EntraId -TagAttribute $config.Retention.TagAttribute }
         $entry.Exo = $exo
         $row.ExchangeOnline = $exo.Type; $row.Holds = ($exo.Holds -join ', ')
         $lastStep = if ($previous.ContainsKey($guid)) { [string](Get-PcmValue $previous[$guid] 'step' '') } else { '' }
-        if ($item.kind -ne 'User' -and $lastStep -in @('Deleting', 'Deleted', 'Inactive', 'Purged') -and -not $exo.Type) {
+        if ($item.kind -ne 'User' -and $lastStep -in @('Deleting', 'Deleted', 'Inactive', 'Purged', 'TargetedSync') -and -not $exo.Type) {
             $result = $null; try { $result = [string](Get-PcmValue $previous[$guid] 'result_json' '') | ConvertFrom-Json } catch { $result = $null }
             $entry.Path = 'SharedDeleted'
             $entry.CloudGuid = [string](Get-PcmValue $result 'inactiveGuid' '')
             if (-not $entry.CloudGuid) { $entry.CloudGuid = [string](Get-PcmValue $result 'cloudGuid' '') }
             $entry.AwaitInactive = $lastStep -in @('Deleting', 'Deleted')
+            if ($lastStep -eq 'TargetedSync' -and (Test-PcmSameText ([string](Get-PcmValue $result 'state' '')) 'Done')) { $entry.TargetedSync = 'Done'; $entry.TargetedSyncDetail = 'done by an earlier run' }
             $row.ExchangeOnline = if ($entry.AwaitInactive) { 'identity deleted' } else { 'inactive' }
             [void]$plan.Add($entry); continue
         }
@@ -3430,7 +3473,15 @@ WHERE cb.action = 'Convert' AND ci.kind = 'User' AND ci.step IS NOT NULL
     $complete = $counts.done -eq @($convertItems).Count
     Set-PcmBatch $context.Journal $context.BatchId $(if ($complete) { 'Complete' } else { 'Partial' }) $counts
     $context.NextOnFailure = $true
-    $context.NextSteps = @(if (-not $complete) { 'Some objects are not back yet. Fix what is named above, then resume them (nothing is rolled back twice):'; (Get-PcmCommandLine -ActionName 'Recover' -ModeName 'Apply' -BatchId ([string]$convert.id) -KeepFilters) })
+    $context.NextSteps = @(if (-not $complete) {
+            if (Get-PcmValue $context 'FullSyncNeeded' $false) {
+                $server = if ([string](Get-PcmValue $config.EntraConnect 'Server' '')) { [string]$config.EntraConnect.Server } else { 'the Entra Connect server' }
+                "Entra Connect did not recreate every deleted identity, even after it synchronised each object on its own. Run a full synchronisation on $server (it can take a long while), in PowerShell on that server:"
+                'Start-ADSyncSyncCycle -PolicyType Initial'
+                'Then resume the rollback (nothing is rolled back twice):'
+            } else { 'Some objects are not back yet. Fix what is named above, then resume them (nothing is rolled back twice):' }
+            (Get-PcmCommandLine -ActionName 'Recover' -ModeName 'Apply' -BatchId ([string]$convert.id) -KeepFilters)
+        })
     $createdLists = @(Get-PcmTenantChange $context.Journal $convert.id | Where-Object kind -eq 'NativeRoomList' |
         ForEach-Object { [string]$_.original_json | ConvertFrom-Json -ErrorAction Stop } | Where-Object { $_.operation -eq 'Create' -and $_.creationAttempted })
     if ($createdLists.Count) {
