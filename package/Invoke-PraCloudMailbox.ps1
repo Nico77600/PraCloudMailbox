@@ -2431,6 +2431,7 @@ function Invoke-PcmConvert {
     $resume = $null; $snapshotId = $Snapshot; $resumeItems = @{}
     $read = @{ Verb = 'convert' }
     if ($Batch) {
+        $context.CurrentOperation = 'Read-Batch'
         $resume = Get-PcmBatch $context.Journal -Id $Batch
         if (-not $resume -or $resume.action -ne 'Convert') { throw "Convert batch $Batch not found in $($config.Store.JournalPath)." }
         $rollbacks = @(Invoke-PcmSql $context.Journal "SELECT id, status FROM batch WHERE action = 'Recover' AND convert_batch = @c COLLATE NOCASE ORDER BY created_utc" @{ c = [string]$resume.id } -As Rows)
@@ -3187,6 +3188,7 @@ function Invoke-PcmRecover {
     $config = $context.Config
     if (-not $Batch) { throw '-Batch is required: the ID of the Convert batch to roll back (printed at the end of Convert).' }
     $context.Journal = Open-PcmStore -Path $config.Store.JournalPath -Root $context.Root -Kind Journal
+    $context.CurrentOperation = 'Read-Batch'
     $convert = Get-PcmBatch $context.Journal -Id $Batch
     if ($convert -and $convert.action -eq 'Recover' -and $convert.convert_batch) {
         $given = $convert

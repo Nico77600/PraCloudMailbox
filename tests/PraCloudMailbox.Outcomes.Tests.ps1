@@ -241,6 +241,7 @@ Describe 'Outcomes and batches of Check, Convert and Recover (fake tenant)' -Ski
             $calls = $global:PraFake.Calls.Count
             Start-E2E -Action Convert -Batch $convert
             { Invoke-PcmConvert } | Should -Throw "Convert batch $convert cannot be resumed: Recover batch $recover (complete) already rolled back objects of it*Nothing was changed."
+            $context.CurrentOperation | Should -Be 'Read-Batch'
             $context.NoChangeMade | Should -BeTrue
             $context.NextSteps[0] | Should -Match 'run a new Convert for them'
             $context.NextSteps[1] | Should -Match '-Action Convert'
