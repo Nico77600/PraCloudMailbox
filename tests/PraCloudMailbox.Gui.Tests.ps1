@@ -307,6 +307,8 @@ Describe 'Console: what this computer can do' {
         (Get-PcmGuiNetworkLight -State 'Partial' -Answers @($good, $bad)).Detail | Should -BeLike '*outlook.office365.com does not answer*no answer within 3 seconds*'
         (Get-PcmGuiNetworkLight -State 'Ok' -Answers @($good, $good)).Status | Should -Be 'Ok'
         (Get-PcmGuiNetworkLight -State 'Checking').Status | Should -Be 'Info'
+        (Get-PcmGuiNetworkLight -State 'Checking' -Answers $null).Status | Should -Be 'Info'
+        (Get-PcmGuiNetworkLight -State 'Fail' -Answers $null).Status | Should -Be 'Fail'
     }
     It 'tests the two Microsoft 365 hosts with tasks that never block the window (answers, timeouts and failures)' {
         $done = [Threading.Tasks.Task]::FromResult([object]::new())

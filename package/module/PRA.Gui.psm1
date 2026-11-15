@@ -444,7 +444,7 @@ function Add-PcmGuiProbeLight {
     $items = [Collections.Generic.List[object]]::new()
     foreach ($item in @($d.Lights)) { $items.Add($item) }
     if ($g.NetProbe) {
-        $answers = if ($g.NetResult) { @($g.NetResult.Answers) } else { @() }
+        $answers = @(if ($g.NetResult) { $g.NetResult.Answers })
         if ($d.CanCloudBase) { $shown = Get-PcmGuiNetworkLight -State $state -Answers $answers; $status = $shown.Status; $detail = $shown.Detail }
         else { $status = 'NA'; $detail = 'Not tested: the lights above must be green first.' }
         $items.Insert([Math]::Min(2, $items.Count), [ordered]@{ Name = $script:GuiNetLight; Status = $status; Detail = $detail })

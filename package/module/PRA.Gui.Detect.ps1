@@ -230,6 +230,7 @@ function ConvertTo-PcmGuiNetworkAnswer {
 function Get-PcmGuiNetworkLight {
     <# The light of the Microsoft 365 test: Status and Detail from its state (Checking, Ok, Partial, Fail) and the answers. #>
     param([string]$State, [object[]]$Answers = @())
+    $Answers = @($Answers | Where-Object { $null -ne $_ })
     $unreached = @($Answers | Where-Object { -not $_.Ok } | ForEach-Object { $_.Host })
     if ([string]::Equals($State, 'Checking', [StringComparison]::OrdinalIgnoreCase)) { return @{ Status = 'Info'; Detail = 'Checking that Microsoft 365 can be reached from this computer (a few seconds)...' } }
     if ([string]::Equals($State, 'Ok', [StringComparison]::OrdinalIgnoreCase)) { return @{ Status = 'Ok'; Detail = ('Reachable from this computer ({0}).' -f ($script:GuiM365Hosts -join ' and ')) } }
