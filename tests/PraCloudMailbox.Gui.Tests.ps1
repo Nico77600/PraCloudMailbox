@@ -298,6 +298,17 @@ Describe 'Console: what this computer can do' {
         Get-PcmGuiNetworkWhy (& $wrap (& $socket 10060)) | Should -BeLike 'no answer from the network*'
         Get-PcmGuiNetworkWhy ([InvalidOperationException]::new('boom')) | Should -Be 'boom'
     }
+    It 'reads a hook that the window was not given as no hook, whatever the letter case, without a strict-mode error' {
+        $answer = & $script:Gui {
+            $saved = $script:Gui
+            try {
+                $script:Gui = @{ Hooks = @{ Question = { $true } } }
+                [pscustomobject]@{ Given = [bool](Get-PcmGuiHook 'QUESTION'); Absent = ($null -eq (Get-PcmGuiHook 'NoConsole')) }
+            } finally { $script:Gui = $saved }
+        }
+        $answer.Given | Should -BeTrue
+        $answer.Absent | Should -BeTrue
+    }
     It 'decides Ok, Partial or Fail from the answers, and writes the light' {
         $good = [pscustomobject]@{ Host = 'login.microsoftonline.com'; Ok = $true; Why = '' }
         $bad = [pscustomobject]@{ Host = 'outlook.office365.com'; Ok = $false; Why = 'no answer within 3 seconds' }

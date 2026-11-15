@@ -674,7 +674,7 @@ function Start-PcmGuiRun {
     Initialize-PcmGuiFolder (Join-Path $g.Root 'logs'); Initialize-PcmGuiFolder $folder
     $base = Join-Path $folder ([guid]::NewGuid().ToString('N'))
     $command = Get-PcmGuiCommand -Root $g.Root -ConfigPath $config.Path -Request $request -Engine $engine.Path -BaseConfigPath $config.Base
-    if ($g.Hooks.NoConsole) { $command.NeedsConsoleWindow = $false }
+    if (Get-PcmGuiHook 'NoConsole') { $command.NeedsConsoleWindow = $false }
     $child = Start-PcmGuiChildProcess -Command $command -Root $g.Root -EventPath ($base + '.events.jsonl') -StopPath ($base + '.stop')
     $g.Run = @{
         Request = $request; Config = $config; Purpose = $Purpose; Process = $child.Process; Output = $child.Output; Errors = $child.Errors; Key = $previewKey; Pending = $pending

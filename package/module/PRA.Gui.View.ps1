@@ -185,7 +185,7 @@ function Start-PcmGuiGroupLookup {
             $config = New-PcmGuiRunConfig -Root $g.Root -ConfigPath $g.ConfigPath -Overrides (Get-PcmGuiOverride)
             $engine = Get-PcmGuiEngine
             $command = Get-PcmGuiCommand -Root $g.Root -ConfigPath $config.Path -Request $request -Engine $engine.Path -BaseConfigPath $config.Base
-            if ($g.Hooks.NoConsole) { $command.NeedsConsoleWindow = $false }
+            if (Get-PcmGuiHook 'NoConsole') { $command.NeedsConsoleWindow = $false }
             $folder = Join-Path (Join-Path $g.Root 'logs') 'gui'
             Initialize-PcmGuiFolder (Join-Path $g.Root 'logs'); Initialize-PcmGuiFolder $folder
             $base = Join-Path $folder ([guid]::NewGuid().ToString('N'))

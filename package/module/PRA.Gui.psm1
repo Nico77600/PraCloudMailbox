@@ -807,11 +807,20 @@ function Open-PcmGuiPath {
     catch { if (Test-PcmGuiOrdinal $extension '.psd1') { $null = [Diagnostics.Process]::Start('notepad.exe', ('"{0}"' -f $Path)) } else { throw } }
 }
 
+function Get-PcmGuiHook {
+    <# The hook of this name that the window was given (the tests and the pictures give some), or $null: a hashtable without the key is an error under strict mode. #>
+    param([Parameter(Mandatory)][string]$Name)
+    $hooks = $script:Gui.Hooks
+    if ($hooks -and $hooks.ContainsKey($Name)) { return $hooks[$Name] }
+    return $null
+}
+
 function Select-PcmGuiOu {
     <# The dialog that lists the OUs of the snapshot. Returns the name picked, or ''. #>
     param([object[]]$Units)
     $g = $script:Gui
-    if ($g.Hooks.PickOu) { return [string](& $g.Hooks.PickOu $Units) }
+    $pick = Get-PcmGuiHook 'PickOu'
+    if ($pick) { return [string](& $pick $Units) }
     $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
  Title="Pick an OU" Width="720" Height="500" WindowStartupLocation="CenterOwner" FontFamily="Segoe UI" Background="{DynamicResource ApplicationBackgroundBrush}">
@@ -847,7 +856,8 @@ function Show-PcmGuiQuestion {
     <# A yes/no question of the engine (No by default). #>
     param([Parameter(Mandatory)][string]$Title, [Parameter(Mandatory)][string]$Text)
     $g = $script:Gui
-    if ($g.Hooks.Question) { return [bool](& $g.Hooks.Question $Title $Text) }
+    $ask = Get-PcmGuiHook 'Question'
+    if ($ask) { return [bool](& $ask $Title $Text) }
     $buttons = [Windows.MessageBoxButton]::YesNo; $image = [Windows.MessageBoxImage]::Question; $default = [Windows.MessageBoxResult]::No
     $answer = if ($g.Form.IsVisible) { [Windows.MessageBox]::Show($g.Form, $Text, $Title, $buttons, $image, $default) } else { [Windows.MessageBox]::Show($Text, $Title, $buttons, $image, $default) }
     return $answer -eq [Windows.MessageBoxResult]::Yes
@@ -856,7 +866,8 @@ function Show-PcmGuiQuestion {
 function Show-PcmGuiNotice {
     param([Parameter(Mandatory)][string]$Text)
     $g = $script:Gui
-    if ($g.Hooks.Notice) { [void](& $g.Hooks.Notice $Text); return }
+    $notice = Get-PcmGuiHook 'Notice'
+    if ($notice) { [void](& $notice $Text); return }
     $buttons = [Windows.MessageBoxButton]::OK; $image = [Windows.MessageBoxImage]::Information
     if ($g.Form.IsVisible) { [void][Windows.MessageBox]::Show($g.Form, $Text, 'PRA Cloud Mailbox', $buttons, $image) } else { [void][Windows.MessageBox]::Show($Text, 'PRA Cloud Mailbox', $buttons, $image) }
 }
