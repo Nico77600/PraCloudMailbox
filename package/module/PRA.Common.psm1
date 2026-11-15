@@ -434,14 +434,18 @@ function ConvertTo-PcmPlainMessage {
     <#
     .SYNOPSIS
         The text of an error without its stack: the lines "at Namespace.Type.Method(...)", "at <ScriptBlock>, file: line N" and "--- End of ... stack trace ---" are removed.
-        The card, the console and the report show this text; the log keeps the whole detail.
+        The card, the console and the report show this text; the log keeps the whole detail. The empty parts that Exchange Online puts between its separators ("||You can't use...")
+        are removed too, so that no stray pipe is shown.
     #>
     [CmdletBinding()]
     param([AllowNull()][AllowEmptyString()][string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return '' }
     $frame = '^\s*(at\s+(<[^>\r\n]+>|[^\s(,]+\([^\r\n]*|[^\s,]+,\s+[^\r\n]*?\bline\s+\d+[^\r\n]*)|---\s*End of [^\r\n]*---)\s*$'
     $kept = @([regex]::Split($Text, '\r?\n') | Where-Object { $_ -notmatch $frame })
-    return (($kept -join [Environment]::NewLine).TrimEnd())
+    $plain = ($kept -join [Environment]::NewLine).TrimEnd()
+    $plain = [regex]::Replace($plain, '\|(?:[ \t]*\|)+', '|')
+    $plain = [regex]::Replace($plain, '(?m)^[ \t]*\|[ \t]*|(?<=:[ \t]+)\|[ \t]*', '')
+    return ([regex]::Replace($plain, '(?m)[ \t]*\|[ \t]*(?=\r?$)', ''))
 }
 
 function Add-PcmWarning {

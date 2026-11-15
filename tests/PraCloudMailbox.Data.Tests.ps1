@@ -817,6 +817,14 @@ Describe 'Convert and Recover in Apply mode need a snapshot they can verify' {
         $run.Text | Should -Match 'Integrity +Skipped on request \(-AcceptUnverifiedSnapshot\)'
         $run.Text | Should -Match 'Snapshot 1 of'
     }
+    It 'says in the banner that the snapshot has no .sha256 file, and not that a changed file does not stop the run (<Spelling>)' -TestCases @(@{ Spelling = '-AcceptUnverifiedSnapshot' }, @{ Spelling = '-ACCEPTUNVERIFIEDSNAPSHOT' }) {
+        param($Spelling)
+        Remove-Item -LiteralPath $script:verify.Hash -Force
+        $run = Invoke-Entry -Folder $script:verify.Folder -Arguments @('-Action', 'Convert', '-Mode', 'Apply', '-Force', $Spelling, '-ConfigPath', $script:verify.Config)
+        $banner = ($run.Text -replace '\s+', ' ')
+        $banner | Should -Match 'Integrity Skipped on request \(-AcceptUnverifiedSnapshot\): this snapshot cannot be verified because it has no \.sha256 file; this run goes on because -AcceptUnverifiedSnapshot was given'
+        $banner | Should -Not -Match 'changed after its Collect does not stop this run'
+    }
     It 'stops Recover -Mode Apply, with nothing changed, when there is no hash file' {
         $snapshot = (Get-CompleteSnapshot $script:verify.Db)[0]
         $batch = New-ConvertBatch -Folder $script:verify.Folder -SnapshotId $snapshot.id -RunId $snapshot.run_id -Hash (Get-DbDigest $script:verify.Db $snapshot.id)

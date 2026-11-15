@@ -1899,6 +1899,7 @@ function Set-PcmRowResult {
     <# Final status and detail of one report row, plus the console line. #>
     param([Parameter(Mandatory)][object]$Row, [Parameter(Mandatory)][ValidateSet('Success','Error','Pending','Skipped','Planned')][string]$Status, [string]$Detail = '', [string]$Field, [string]$Value)
     $Row.FinalStatus = $Status
+    $Detail = ConvertTo-PcmPlainMessage $Detail
     if ($Detail) { $Row.Detail = $Detail }
     if ($Field) { $Row[$Field] = $Value }
     $item = @{ Success = 'Ok'; Error = 'Fail'; Pending = 'Warn'; Skipped = 'Skip'; Planned = 'Info' }[$Status]
@@ -1915,7 +1916,7 @@ function Set-PcmRowResult {
 function Stop-PcmEntry {
     <# An object that fails in a phase: journal, report row, and it leaves the next phases. #>
     param([Parameter(Mandatory)][object]$Entry, [Parameter(Mandatory)][string]$Step, [Parameter(Mandatory)][string]$Message)
-    $text = $Message -replace '\s+', ' '
+    $text = (ConvertTo-PcmPlainMessage $Message) -replace '\s+', ' '
     Write-PcmJournal -ObjectGuid ([string]$Entry.Record.object_guid) -Step $Step -Outcome Fail -Detail $text -Item @{ status = 'Failed'; message = $text }
     Set-PcmRowResult -Row $Entry.Row -Status Error -Detail "Convert stopped: $text"
 }
@@ -2869,6 +2870,7 @@ function Invoke-PcmRecoverObjectSync {
         $detail = if (-not $dn) { 'the snapshot holds no distinguished name for this object' } elseif ($answer) { [string]$answer.Detail } else { 'no answer from Entra Connect' }
         $entry.TargetedSync = if ($ok) { 'Done' } else { 'Failed' }
         $entry.TargetedSyncDetail = $detail
+        if (-not $ok -and $detail -match 'no endpoint listening' -and ((Test-PcmSameText $context.Config.EntraConnect.Mode 'Remoting') -or (Test-PcmSameText $context.Config.EntraConnect.Mode 'Script'))) { $context.FullSyncOnServerOnly = $true }
         Write-PcmJournal -ObjectGuid ([string]$entry.Item.object_guid) -Step 'TargetedSync' -Outcome $(if ($ok) { 'Ok' } else { 'Fail' }) -Detail $detail -Item @{ step = 'TargetedSync'; result_json = (@{ cloudGuid = [string]$entry.CloudGuid; state = [string]$entry.TargetedSync } | ConvertTo-Json -Compress) }
         Write-PcmItem -Context $context -Status $(if ($ok) { 'Ok' } else { 'Warn' }) -Icon Sync -Text ('{0}: Entra Connect, targeted synchronisation of the object: {1}' -f $entry.Row.Identity, $detail)
         if ($ok) { $synced.Add($entry) }
@@ -3476,7 +3478,11 @@ WHERE cb.action = 'Convert' AND ci.kind = 'User' AND ci.step IS NOT NULL
     $context.NextSteps = @(if (-not $complete) {
             if (Get-PcmValue $context 'FullSyncNeeded' $false) {
                 $server = if ([string](Get-PcmValue $config.EntraConnect 'Server' '')) { [string]$config.EntraConnect.Server } else { 'the Entra Connect server' }
-                "Entra Connect did not recreate every deleted identity, even after it synchronised each object on its own. Run a full synchronisation on $server (it can take a long while), in PowerShell on that server:"
+                if (Get-PcmValue $context 'FullSyncOnServerOnly' $false) {
+                    "Entra Connect did not recreate every deleted identity: the synchronisation of each object cannot be reached from a remote session. This command works only in a session opened ON the Entra Connect server ($server) itself, not through remoting or a script run remotely. Run a full synchronisation there (it can take a long while), in PowerShell on that server:"
+                } else {
+                    "Entra Connect did not recreate every deleted identity, even after it synchronised each object on its own. Run a full synchronisation on $server (it can take a long while), in PowerShell on that server:"
+                }
                 'Start-ADSyncSyncCycle -PolicyType Initial'
                 'Then resume the rollback (nothing is rolled back twice):'
             } else { 'Some objects are not back yet. Fix what is named above, then resume them (nothing is rolled back twice):' }
@@ -3585,7 +3591,8 @@ try {
     $skipSnapshotCheck = $AcceptUnverifiedSnapshot -and -not (Test-PcmSameText $Action 'Collect')
     if ($skipSnapshotCheck) {
         $context.SnapshotCheck = 'skipped on request (-AcceptUnverifiedSnapshot)'
-        $banner['Integrity'] = @('Key', 'Skipped on request (-AcceptUnverifiedSnapshot): a snapshot file changed after its Collect does not stop this run')
+        $withoutHash = [IO.File]::Exists($config.Store.Path) -and -not [IO.File]::Exists($config.Store.Path + '.sha256')
+        $banner['Integrity'] = @('Key', $(if ($withoutHash) { 'Skipped on request (-AcceptUnverifiedSnapshot): this snapshot cannot be verified because it has no .sha256 file; this run goes on because -AcceptUnverifiedSnapshot was given' } else { 'Skipped on request (-AcceptUnverifiedSnapshot): a snapshot file changed after its Collect does not stop this run' }))
     }
     $banner['Config'] = @('Config', ('{0} {1} Environment {2}' -f (Split-Path $config._Path -Leaf), $dot, $config.Environment))
     if (@($context.ConfigOverrides).Count) { $banner['Settings'] = @('Key', ('{0} setting(s) differ from {1}: {2}{3}' -f @($context.ConfigOverrides).Count, (Split-Path $BaseConfigPath -Leaf), ((@($context.ConfigOverrides) | Select-Object -First 3) -join '; '), $(if (@($context.ConfigOverrides).Count -gt 3) { '; ...' } else { '' }))) }

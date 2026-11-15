@@ -9,7 +9,7 @@
     wait function so that every poll advances the tenant by one tick.
     Faults: LicenceAssign400 (number of refused assignments), NeverMailbox (user IDs never provisioned),
     NoHoldStamp (the case hold is never stamped), DeleteFails (DELETE /users refused), NoRecreate (Entra Connect
-    does not recreate deleted objects), ObjectSyncFails (the targeted synchronisation of an object is refused), ObjectSyncNoEffect (it answers Success and recreates nothing), SendAsFails (Add-RecipientPermission refused),
+    does not recreate deleted objects), ObjectSyncFails (the targeted synchronisation of an object is refused), ObjectSyncNoEndpoint (it is refused because the ADSyncManagement endpoint cannot be reached remotely), ObjectSyncNoEffect (it answers Success and recreates nothing), SendAsFails (Add-RecipientPermission refused),
     CaseHoldDeployError (Set-CaseHoldPolicy records the change but reports 'failed to be deployed'),
     CaseHoldFails (Set-CaseHoldPolicy refuses every change),
     StopAfter (@{ Pattern; Path }: the stop file of the window is created after the first call that matches),
@@ -63,8 +63,8 @@ function global:New-PraFakeTenant {
         CasePolicy = $null
         CaseRules = [System.Collections.Generic.List[string]]::new()
         Scheduler = $true
-        Faults = @{ LicenceAssign400 = 0; NeverMailbox = @(); NoHoldStamp = $false; DeleteFails = $false; DeleteRejectedStatus = 0; DeleteAmbiguousStatus = 0; NoRecreate = $false; ObjectSyncFails = $false; ObjectSyncNoEffect = $false; SendAsFails = $false; CaseHoldDeployError = $false; CaseHoldFails = $false; StopAfter = $null; BatchThrottle = 0; ExoFilterFails = $false
-            NewMailboxFails = $false; CrashAfterNewMailbox = $false; CrashAfterDelete = $false; CrashAfterContact = $false; NoEnterprise = $false
+        Faults = @{ LicenceAssign400 = 0; NeverMailbox = @(); NoHoldStamp = $false; DeleteFails = $false; DeleteRejectedStatus = 0; DeleteAmbiguousStatus = 0; NoRecreate = $false; ObjectSyncFails = $false; ObjectSyncNoEndpoint = $false; ObjectSyncNoEffect = $false; SendAsFails = $false; CaseHoldDeployError = $false; CaseHoldFails = $false; StopAfter = $null; BatchThrottle = 0; ExoFilterFails = $false
+            NewMailboxFails = $false; NewMailboxMessage = ''; CrashAfterNewMailbox = $false; CrashAfterDelete = $false; CrashAfterContact = $false; NoEnterprise = $false
             RecipientReadFails = $false; RecipientQueryFailsAt = 0; RecipientIdentityError = $null; RecipientIdentityEmpty = $false; RejectUnfilteredRecipientInventory = $false; GraphReadFails = $false
             RejectUnfilteredGraphInventory = $false; GraphQueryFailsAt = 0; GraphQueryUnsupported = $false; GraphAdvancedStatus = 0; GraphAdvancedFailsAt = 0; SignInDisableFails = $false; ContactFails = $false; ContactSoftDeletedAliasBlocks = $false; ContactSoftDeletedProxyBlocks = $false; NoInactive = $false; WrongInactiveHold = $false; WorkDaysAliasRead = $false; WorkTimeZoneObjectRead = $false
             DirectoryWriteFails = $false; DirectoryReadMismatch = $false; DirectoryNotesReadMismatch = $false; DirectoryNotesReadMissing = $false
@@ -255,6 +255,7 @@ function global:Invoke-PraFakeEntraConnectObject {
     foreach ($dn in $ObjectDn) {
         Write-PraFakeCall "EntraConnect SyncObject $dn"
         if ($fake.Faults.ObjectSyncFails) { [pscustomobject]@{ Dn = $dn; Ok = $false; Detail = 'Filtered Object' }; continue }
+        if ($fake.Faults.ObjectSyncNoEndpoint) { [pscustomobject]@{ Dn = $dn; Ok = $false; Detail = 'There was no endpoint listening at net.pipe://localhost/ADSyncManagement that could accept the message' }; continue }
         if (-not $fake.Faults.ObjectSyncNoEffect) {
             $local = [regex]::Match($dn, '^CN=([^,]+)').Groups[1].Value
             $ad = @($fake.Ad | Where-Object { ([string]$_.Upn -split '@')[0] -ieq $local }) | Select-Object -First 1
@@ -948,7 +949,7 @@ function global:Set-Mailbox {
 
 function global:New-Mailbox {
     [CmdletBinding()] param([string]$Name, [string]$Alias, [string]$DisplayName, [string]$PrimarySmtpAddress, [switch]$Room, [switch]$Equipment)
-    if ($global:PraFake.Faults.NewMailboxFails) { throw 'New-Mailbox refused.' }
+    if ($global:PraFake.Faults.NewMailboxFails) { throw $(if ($global:PraFake.Faults.NewMailboxMessage) { $global:PraFake.Faults.NewMailboxMessage } else { 'New-Mailbox refused.' }) }
     if (Resolve-PraFakeUser $PrimarySmtpAddress) { throw 'Address already assigned.' }
     $kind = if ($Room) { 'Room' } else { 'Equipment' }
     $user = Add-PraFakeUser -Upn $PrimarySmtpAddress -Kind $kind -UsageLocation ''

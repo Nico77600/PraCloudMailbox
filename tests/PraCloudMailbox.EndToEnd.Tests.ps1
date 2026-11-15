@@ -1968,6 +1968,22 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         @($global:PraFake.Calls | Where-Object { $_ -match 'DELETE' }) | Should -BeNullOrEmpty
     }
 
+    It 'shows the error of Exchange Online without the empty parts between its separators (<Text>)' -TestCases @(
+        @{ Text = '||You can''t use the domain contoso.local because it''s not an accepted domain for your organization.' },
+        @{ Text = ' | |You can''t use the domain contoso.local because it''s not an accepted domain for your organization.' },
+        @{ Text = '|| You can''t use the domain contoso.local because it''s not an accepted domain for your organization.' }) {
+        param($Text)
+        $null = Add-E2ENativeResource -Only
+        $global:PraFake.Faults.NewMailboxFails = $true
+        $global:PraFake.Faults.NewMailboxMessage = $Text
+        Start-E2E -Action Convert
+        Invoke-PcmConvert
+        $row = Get-E2ERow 'room@contoso.com'
+        $row.FinalStatus | Should -Be Error
+        $row.Detail | Should -Match '^Convert stopped: You can''t use the domain contoso\.local because it''s not an accepted domain for your organization\.'
+        $row.Detail | Should -Not -Match '\|\s*\|'
+    }
+
     It 'keeps native creation intent when configuration changes after the creation response was lost' {
         $null = Add-E2ENativeResource -Only
         $global:PraFake.Faults.CrashAfterNewMailbox = $true
@@ -2721,6 +2737,52 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         Invoke-PcmRecover
         (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Success'
         (Get-E2EJournal $context.BatchId).Batch.status | Should -Be 'Complete'
+    }
+    It 'says in plain words that the full synchronisation works only in a session on the Entra Connect server when the object synchronisation could not reach its endpoint remotely' {
+        Start-E2E -Action Convert -Scope SharedOnly
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        Close-E2E
+        $global:PraFake.Faults.NoRecreate = $true
+        $global:PraFake.Faults.ObjectSyncNoEndpoint = $true
+        foreach ($connectMode in @('REMOTING', 'script')) {
+            Start-E2E -Action Recover -Batch $convert
+            $context.Config.EntraConnect.Mode = $connectMode
+            Invoke-PcmRecover
+            (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Pending'
+            $next = @($context.NextSteps)
+            $initial = [Array]::IndexOf($next, 'Start-ADSyncSyncCycle -PolicyType Initial')
+            $initial | Should -BeGreaterThan 0
+            $next[0] | Should -Match 'works only in a session opened ON the Entra Connect server \(aadc\) itself'
+            $next[0] | Should -Match 'not through remoting or a script run remotely'
+            ($next[($initial + 2)]) | Should -Match 'Recover -Mode Apply -Batch'
+            Close-E2E
+        }
+        $global:PraFake.Faults.NoRecreate = $false
+        $global:PraFake.Faults.ObjectSyncNoEndpoint = $false
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Success'
+    }
+    It 'keeps the usual full-synchronisation text with the Manual mode, or when the refusal was not about the endpoint' {
+        Start-E2E -Action Convert -Scope SharedOnly
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        Close-E2E
+        $global:PraFake.Faults.NoRecreate = $true
+        $global:PraFake.Faults.ObjectSyncNoEndpoint = $true
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        @($context.NextSteps)[0] | Should -Match 'even after it synchronised each object on its own'
+        @($context.NextSteps)[0] | Should -Not -Match 'works only in a session'
+        Close-E2E
+        $global:PraFake.Faults.ObjectSyncNoEndpoint = $false
+        $global:PraFake.Faults.ObjectSyncFails = $true
+        Start-E2E -Action Recover -Batch $convert
+        $context.Config.EntraConnect.Mode = 'Remoting'
+        Invoke-PcmRecover
+        @($context.NextSteps)[0] | Should -Match 'even after it synchronised each object on its own'
+        @($context.NextSteps)[0] | Should -Not -Match 'works only in a session'
     }
     It 'does not repeat a targeted synchronisation that was done: a resumed Recover goes to the PENDING message at once' {
         Start-E2E -Action Convert -Scope SharedOnly

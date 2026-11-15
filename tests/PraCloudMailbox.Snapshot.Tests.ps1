@@ -322,6 +322,14 @@ Describe 'Check, Convert and Recover check the snapshot file before they read it
         $run.Text | Should -Match 'Integrity +skipped on request \(-AcceptUnverifiedSnapshot\)'
         $run.Text | Should -Match '-AcceptUnverifiedSnapshot'
     }
+    It 'says in the banner that a changed snapshot file does not stop the run, and not that the .sha256 is missing' {
+        $copy = Copy-Seed 'banner-changed'
+        Edit-SnapshotRow -SnapshotFile $copy.Db
+        $run = Invoke-Entry -Folder $copy.Folder -Arguments @('-Action', 'Check', '-ConfigPath', $copy.Config, '-AcceptUnverifiedSnapshot')
+        $banner = ($run.Text -replace '\s+', ' ')
+        $banner | Should -Match 'Integrity Skipped on request \(-AcceptUnverifiedSnapshot\): a snapshot file changed after its Collect does not stop this run'
+        $banner | Should -Not -Match 'has no \.sha256 file'
+    }
     It 'ignores -AcceptUnverifiedSnapshot for Collect and keeps it out of the Collect command line' {
         $copy = Copy-Seed 'collect-switch'
         $run = Invoke-Entry -Folder $copy.Folder -Arguments @('-Action', 'Collect', '-ConfigPath', $copy.Config, '-AcceptUnverifiedSnapshot')
