@@ -8,7 +8,7 @@ updated: 2026-11-15
 
 # PRA Cloud Mailbox — Administrator guide
 
-> Exchange disaster recovery, **scenario 2**: Active Directory, Exchange and Entra Connect are lost at the same time. Users and shared mailboxes get a mailbox in **Exchange Online on their existing identities** — the Teams storage of each user becomes his mailbox, so Teams keeps working and nothing is lost — and **everything is rolled back** when the on-premises infrastructure is rebuilt, without losing the mails received in the cloud.
+> Exchange disaster recovery, **scenario 2**: Active Directory, Exchange and Entra Connect are lost at the same time. Users and shared mailboxes get a mailbox in **Exchange Online on their existing identities** — the Teams storage of each user becomes their mailbox, so Teams keeps working and nothing is lost — and **everything is rolled back** when the on-premises infrastructure is rebuilt, without losing the mails received in the cloud.
 
 > [!IMPORTANT]
 > Files downloaded from the Internet may be blocked by Windows and fail to run. Before using this project, unblock every file in the downloaded folder:
@@ -57,7 +57,7 @@ In a hybrid organisation, a mailbox hosted on-premises is only a *mail user* for
 
 **Scenario 2** is worse: Active Directory, Exchange **and** Entra Connect are lost (ransomware, loss of the site). The users can still sign in to Microsoft 365 — their Entra ID objects and password hashes are in the cloud — and Teams keeps working, but their mailboxes are unreachable and nothing can be written in AD any more. *PRA* stands for *Plan de Reprise d'Activité*, the disaster recovery plan.
 
-PRA Cloud Mailbox gives every user and shared mailbox in scope a mailbox in Exchange Online **on the same identity** (same objectId, same SMTP and X500 addresses), entirely from the cloud, and rolls everything back once AD, Exchange and Entra Connect are rebuilt. No data is migrated: the cloud mailboxes start with what the cloud already holds — for a user, his Teams storage.
+PRA Cloud Mailbox gives every user and shared mailbox in scope a mailbox in Exchange Online **on the same identity** (same objectId, same SMTP and X500 addresses), entirely from the cloud, and rolls everything back once AD, Exchange and Entra Connect are rebuilt. No data is migrated: the cloud mailboxes start with what the cloud already holds — for a user, their Teams storage.
 
 Why a snapshot: after the disaster nothing on-premises can be read. The list of the objects, their GUIDs, their X500 addresses and the permissions of the shared mailboxes (FullAccess with AutoMapping, SendAs, SendOnBehalf) must therefore be collected **before**, regularly, and stored in a file that is copied to the cloud admin server.
 

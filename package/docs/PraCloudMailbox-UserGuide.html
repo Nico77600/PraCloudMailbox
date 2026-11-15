@@ -525,7 +525,7 @@ Register-ScheduledTask -TaskName 'PRA Collect' -Action $action -Trigger $trigger
 </div>
 <ol>
 <li><strong>Back it up every day.</strong> Collect keeps a consistent copy of each run in <code>data\backup</code>. Back up that folder, and the <code>data\PraCloudMailbox.db</code> file.</li>
-<li><strong>Keep a copy outside your network.</strong> Put the backup somewhere that the lost domain cannot reach: off-site, offline or immutable storage, with credentials that are <strong>not</strong> in your domain. If an attacker has your domain, he has every disk and every share that your domain reaches. Keep <strong>several generations</strong>, not only the last one.</li>
+<li><strong>Keep a copy outside your network.</strong> Put the backup somewhere that the lost domain cannot reach: off-site, offline or immutable storage, with credentials that are <strong>not</strong> in your domain. If attackers hold your domain, they have every disk and every share that your domain reaches. Keep <strong>several generations</strong>, not only the last one.</li>
 <li><strong>Protect who can read it.</strong> The snapshot holds names, e-mail addresses, GUIDs and permissions. Give the folder and the backups a <strong>restricted access list</strong>: the administrators of the tool and the backup account only. Never share the folder with <strong>Domain Users</strong>.</li>
 <li><strong>Copy the <code>.sha256</code> file with it.</strong> Collect writes <code>PraCloudMailbox.db.sha256</code> beside the snapshot, and one beside each backup. The tool checks the snapshot against this file <strong>before</strong> it reads it, in Check, Convert and Recover.</li>
 <li><strong>If the check says the file changed, restore it from the external backup.</strong> The message says <em>Nothing was changed.</em> and <em>Restore the file from your external backup</em>. Use <code>-AcceptUnverifiedSnapshot</code> <strong>only</strong> when you know why the file changed and you accept it as it is. A snapshot with <strong>no</strong> <code>.sha256</code> file gives a warning in a Preview and in a Check. A <strong>Convert or a Recover in Apply mode stops</strong> and changes nothing: copy the <code>.sha256</code> file with the snapshot, or add <code>-AcceptUnverifiedSnapshot</code> when you know the file is the right one.</li>
@@ -1485,7 +1485,7 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Check -Batch 1a2b3c4d -Expect Re
 </tbody>
 </table></div>
 </div></section>
-<footer>PRA Cloud Mailbox 2.1.0 · Nicolas Fabert · generated 2026-11-15 15:57 from PraCloudMailbox-UserGuide.md</footer></main>
+<footer>PRA Cloud Mailbox 2.1.0 · Nicolas Fabert · generated 2026-11-15 20:49 from PraCloudMailbox-UserGuide.md</footer></main>
 <button type="button" id="to-top" title="Back to top"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 14 6-6 6 6"/></svg></button>
 <dialog id="zoom"></dialog>
 <script>
