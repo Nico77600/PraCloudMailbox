@@ -661,6 +661,7 @@ Describe 'Collect refuses a snapshot that lost its mailboxes' {
         $run.Text | Should -Match 'RESULT: FAIL|Collect stopped'
         $run.Text | Should -Match 'Collect found 4 mailbox\(es\), 60% fewer than the last complete snapshot of the same scope \(snapshot 1, 10 mailbox\(es\)\)'
         $run.Text | Should -Match 'Collect\.MaxDropPercent \(50%\)'
+        $run.Text | Should -Match 'Stopped at step .Saving the snapshot. \(operation Check-SnapshotSize\)'
         $run.Text | Should -Match 'Nothing was changed on Exchange'
         @(Get-CompleteSnapshot $script:size.Db).Count | Should -Be 1
         (Read-PcmHashFile -Path $script:size.Hash).Hash | Should -BeExactly $before
@@ -673,6 +674,7 @@ Describe 'Collect refuses a snapshot that lost its mailboxes' {
         $run.Text | Should -Match 'Collect found no mailbox in the scope'
         $run.Text | Should -Match 'The last complete snapshot is snapshot 1, with 10 mailbox\(es\)'
         $run.Text | Should -Match 'set Collect\.MaxDropPercent to 100'
+        $run.Text | Should -Match 'Stopped at step .Saving the snapshot. \(operation Check-SnapshotSize\)'
         @(Get-CompleteSnapshot $script:size.Db).Count | Should -Be 1
     }
     It 'shows the same refusal as a warning in a Preview, and exits 0' {

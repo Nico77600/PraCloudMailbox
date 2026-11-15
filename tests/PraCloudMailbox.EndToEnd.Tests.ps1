@@ -3083,6 +3083,37 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         $context.NoChangeMade | Should -BeTrue
         Close-E2E
     }
+    It 'resumes a Convert wave given again by -CsvPath: the objects already finished are skipped with their reason, not refused' {
+        $wave = Join-Path $global:PraE2E.Dir 'wave-convert-resume.csv'
+        Set-Content -LiteralPath $wave -Encoding UTF8 -Value 'IDENTITY', 'alice@contoso.com', 'COMPTA@contoso.com'
+        $original = [IO.File]::ReadAllText($global:PraE2E.Config)
+        [IO.File]::WriteAllText($global:PraE2E.Config, $original.Replace("Shared = @{ SkuPartNumber = 'E5' }", "Shared = @{ SkuPartNumber = 'E5'; KeepFree = 1 }"), [Text.UTF8Encoding]::new($true))
+        $global:PraFake.Skus['sku-e5'].Enabled = 2
+        Start-E2E -Action Convert -CsvPath $wave
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        (Get-E2ERow 'alice@contoso.com').FinalStatus | Should -Be 'Success'
+        (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Error'
+        (Get-E2EJournal $convert).Batch.status | Should -Be 'Partial'
+        Close-E2E
+        [IO.File]::WriteAllText($global:PraE2E.Config, $original, [Text.UTF8Encoding]::new($true))
+        Start-E2E -Action Convert -Batch $convert -CsvPath $wave
+        Invoke-PcmConvert
+        (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Success'
+        @($context.SkippedMembers) | Should -Be @("alice@contoso.com (already finished in Convert batch $convert)")
+        (Get-E2EJournal $convert).Batch.status | Should -Be 'Complete'
+    }
+    It 'refuses in plain words a Convert resume whose list holds only finished objects, and changes nothing' {
+        $wave = Join-Path $global:PraE2E.Dir 'wave-convert-done.csv'
+        Set-Content -LiteralPath $wave -Encoding UTF8 -Value 'Identity', 'alice@contoso.com'
+        Start-E2E -Action Convert -CsvPath $wave
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        Close-E2E
+        Start-E2E -Action Convert -Batch $convert -CsvPath $wave
+        { Invoke-PcmConvert } | Should -Throw '*Every object asked for is already done (already finished in Convert batch*Nothing was changed*'
+        $context.NoChangeMade | Should -BeTrue
+    }
     It 'stops Convert before the next object when the window asks, then the batch resumes' {
         $stop = Join-Path $global:PraE2E.Dir 'run.stop'
         $env:PRA_STOP_FILE = $stop

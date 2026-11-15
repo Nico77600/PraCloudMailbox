@@ -1053,7 +1053,7 @@ function Invoke-PcmCollect {
         return
     }
     Write-PcmStep -Context $context -Title 'Saving the snapshot' -Icon Backup
-    if ($sizeProblem) { $context.NoChangeMade = $true; throw $sizeProblem }
+    if ($sizeProblem) { $context.NoChangeMade = $true; $context.CurrentOperation = 'Check-SnapshotSize'; throw $sizeProblem }
     if ($Identity) {
         # A one-object snapshot becomes the last complete snapshot: Check and Convert would only see this object.
         if (-not $Force -and -not ($script:ConfirmBound -and (Test-PcmSameText $ConfirmPreference 'None'))) {
@@ -1352,12 +1352,14 @@ function Read-PcmSnapshotData {
     # -ObjectGuid keeps the objects of a batch still to resume; the source of the run, -Scope and -MaxObjects then narrow them like they narrow a snapshot.
     $allRecords = @($records)
     $inBatch = $PSBoundParameters.ContainsKey('ObjectGuid')
+    $knownRecords = @()
     if ($inBatch) {
         $wanted = [System.Collections.Generic.HashSet[string]]::new([string[]]@($ObjectGuid), [StringComparer]::OrdinalIgnoreCase)
+        $knownRecords = @($records | Where-Object { -not $wanted.Contains([string]$_.object_guid) -and $Known.ContainsKey([string]$_.object_guid) })
         $records = @($records | Where-Object { $wanted.Contains([string]$_.object_guid) })
     }
     if (-not $All) {
-        $records = @(Select-PcmTarget -Items $records -Where $(if ($Where) { $Where } else { "snapshot $($snap.id)" }) -AllRecords $allRecords -Known $Known -InBatch:$inBatch -SkipConverted:$SkipConverted `
+        $records = @(Select-PcmTarget -Items $records -Where $(if ($Where) { $Where } else { "snapshot $($snap.id)" }) -AllRecords $allRecords -Known $Known -KnownItems $knownRecords -InBatch:$inBatch -SkipConverted:$SkipConverted `
                 -RecordOf { param($r) $r } -Keys { param($r) @([string]$r.user_principal_name, [string]$r.primary_smtp_address, [string]$r.sam_account_name, [string]$r.object_guid, [string]$r.distinguished_name) })
         $records = @(Limit-PcmTarget -Items $records -SkipConverted:$SkipConverted)
         Write-PcmTargetHeader -Count $records.Count
