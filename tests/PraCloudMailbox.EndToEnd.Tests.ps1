@@ -3967,7 +3967,8 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         $convertBatch = $context.BatchId
         Close-E2E
         $credentialFile = Join-Path $global:PraE2E.Dir 'entra.cred.xml'
-        [pscredential]::new('CONTOSO\svc', (ConvertTo-SecureString 'not a secret' -AsPlainText -Force)) | Export-Clixml -LiteralPath $credentialFile
+        $secret = [System.Security.SecureString]::new(); foreach ($character in 'not a secret'.ToCharArray()) { $secret.AppendChar($character) }
+        [pscredential]::new('CONTOSO\svc', $secret) | Export-Clixml -LiteralPath $credentialFile
         $scriptFile = Join-Path $global:PraE2E.Dir 'entra.ps1'
         [IO.File]::WriteAllText($scriptFile, "param(`$Operation)`n")
         $text = [IO.File]::ReadAllText($global:PraE2E.Config).Replace("EntraConnect = @{ Mode = 'Manual'; Server = 'aadc' }", "EntraConnect = @{ Mode = 'Script'; Server = 'aadc'; ScriptPath = '$scriptFile'; CredentialPath = '$credentialFile' }")

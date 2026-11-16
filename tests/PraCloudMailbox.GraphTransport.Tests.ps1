@@ -186,7 +186,8 @@ Describe 'Entra Connect check (authenticated, read-only)' {
         $answer.Ok | Should -BeTrue
         $answer.Kind | Should -BeExactly 'Ok'
         Should -Invoke Invoke-Command -ModuleName PRA.Cloud -Times 1 -Exactly -ParameterFilter { $ComputerName -eq 'aadc' -and -not $Credential -and $null -ne $SessionOption }
-        $account = [pscredential]::new('CONTOSO\svc', (ConvertTo-SecureString 'not a secret' -AsPlainText -Force))
+        $secret = [System.Security.SecureString]::new(); foreach ($character in 'not a secret'.ToCharArray()) { $secret.AppendChar($character) }
+        $account = [pscredential]::new('CONTOSO\svc', $secret)
         $null = Test-PcmSyncServer -Server 'aadc' -Credential $account
         Should -Invoke Invoke-Command -ModuleName PRA.Cloud -Times 1 -Exactly -ParameterFilter { $Credential.UserName -eq 'CONTOSO\svc' }
     }
