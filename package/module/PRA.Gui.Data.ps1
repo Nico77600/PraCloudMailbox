@@ -135,10 +135,15 @@ function ConvertTo-PcmGuiNativeArgument {
 }
 
 function ConvertTo-PcmGuiShownArgument {
-    <# A value as an operator would type it: bare when it is plain, between double quotes otherwise. #>
+    <#
+    A value as an operator would type it: bare when it is plain, otherwise a single-quoted PowerShell literal, which PowerShell never expands (no sub-expression, no variable, no
+    escape): the apostrophe AND the typographic quotes that PowerShell also reads as quotes are doubled.
+    #>
     param([AllowEmptyString()][string]$Value)
-    if ($Value -match '^[A-Za-z0-9_.:@\\/-]+$') { return $Value }
-    return '"' + $Value.Replace('"', '""') + '"'
+    if ($Value -match '^[A-Za-z0-9_.:\\/][A-Za-z0-9_.:@\\/-]*$') { return $Value }
+    $escaped = $Value.Replace("'", "''")
+    foreach ($code in @(0x2018, 0x2019, 0x201A, 0x201B)) { $quote = [string][char]$code; $escaped = $escaped.Replace($quote, $quote + $quote) }
+    return "'" + $escaped + "'"
 }
 
 function Get-PcmGuiEngine {
@@ -176,15 +181,18 @@ function Get-PcmGuiCommand {
     if (-not $Engine) { $Engine = (Get-PcmGuiEngine).Path }
     $mode = if ($Request.Contains('Mode') -and $Request.Mode) { [string]$Request.Mode } else { 'Preview' }
     $options = [Collections.Generic.List[string]]::new()
-    $options.Add('-Action'); $options.Add($action)
-    if ($action -ne 'Check') { $options.Add('-Mode'); $options.Add($mode) }
-    if ($Request.Contains('Scope') -and $Request.Scope -and -not (Test-PcmGuiOrdinal $Request.Scope 'All')) { $options.Add('-Scope'); $options.Add([string]$Request.Scope) }
-    foreach ($name in @('Batch', 'Identity', 'CsvPath', 'SearchBase', 'Group')) { if ($Request.Contains($name) -and $Request[$name]) { $options.Add('-' + $name); $options.Add([string]$Request[$name]) } }
-    if ($Request.Contains('MaxObjects') -and [int]$Request.MaxObjects -gt 0) { $options.Add('-MaxObjects'); $options.Add([string][int]$Request.MaxObjects) }
-    if ($Request.Contains('Snapshot') -and [long]$Request.Snapshot -gt 0) { $options.Add('-Snapshot'); $options.Add([string][long]$Request.Snapshot) }
-    if ($Request.Contains('Expect') -and $Request.Expect) { $options.Add('-Expect'); $options.Add([string]$Request.Expect) }
-    if ($Request.Contains('Once') -and [bool]$Request.Once) { $options.Add('-Once') }
-    if ($Request.Contains('ResolveOnly') -and [bool]$Request.ResolveOnly) { $options.Add('-ResolveOnly') }
+    # The names of the options are shown as they are; every value goes through ConvertTo-PcmGuiShownArgument.
+    $optionNames = [Collections.Generic.HashSet[int]]::new()
+    $addName = { param([string]$Text) [void]$optionNames.Add($options.Count); $options.Add($Text) }
+    & $addName '-Action'; $options.Add($action)
+    if ($action -ne 'Check') { & $addName '-Mode'; $options.Add($mode) }
+    if ($Request.Contains('Scope') -and $Request.Scope -and -not (Test-PcmGuiOrdinal $Request.Scope 'All')) { & $addName '-Scope'; $options.Add([string]$Request.Scope) }
+    foreach ($name in @('Batch', 'Identity', 'CsvPath', 'SearchBase', 'Group')) { if ($Request.Contains($name) -and $Request[$name]) { & $addName ('-' + $name); $options.Add([string]$Request[$name]) } }
+    if ($Request.Contains('MaxObjects') -and [int]$Request.MaxObjects -gt 0) { & $addName '-MaxObjects'; $options.Add([string][int]$Request.MaxObjects) }
+    if ($Request.Contains('Snapshot') -and [long]$Request.Snapshot -gt 0) { & $addName '-Snapshot'; $options.Add([string][long]$Request.Snapshot) }
+    if ($Request.Contains('Expect') -and $Request.Expect) { & $addName '-Expect'; $options.Add([string]$Request.Expect) }
+    if ($Request.Contains('Once') -and [bool]$Request.Once) { & $addName '-Once' }
+    if ($Request.Contains('ResolveOnly') -and [bool]$Request.ResolveOnly) { & $addName '-ResolveOnly' }
     $tokens = [Collections.Generic.List[string]]::new()
     foreach ($token in @('-NoProfile', '-STA', '-File', $ScriptPath)) { $tokens.Add($token) }
     foreach ($token in $options) { $tokens.Add($token) }
@@ -194,7 +202,7 @@ function Get-PcmGuiCommand {
     # As an operator would type it in the package folder: the script as .\Invoke-PraCloudMailbox.ps1, the original configuration file only when it is not the default one.
     $shown = [Collections.Generic.List[string]]::new()
     $shown.Add('.\Invoke-PraCloudMailbox.ps1')
-    foreach ($token in $options) { $shown.Add((ConvertTo-PcmGuiShownArgument $token)) }
+    for ($i = 0; $i -lt $options.Count; $i++) { $shown.Add($(if ($optionNames.Contains($i)) { $options[$i] } else { ConvertTo-PcmGuiShownArgument $options[$i] })) }
     $shownConfig = if ($BaseConfigPath) { $BaseConfigPath } else { $ConfigPath }
     $defaultConfig = Join-Path $Root 'config\PraCloudMailbox.config.psd1'
     if (-not (Test-PcmGuiSamePath $shownConfig $defaultConfig)) { $shown.Add('-ConfigPath'); $shown.Add((ConvertTo-PcmGuiShownArgument $shownConfig)) }
