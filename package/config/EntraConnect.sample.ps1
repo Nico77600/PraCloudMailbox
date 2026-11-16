@@ -5,14 +5,16 @@
     rebuilt server with an account other than the one running the tool.
 
 .DESCRIPTION
-    Recover needs three operations on the Entra Connect server: Pause and Resume of the scheduler (around the
-    deletion of the shared mailbox identities) and a Delta cycle that it waits for. EntraConnect.Mode =
+    Recover needs four operations on the Entra Connect server: Pause and Resume of the scheduler (around the
+    deletion of the shared mailbox identities), a Delta cycle that it waits for, and, only when a delta cycle did
+    not recreate a deleted identity, the synchronisation of that one object. EntraConnect.Mode =
     'Remoting' does them with Invoke-Command and the current account. When that is not possible (the cloud
     admin server is not in the domain, another account is needed, the server is reached through a jump host
     or an Azure Run Command...), write a script with this contract and set EntraConnect.Mode = 'Script' and
     EntraConnect.ScriptPath to its path:
 
-        -Operation Pause | Resume | Delta     the operation to run
+        -Operation Pause | Resume | Delta | SyncObject     the operation to run
+        -ObjectDn <distinguished name>     SyncObject only: the on-premises object to synchronise (one call per object)
         output                               a short state (one line is best): it goes to the log
         exit 0                               done; any other exit code (or an exception) = failed
 
@@ -23,24 +25,45 @@
     (the file can only be read by the same Windows account on the same computer). The account needs to be
     a member of ADSyncAdmins on the Entra Connect server and allowed to use WinRM there.
 
+    The sample is signed and runs as it is: the tool gives it the server (EntraConnect.Server) and the credential
+    file (EntraConnect.CredentialPath, default .\config\EntraConnect.cred.xml) of the configuration, so there is
+    nothing to edit in it. A script of your own that declares -Server and -CredentialPath receives them too.
+
 .PARAMETER Operation
-    Pause, Resume or Delta.
+    Pause, Resume, Delta or SyncObject.
+
+.PARAMETER ObjectDn
+    The distinguished name of the on-premises object that SyncObject synchronises, as in the snapshot.
+
+.PARAMETER Server
+    The Entra Connect server (EntraConnect.Server of the configuration).
+
+.PARAMETER CredentialPath
+    The file written by Export-Clixml that holds the credential (EntraConnect.CredentialPath of the configuration).
+    Empty = EntraConnect.cred.xml beside this script.
 
 .NOTES
     Author  : Nicolas Fabert
     Version : 1.0.0
-    Part of : PRA Cloud Mailbox (sample, copy and adapt it)
+    Part of : PRA Cloud Mailbox (sample: signed, it runs as it is)
 #>
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'CredentialPath', Justification = 'The path of a file, not a secret.')]
 [CmdletBinding()]
-param([Parameter(Mandatory)][ValidateSet('Pause', 'Resume', 'Delta')][string]$Operation)
+param(
+    [Parameter(Mandatory)][ValidateSet('Pause', 'Resume', 'Delta', 'SyncObject')][string]$Operation,
+    [string]$ObjectDn = '',
+    [string]$Server = '',
+    [string]$CredentialPath = ''
+)
 $ErrorActionPreference = 'Stop'
 
-# ---- Adapt these two values ------------------------------------------------------------------------
-$server = 'aadc01.contoso.com'
-$credentialFile = Join-Path $PSScriptRoot 'EntraConnect.cred.xml'
-# ------------------------------------------------------------------------------------------------------
+$server = $Server.Trim()
+$credentialFile = if ($CredentialPath.Trim()) { $CredentialPath.Trim() } else { Join-Path $PSScriptRoot 'EntraConnect.cred.xml' }
 
 try {
+    if (-not $server) { throw 'EntraConnect.Server is empty: set it to the host name of the Entra Connect server in the configuration file.' }
+    if (-not (Test-Path -LiteralPath $credentialFile -PathType Leaf)) { throw "the credential file $credentialFile does not exist: create it with Get-Credential | Export-Clixml, or set EntraConnect.CredentialPath." }
+    if ($Operation -eq 'SyncObject' -and -not $ObjectDn.Trim()) { throw 'SyncObject needs -ObjectDn: the distinguished name of the object.' }
     $credential = Import-Clixml -LiteralPath $credentialFile
     $state = Invoke-Command -ComputerName $server -Credential $credential -ScriptBlock {
         Import-Module ADSync -ErrorAction Stop
@@ -56,6 +79,36 @@ try {
                 $t0 = Get-Date
                 while ((Get-ADSyncScheduler).SyncCycleInProgress -and ((Get-Date) - $t0).TotalMinutes -lt 30) { Start-Sleep -Seconds 10 }
             }
+            'SyncObject' {
+                # The object is read from Active Directory, synchronised and exported by Invoke-ADSyncSingleObjectSync. That cmdlet needs a session that can reach the management service of
+                # Entra Connect, which a remote session often cannot: then one cycle in which the Active Directory connector of the object runs a full synchronisation does the work.
+                $dn = [string]$using:ObjectDn
+                $retry = {
+                    param([scriptblock]$Call)
+                    for ($attempt = 1; $attempt -le 3; $attempt++) {
+                        $t0 = Get-Date; while ((Get-ADSyncScheduler).SyncCycleInProgress -and ((Get-Date) - $t0).TotalMinutes -lt 15) { Start-Sleep -Seconds 10 }
+                        try { return (& $Call) } catch { if ($attempt -ge 3) { throw }; Start-Sleep -Seconds 30 }
+                    }
+                }
+                $why = 'Invoke-ADSyncSingleObjectSync is not available on this server'
+                $done = $false
+                if (Get-Command -Name Invoke-ADSyncSingleObjectSync -ErrorAction SilentlyContinue) {
+                    try {
+                        $report = (& $retry { Invoke-ADSyncSingleObjectSync -DistinguishedName $dn -NoHtmlReport -ErrorAction Stop | Out-String }) | ConvertFrom-Json
+                        if ([string]$report.StatusInfo.Status -eq 'Success') { $done = $true } else { $why = (@($report.StatusInfo.ErrorCode, $report.StatusInfo.Reason) | Where-Object { $_ }) -join ' ' }
+                    } catch { $why = $_.Exception.Message }
+                }
+                if (-not $done) {
+                    $directory = @(Get-ADSyncConnector) | Where-Object { $_.Type -eq 'AD' -and @($_.Partitions | Where-Object { $_.DN -and $dn.EndsWith($_.DN, [StringComparison]::OrdinalIgnoreCase) }).Count } | Select-Object -First 1
+                    if (-not $directory) { throw "the object was not synchronised ($why) and its Active Directory connector was not found" }
+                    & $retry { Set-ADSyncSchedulerConnectorOverride -ConnectorName $directory.Name -FullSyncRequired $true -ErrorAction Stop | Out-Null }
+                    & $retry { Start-ADSyncSyncCycle -PolicyType Delta -ErrorAction Stop | Out-Null }
+                    Start-Sleep -Seconds 10
+                    $t0 = Get-Date
+                    while ((Get-ADSyncScheduler).SyncCycleInProgress -and ((Get-Date) - $t0).TotalMinutes -lt 30) { Start-Sleep -Seconds 10 }
+                    'full synchronisation of the Active Directory connector'
+                }
+            }
         }
         $s = Get-ADSyncScheduler
         'SyncCycleEnabled={0} InProgress={1}' -f $s.SyncCycleEnabled, $s.SyncCycleInProgress
@@ -68,10 +121,10 @@ try {
 }
 
 # SIG # Begin signature block
-# MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAmgiEveLYaEci3
-# nZjU8C+bSkzPqzbTuBOkCrqaPwOpK6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCutg53dWjFemlk
+# dx6itSd5YWeY9C7qYlHmETzMoDVka6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -143,28 +196,28 @@ try {
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYEjCCGA4CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCM7M1b8yVm
-# rtaHJY7uK8vop5c62FYhCpEpHaRK0v3gYjANBgkqhkiG9w0BAQEFAASCAgB39/ui
-# iYH9jTaAkVBsON8IWbyuUnqvqbPSZtRsAdeBTS/IrdAfi20gncwU5tu6UIA6s/Uy
-# SSlFTAsSJPLcqxi+PZXh+8MycpuebaeFtPCI7eN1OPjkrIMqK2nT3WHX235pv7Mo
-# vGXfjyiIkMETZ2HDDxNAAq7u/GbDTONASz9+fQ7MeoqVVM+TJItn2NQ5plXOECgQ
-# 6IBerb1XTfGodGQ0XyR8UHinM1p2KO7lHgjiTMaRVZiy2wwmNE5UCPkopmlhJo/p
-# laiy0QNK9XJY1Dg/3rRjrhFF7gIm5nJ30jfoP7bRHu+Z/FFcDsMEALPkUsFEe2w1
-# R3dVxlOcv8uqd+vkGXaK3NCLsMnQsRvUDhtY9BXOc5crvuc/Zx2BAJPacxomDThs
-# sUNWK7BB28oWKqQt0PufydZ+QgnyBnt4N3QQjqW/mXa0PEf5l4Aom9W8kjBONCiD
-# wMg3ZBBs8VnXtJVwAWbbdCmxUK8MUZJbPnB+w1/qBW+Ujpjy26H9ejdqHXHl/fWu
-# xj+5mgB+HU24PO4H19pXuC+kihIudGc8ivOuyglVq+TeQRfskt+j+6wm9V34NTBX
-# 4m9vcPqNCbmJhgQAtshMwuodZ8G0FXFDY7jAeRaEri1obzdiyoV3feD9tjucwowb
-# ThZyr8FuVsfOUT1REP/59v8DU3ffGDUO4SLhhaGCFM8wghTLBgorBgEEAYI3AwMB
-# MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDRWqShujGg
+# LDMwn/9Cf0GDmpFuJqR9cZTgUdUW0tAtKjANBgkqhkiG9w0BAQEFAASCAgCTpWgC
+# am033Co1/KwLz6+kSCgFW+dUUomNKVZ96glYLbrxpGBeDWsz1znp0SXpQVck7PpR
+# 2rTCyHVoXdz2ixxS2vVhiaugvldOj/ixDr+MGGSVp8X9iVapLIGZdME4BlWEaqIe
+# aIN9FifoGN3kGvdwejgPl4B4k5YYV4/fyWVYQ20eC4twX4KrZFC7VSodkA4J2G2g
+# bHpElnjQ5iavzncUsH/zmKcGAG2WvUpIeznzC1Z6OgbP1Vv9bfv3WhzxVGbasieA
+# L5hKyQzISUOX2Ob2CxoyOJu7CZ33nlLharxySHP3rs558EMrhq1hOgEvxLmOvP1n
+# Hdv3YyYF2dmEvFBv25+naGf29X5xLcc2CJX4nYzFPbJDdEVI847jjYVFFUEUvJTi
+# 3Vf/ZFAGRqIAWuHNOxXj7VOq0Utz3CWArUW+hGgsQFvCMTaj3YuZSSkBFc/5N1iG
+# kCmJGic/UbSFK/usiYKs/g8B682l2jwZEObGSfOFqEZcwKRqaP1fs3/Z5IWniRXv
+# A7WANQ7hVqs3JC+e0R/maMsm8af8UNQ7pMZ4E3RvJmV2OrO4e5VB4BTrlSxr0LpT
+# PAHQtAkSCtdVU2+guly0VzJoyL3qRRwsqnRp29HHzlI2FALKVHhXzjoE/BqCNUO2
+# IA/Ac3LDutYDenyrUa8xYuNcMMSyQqw2CeKdeqGCFM4wghTKBgorBgEEAYI3AwMB
+# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIFLQciQUMKryG8O4GsiJcaussOUfyz+4hF2SKgVMDpcRAggazZ2PuMkF
-# qxgPMjAyNjExMTQwODE4MTBaMAMCAQECEB8OiFs7TCi1inmp2q0BWLCgghGnMIIE
+# BAIBBQAEIMvWTldcwGxEQyWSzNv6IaOe5Le005WjQw2biGtcvhKIAghvbOhmz06R
+# QBgPMjAyNjExMTUyMDA2MTdaMAMCAQECECepw1udQO0zgtmfVpCU9CGgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -259,17 +312,17 @@ try {
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlcwggJTAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNDA4MTgxMFowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIMqw
-# Y9oD3C1VYs5bPX7HtDRMhuRlccqeO7uj/stkWaeKMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNTIwMDYxN1owKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIOL3
+# wpXN3iA7XcIdj1Q3WyANvWuWpCwKPc51i1ZfwyJDMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIESDBGAiEAwqWj+RZuC5nainGDOlim65QpLtVu2HLNgv2hpalBY5UCIQDB
-# +yFPwaFTF5q6Qw9qWokvPxjS74W8j1Ptt7c7UDxjcg==
+# zj0EAwIERzBFAiB4DBNzpbnVYdaQRUuWmPqIEDT1R4CKiGyXzXaCkCA6JgIhAKjC
+# pCJ+AhwoUkZYPfqorH+ERiJI2GNkUgX9BheoFFNj
 # SIG # End signature block

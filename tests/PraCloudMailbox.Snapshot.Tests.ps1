@@ -4,7 +4,7 @@
     Check, Convert and Recover make before they read the snapshot. No Exchange and no cloud: Collect runs in a child process against synthetic Exchange commands.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0
+    Version : 2.1.0
 #>
 #Requires -Version 7.5
 
@@ -52,6 +52,7 @@ function global:New-PSSession { param($ConfigurationName, $ConnectionUri, $Authe
 function global:Import-PSSession { param($Session, $CommandName, [switch]$DisableNameChecking, [switch]$AllowClobber) New-Module -Name PcmSyntheticExchange -ScriptBlock { } }
 function global:Remove-PSSession { param($Session) }
 function global:Get-ExchangeServer { @([pscustomobject]@{ Name = 'ex1'; AdminDisplayVersion = 'Version 15.2 (Build 1748.10)' }) }
+function global:Set-ADServerSettings { param($ViewEntireForest) }
 function global:Get-Mailbox {
     param($Identity, $OrganizationalUnit, $ResultSize, $RecipientTypeDetails, $DomainController)
     $make = { param($sam, $type) [pscustomobject]@{ Guid = [guid]::NewGuid(); Identity = $sam; Name = $sam; DisplayName = $sam; Alias = $sam; SamAccountName = $sam
@@ -283,7 +284,7 @@ Describe 'Check, Convert and Recover check the snapshot file before they read it
         $read = $functions['Read-PcmSnapshotData']
         $read.IndexOf('Confirm-PcmSnapshotHash') | Should -BeGreaterThan 0
         $read.IndexOf('Confirm-PcmSnapshotHash') | Should -BeLessThan $read.IndexOf('Open-PcmStore')
-        $others = @($functions.Keys | Where-Object { $_ -notin @('Read-PcmSnapshotData', 'Invoke-PcmCollect') -and $functions[$_] -match 'Open-PcmStore[^\r\n]*Store\.Path' })
+        $others = @($functions.Keys | Where-Object { $_ -notin @('Read-PcmSnapshotData', 'Invoke-PcmCollect', 'Get-PcmCollectSizeProblem') -and $functions[$_] -match 'Open-PcmStore[^\r\n]*Store\.Path' })
         $others | Should -BeNullOrEmpty
     }
     It 'stops when the hash file was altered instead of the snapshot' {
@@ -320,6 +321,14 @@ Describe 'Check, Convert and Recover check the snapshot file before they read it
         $log | Should -Match 'Snapshot 1 of'
         $run.Text | Should -Match 'Integrity +skipped on request \(-AcceptUnverifiedSnapshot\)'
         $run.Text | Should -Match '-AcceptUnverifiedSnapshot'
+    }
+    It 'says in the banner that a changed snapshot file does not stop the run, and not that the .sha256 is missing' {
+        $copy = Copy-Seed 'banner-changed'
+        Edit-SnapshotRow -SnapshotFile $copy.Db
+        $run = Invoke-Entry -Folder $copy.Folder -Arguments @('-Action', 'Check', '-ConfigPath', $copy.Config, '-AcceptUnverifiedSnapshot')
+        $banner = ($run.Text -replace '\s+', ' ')
+        $banner | Should -Match 'Integrity Skipped on request \(-AcceptUnverifiedSnapshot\): a snapshot file changed after its Collect does not stop this run'
+        $banner | Should -Not -Match 'has no \.sha256 file'
     }
     It 'ignores -AcceptUnverifiedSnapshot for Collect and keeps it out of the Collect command line' {
         $copy = Copy-Seed 'collect-switch'

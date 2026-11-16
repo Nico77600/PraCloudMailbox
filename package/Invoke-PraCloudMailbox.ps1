@@ -120,8 +120,9 @@
     Check, Convert and Recover. Snapshot check: every Collect writes a .sha256 file beside the snapshot file (and beside its backup copy), and these actions compare the snapshot
     file with it before they read it. When the file was changed after its last Collect, the run stops, with nothing changed: restore the file from your external backup. Give this
     switch only when you know why the file changed and accept it as it is: the run then goes on, says so in the banner, the log, the summary and the report, and the next steps
-    keep the switch. A snapshot without a .sha256 file (an old snapshot, or a copy made without it) is not stopped: the run warns that the tool cannot prove the file is the one
-    Collect wrote. The journal is written by Convert and Recover themselves and is not covered.
+    keep the switch. A snapshot without a .sha256 file (an old snapshot, or a copy made without it) stops a Convert or a Recover in Apply mode in the same way, because the tool
+    cannot prove the file is the one Collect wrote; a Preview and a Check only warn. A batch also keeps the run and the content of the snapshot it was made from: a snapshot that
+    is not that one stops the run too, and this switch accepts it. The journal is written by Convert and Recover themselves and is not covered.
 
 .PARAMETER Credential
     Schedule: the domain user account that runs the daily Collect, with its password (Get-Credential). Without it, a Preview does not test the account and an Apply asks for it,
@@ -200,7 +201,7 @@
 
 .NOTES
     Author     : Nicolas Fabert
-    Version    : 2.0.0
+    Version    : 2.1.0
     Requires   : PowerShell 7.5 or later for every action and for the window.
                  Collect: a domain-joined computer that reaches Exchange.Server with Kerberos.
                  Schedule: the same computer, in an elevated window.
@@ -409,13 +410,13 @@ function ConvertTo-PcmIdentityKey {
 
 function Read-PcmIdentityFile {
     <#
-    -CsvPath: one identity per line (# starts a comment, a blank line is ignored), or a CSV file with an Identity column (any letter case,
-    delimiter , or ;). The whole list is refused, with the line numbers, when an object is listed twice (letter case ignored) or when a line has no
+    -CsvPath: one identity per line (# starts a comment, a blank line is ignored), or a CSV file with an Identity column (any letter case, anywhere among the columns,
+    delimiter , or ;). A file saved by Excel or Notepad as "ANSI" is read with the ANSI code page of the computer, so that its accents are kept. The whole list is refused, with the line numbers, when an object is listed twice (letter case ignored) or when a line has no
     valid identity: the run must not start on a list that is not what the operator meant.
     #>
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "-CsvPath: file not found: $Path" }
-    $lines = @(Get-Content -LiteralPath $Path -Encoding UTF8)
+    $lines = @([string](Read-PcmCsvText -Path $Path) -split '\r?\n')
     $entries = [System.Collections.Generic.List[object]]::new()
     $problems = [System.Collections.Generic.List[string]]::new()
     $header = ''; $delimiter = ','
@@ -423,8 +424,8 @@ function Read-PcmIdentityFile {
         $text = ([string]$lines[$index]).Trim()
         if (-not $text -or $text.StartsWith('#')) { continue }
         $number = $index + 1
-        if (-not $header -and -not $entries.Count -and $text -match '^"?Identity"?\s*([,;]|$)') {
-            $header = $text; $delimiter = if ($text.Contains(';')) { ';' } else { ',' }
+        if (-not $header -and -not $entries.Count -and (Get-PcmCsvDelimiter $text)) {
+            $header = $text; $delimiter = Get-PcmCsvDelimiter $text
             continue
         }
         $value = $text
@@ -881,6 +882,51 @@ function Set-PcmRowStopped {
 # =================================================================================================
 # Collect - Exchange on-premises, before the disaster (remote session to Exchange.Server).
 # =================================================================================================
+function Get-PcmCollectSizeProblem {
+    <#
+    Before a snapshot is written: is its size acceptable? A snapshot without any mailbox is refused, and so is one that holds more than Collect.MaxDropPercent percent fewer
+    mailboxes than the last complete snapshot of the same scope (a full one, not a one-object snapshot): it would become the last complete snapshot and push the good ones out of
+    Store.KeepSnapshots. Collect.MaxDropPercent = 100 accepts any size. Returns the plain message for the operator, or '' when the size is acceptable.
+    #>
+    param([Parameter(Mandatory)][int]$Count, [Parameter(Mandatory)][string]$ScopeJson)
+    $config = $context.Config
+    $limit = [int](Get-PcmValue $config.Collect 'MaxDropPercent' 50)
+    if ($limit -ge 100) { return '' }
+    $previous = $null
+    if ([IO.File]::Exists($config.Store.Path)) {
+        $connection = $null
+        try {
+            $connection = Open-PcmStore -Path $config.Store.Path -Root $context.Root -ReadOnly
+            $now = $ScopeJson | ConvertFrom-Json
+            $oneObject = [bool][string](Get-PcmValue $now 'Identity' '')
+            foreach ($row in @(if (-not $oneObject) { Invoke-PcmSql $connection "SELECT id, scope_json, counts_json FROM snapshot WHERE status = 'Complete' ORDER BY id DESC LIMIT 50" -As Rows })) {
+                $then = $null; try { $then = [string]$row.scope_json | ConvertFrom-Json } catch { $then = $null }
+                if (-not $then -or [string](Get-PcmValue $then 'Identity' '')) { continue }
+                $same = $true
+                foreach ($name in @('Mode', 'SearchBase', 'GroupDN', 'CsvPath', 'Filter', 'IncludeUsers', 'IncludeShared', 'IncludeRoom', 'IncludeEquipment')) {
+                    if (-not (Test-PcmSameText ([string](Get-PcmValue $then $name '')) ([string](Get-PcmValue $now $name '')))) { $same = $false; break }
+                }
+                if (-not $same) { continue }
+                $mailboxes = [int](Get-PcmValue ([string]$row.counts_json | ConvertFrom-Json) 'mailbox' 0)
+                $previous = [pscustomobject]@{ Id = [long]$row.id; Count = $mailboxes }
+                break
+            }
+        } catch { $previous = $null }
+        finally { Close-PcmStore $connection }
+    }
+    $last = if ($previous) { "The last complete snapshot is snapshot $($previous.Id), with $($previous.Count) mailbox(es), and it stays the last complete one. " } else { '' }
+    if ($Count -eq 0) {
+        return ("Collect found no mailbox in the scope ({0}), so it wrote nothing: an empty snapshot would become the last complete snapshot and Check, Convert and Recover would have nothing to work from. {1}Check Exchange.Server, the scope in the configuration file (Scope.Mode and its SearchBase, GroupDN or CsvPath, and Scope.Include*) and that the account can read the mailboxes, then run Collect again. If the scope really holds no mailbox, set Collect.MaxDropPercent to 100 for this run." -f (Get-PcmScopeText $config), $last)
+    }
+    if ($previous -and $previous.Count -gt 0) {
+        $drop = ($previous.Count - $Count) * 100.0 / $previous.Count
+        if ($drop -gt $limit) {
+            return ("Collect found {0} mailbox(es), {1:0}% fewer than the last complete snapshot of the same scope (snapshot {2}, {3} mailbox(es)): more than Collect.MaxDropPercent ({4}%), so it wrote nothing and that snapshot stays the last complete one. If mailboxes were really moved or the scope was narrowed on purpose, set Collect.MaxDropPercent to a higher value in the configuration file (100 accepts any size) and run Collect again; otherwise find out why Exchange returned fewer mailboxes." -f $Count, $drop, $previous.Id, $previous.Count, $limit)
+        }
+    }
+    return ''
+}
+
 function Invoke-PcmCollect {
     $config = $context.Config
     $collect = $config.Collect
@@ -996,12 +1042,18 @@ function Invoke-PcmCollect {
 
     $counts = @{ mailbox = $records.Count; permission = $permissions.Count; group_member = $members.Count; contact = $contacts.Count
         distribution_group = @($groupResult.Groups).Count; dl_member = @($groupResult.Members).Count; target_group = @($targetGroups.Groups).Count; target_member = @($targetGroups.Members).Count; excluded = $context.Excluded.Count }
+    $scopeJson = @{ Mode = $config.Scope.Mode; SearchBase = $config.Scope.SearchBase; GroupDN = $config.Scope.GroupDN; CsvPath = $config.Scope.CsvPath
+        Identity = $Identity; Filter = $Scope; IncludeUsers = $config.Scope.IncludeUsers; IncludeShared = $config.Scope.IncludeShared
+        IncludeRoom = $config.Scope.IncludeRoom; IncludeEquipment = $config.Scope.IncludeEquipment } | ConvertTo-Json -Compress
+    $sizeProblem = Get-PcmCollectSizeProblem -Count $records.Count -ScopeJson $scopeJson
     if ($context.Mode -ne 'Apply') {
+        if ($sizeProblem) { Write-PcmLog -Context $context -Message ('In Apply mode this Collect would be refused: {0}' -f $sizeProblem) -Level Warning }
         Skip-PcmStep -Title 'Saving the snapshot' -Reason 'Preview: not written (add -Mode Apply).' -Icon Backup
         $context.NextSteps = @((Get-PcmCommandLine -ActionName 'Collect' -ModeName 'Apply' -KeepFilters))
         return
     }
     Write-PcmStep -Context $context -Title 'Saving the snapshot' -Icon Backup
+    if ($sizeProblem) { $context.NoChangeMade = $true; $context.CurrentOperation = 'Check-SnapshotSize'; throw $sizeProblem }
     if ($Identity) {
         # A one-object snapshot becomes the last complete snapshot: Check and Convert would only see this object.
         if (-not $Force -and -not ($script:ConfirmBound -and (Test-PcmSameText $ConfirmPreference 'None'))) {
@@ -1016,13 +1068,13 @@ function Invoke-PcmCollect {
         Write-PcmLog -Context $context -Message 'Snapshot of ONE object (-Identity): Check and Convert use the last complete snapshot, so a full Collect must follow.' -Level Warning
     }
     $context.CurrentOperation = 'Write-Snapshot'
-    Remove-PcmHashFile -Path $config.Store.Path
+    # The hash file of the snapshot that is there now stays until the new one is written; when this Collect fails after it touched the database, the hash file is written again for
+    # the database as it is (the last complete snapshot is intact) provided that it matched the file before.
+    $hashedBefore = [IO.File]::Exists($config.Store.Path) -and (Test-PcmSameText (Test-PcmSnapshotHash -Path $config.Store.Path).State 'Verified')
     $connection = Open-PcmStore -Path $config.Store.Path -Root $context.Root
     $backup = ''
+    $finished = $false
     try {
-        $scopeJson = @{ Mode = $config.Scope.Mode; SearchBase = $config.Scope.SearchBase; GroupDN = $config.Scope.GroupDN; CsvPath = $config.Scope.CsvPath
-            Identity = $Identity; Filter = $Scope; IncludeUsers = $config.Scope.IncludeUsers; IncludeShared = $config.Scope.IncludeShared
-            IncludeRoom = $config.Scope.IncludeRoom; IncludeEquipment = $config.Scope.IncludeEquipment } | ConvertTo-Json -Compress
         $id = New-PcmSnapshot $connection @{ RunId = $context.RunId; Environment = $config.Environment; Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
             ToolVersion = $toolVersion; ExchangeServer = $context.Server; ScopeJson = $scopeJson }
         try {
@@ -1043,12 +1095,27 @@ function Invoke-PcmCollect {
         }
         $context.SnapshotLabel = '{0} {1} {2}' -f $id, $dot, (Get-Date -Format 'yyyy-MM-dd HH:mm')
         Write-PcmItem -Context $context -Status Ok -Icon Batch -Text ('Snapshot {0} written to {1}' -f $id, $config.Store.Path)
-        $pruned = Remove-PcmOldSnapshot $connection $config.Store.KeepSnapshots
+        $inUse = Get-PcmSnapshotInUse -JournalPath $config.Store.JournalPath -Root $context.Root
+        $pruned = 0
+        if ($inUse.Readable) {
+            $kept = @()
+            $pruned = Remove-PcmOldSnapshot $connection $config.Store.KeepSnapshots -Protect $inUse.Items -Kept ([ref]$kept)
+            if (@($kept).Count) { Write-PcmItem -Context $context -Status Info -Text ('{0} old snapshot(s) kept although older than Store.KeepSnapshots = {1}: a Convert batch that is not rolled back yet needs them (snapshot {2})' -f @($kept).Count, $config.Store.KeepSnapshots, (@($kept) -join ', ')) }
+        } else {
+            Write-PcmLog -Context $context -Message ('The journal {0} could not be read ({1}): no old snapshot is deleted in this run, because a batch may still need it.' -f $config.Store.JournalPath, $inUse.Message) -Level Warning
+        }
         if ($pruned) { Write-PcmItem -Context $context -Status Info -Text ('{0} old snapshot(s) deleted (Store.KeepSnapshots = {1})' -f $pruned, $config.Store.KeepSnapshots) }
         $backup = Backup-PcmStore $connection $config.Store.BackupFolder ('PraCloudMailbox_{0}_snapshot{1}_{2}.db' -f $config.Environment, $id, (Get-Date -Format 'yyyyMMdd-HHmmss'))
         [void]$context.BackupFiles.Add($backup)
         Write-PcmItem -Context $context -Status Ok -Icon Backup -Text "Copy of the database: $backup"
-    } finally { Close-PcmStore $connection }
+        $finished = $true
+    } finally {
+        Close-PcmStore $connection
+        if (-not $finished -and $hashedBefore) {
+            try { $null = Write-PcmHashFile -Path $config.Store.Path }
+            catch { try { Remove-PcmHashFile -Path $config.Store.Path } catch { $null = $_ } }
+        }
+    }
     $context.CurrentOperation = 'Write-SnapshotHash'
     foreach ($hashed in @($backup, $config.Store.Path) | Where-Object { $_ }) {
         try {
@@ -1192,7 +1259,7 @@ function Invoke-PcmSchedule {
 function Confirm-PcmSnapshotHash {
     <#
     Before the snapshot file is read: compares it with the .sha256 that Collect wrote beside it. A file changed after its Collect stops the run with nothing changed (unless
-    -AcceptUnverifiedSnapshot); a file without a .sha256 only warns. The journal is not covered: Convert and Recover write it themselves.
+    -AcceptUnverifiedSnapshot); a file without a .sha256 stops a Convert or a Recover in Apply mode in the same way, and only warns in a Preview, a Check or a Collect. The journal is not covered: Convert and Recover write it themselves.
     #>
     $config = $context.Config
     $path = $config.Store.Path
@@ -1206,6 +1273,10 @@ function Confirm-PcmSnapshotHash {
         }
         'NotVerifiable' {
             if (-not $accept) { $context.SnapshotCheck = 'not verifiable: no .sha256 beside the file' }
+            if (-not $accept -and (Test-PcmSameText $context.Mode 'Apply') -and ((Test-PcmSameText $context.Action 'Convert') -or (Test-PcmSameText $context.Action 'Recover'))) {
+                $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+                throw ($state.Message + ' Nothing was changed. If you know that this file is the one Collect wrote, run the same command again with -AcceptUnverifiedSnapshot.')
+            }
             Write-PcmLog -Context $context -Message $state.Message -Level Warning
         }
         default {
@@ -1226,16 +1297,24 @@ function Read-PcmSnapshotData {
     (or keeps -ObjectGuid only), prints the step. -Known gives the reason why an object of the batch is not left to do; -SkipConverted (a new Convert) leaves out the
     objects that an earlier batch converted.
     #>
-    param([long]$Id = 0, [string]$Verb = 'check', [switch]$All, [AllowEmptyCollection()][string[]]$ObjectGuid, [switch]$NoCount, [string]$Where = '', [hashtable]$Known = @{}, [switch]$SkipConverted)
+    param([long]$Id = 0, [string]$Verb = 'check', [switch]$All, [AllowEmptyCollection()][string[]]$ObjectGuid, [switch]$NoCount, [string]$Where = '', [hashtable]$Known = @{}, [switch]$SkipConverted, [AllowNull()][object]$Batch = $null)
     $config = $context.Config
     $dot = [char]0x00B7
     Write-PcmStep -Context $context -Title 'Collect snapshot' -Icon Batch
     $context.CurrentOperation = 'Read-Snapshot'
     Confirm-PcmSnapshotHash
+    $batchRun = [string](Get-PcmValue $Batch 'snapshot_run_id' '')
+    $batchHash = [string](Get-PcmValue $Batch 'snapshot_hash' '')
     $connection = Open-PcmStore -Path $config.Store.Path -Root $context.Root -ReadOnly
     try {
-        $snap = Get-PcmSnapshot $connection $Id
-        if (-not $snap) { throw $(if ($Id) { "Snapshot $Id not found in $($config.Store.Path)." } else { "No complete snapshot in $($config.Store.Path): run Collect -Mode Apply (it reads Exchange.Server) or copy the snapshot database here." }) }
+        $snap = if ($batchRun) { Get-PcmSnapshot $connection -RunId $batchRun } else { Get-PcmSnapshot $connection $Id }
+        if (-not $snap) {
+            $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+            $copies = "Every Collect also writes a copy of the database in Store.BackupFolder ($($config.Store.BackupFolder)), named PraCloudMailbox_<Environment>_snapshot<number>_<date>.db and kept as it is: copy the file of the snapshot you need over $($config.Store.Path) (with its .sha256 file) and run the same command again."
+            throw $(if ($Batch) { "Batch $(Get-PcmValue $Batch 'id' '') was made from snapshot $Id$(if ($batchRun) { " (Collect run $batchRun)" }), which is not in $($config.Store.Path): Collect keeps only the last Store.KeepSnapshots ($($config.Store.KeepSnapshots)) snapshots, or this database is another one. Nothing was changed. $copies" }
+                elseif ($Id) { "Snapshot $Id not found in $($config.Store.Path) (Collect keeps the last Store.KeepSnapshots = $($config.Store.KeepSnapshots) snapshots). $copies" }
+                else { "No complete snapshot in $($config.Store.Path): run Collect -Mode Apply (it reads Exchange.Server) or copy the snapshot database here." })
+        }
         if ($snap.status -ne 'Complete') { throw "Snapshot $($snap.id) is $($snap.status), not Complete." }
         $records = @(Read-PcmTable $connection mailbox $snap.id)
         $permissions = @(Read-PcmTable $connection permission $snap.id)
@@ -1249,6 +1328,17 @@ function Read-PcmSnapshotData {
         }
     } finally { Close-PcmStore $connection }
     $context.SnapshotId = [string]$snap.id
+    $context.SnapshotRunId = [string]$snap.run_id
+    $context.SnapshotHash = Get-PcmSnapshotDigest -Mailbox $records -Permission $permissions -Member $members
+    if ($Batch -and $batchHash -and -not (Test-PcmSameText $batchHash $context.SnapshotHash)) {
+        if (-not [bool](Get-PcmValue $context 'AcceptUnverifiedSnapshot' $false)) {
+            $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+            throw ("Snapshot {0} of {1} is not the snapshot that batch {2} was made from: the mailboxes, permissions or group members it holds are not the ones that Convert read (digest {3}, the journal says {4}). Nothing was changed. Restore the right database from Store.BackupFolder ({5}), or, if you know why it differs and accept it, run the same command again with -AcceptUnverifiedSnapshot." -f $snap.id, $config.Store.Path, (Get-PcmValue $Batch 'id' ''), $context.SnapshotHash, $batchHash, $config.Store.BackupFolder)
+        }
+        Write-PcmLog -Context $context -Message ('Snapshot {0} is not the snapshot that batch {1} was made from; the run goes on because of -AcceptUnverifiedSnapshot.' -f $snap.id, (Get-PcmValue $Batch 'id' '')) -Level Warning
+    } elseif ($Batch -and -not $batchHash) {
+        Write-PcmLog -Context $context -Message ('Batch {0} was made before batches kept the content of their snapshot: the tool cannot prove that snapshot {1} is the one it was made from.' -f (Get-PcmValue $Batch 'id' ''), $snap.id) -Level Warning
+    }
     $taken = [datetime]::Parse([string]$snap.finished_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
     $age = (Get-Date).ToUniversalTime() - $taken.ToUniversalTime()
     $context.SnapshotLabel = '{0} {1} {2:yyyy-MM-dd HH:mm} UTC {1} {3}' -f $snap.id, $dot, $taken.ToUniversalTime(), $snap.exchange_server
@@ -1262,9 +1352,14 @@ function Read-PcmSnapshotData {
     # -ObjectGuid keeps the objects of a batch still to resume; the source of the run, -Scope and -MaxObjects then narrow them like they narrow a snapshot.
     $allRecords = @($records)
     $inBatch = $PSBoundParameters.ContainsKey('ObjectGuid')
-    if ($inBatch) { $records = @($records | Where-Object { [string]$_.object_guid -in @($ObjectGuid) }) }
+    $knownRecords = @()
+    if ($inBatch) {
+        $wanted = [System.Collections.Generic.HashSet[string]]::new([string[]]@($ObjectGuid), [StringComparer]::OrdinalIgnoreCase)
+        $knownRecords = @($records | Where-Object { -not $wanted.Contains([string]$_.object_guid) -and $Known.ContainsKey([string]$_.object_guid) })
+        $records = @($records | Where-Object { $wanted.Contains([string]$_.object_guid) })
+    }
     if (-not $All) {
-        $records = @(Select-PcmTarget -Items $records -Where $(if ($Where) { $Where } else { "snapshot $($snap.id)" }) -AllRecords $allRecords -Known $Known -InBatch:$inBatch -SkipConverted:$SkipConverted `
+        $records = @(Select-PcmTarget -Items $records -Where $(if ($Where) { $Where } else { "snapshot $($snap.id)" }) -AllRecords $allRecords -Known $Known -KnownItems $knownRecords -InBatch:$inBatch -SkipConverted:$SkipConverted `
                 -RecordOf { param($r) $r } -Keys { param($r) @([string]$r.user_principal_name, [string]$r.primary_smtp_address, [string]$r.sam_account_name, [string]$r.object_guid, [string]$r.distinguished_name) })
         $records = @(Limit-PcmTarget -Items $records -SkipConverted:$SkipConverted)
         Write-PcmTargetHeader -Count $records.Count
@@ -1414,13 +1509,15 @@ function Invoke-PcmCheckBatch {
     $actionOf = @{}; foreach ($batchRow in @($history.Batches)) { $actionOf[[string]$batchRow.id] = [string]$batchRow.action }
     $recoverByGuid = @{}
     foreach ($row in @($history.Items | Where-Object { $actionOf[[string]$_.batch_id] -eq 'Recover' })) { $recoverByGuid[[string]$row.object_guid] = $row }
-    $items = @($history.Items | Where-Object { [string]$_.batch_id -eq [string]$convert.id -and $_.status -ne 'Skipped' -and $_.step -and ($_.entra_id -or (Get-PcmResourceIntent -Item $_)) })
+    # Every object of the batch is followed, also the ones that Convert never started or that failed at their first step.
+    $items = @($history.Items | Where-Object { [string]$_.batch_id -eq [string]$convert.id -and $_.status -ne 'Skipped' })
+    $hasRecover = @($history.Batches | Where-Object { Test-PcmSameText ([string]$_.action) 'Recover' }).Count -gt 0
     if ($isRecover) {
         $wanted = @(@($history.Items | Where-Object { [string]$_.batch_id -eq [string]$given.id }) | ForEach-Object { [string]$_.object_guid })
         $items = @($items | Where-Object { [string]$_.object_guid -in $wanted })
     }
     Write-PcmItem -Context $context -Status Info -Icon Batch -Text ('{0} batch {1} of {2}: {3} object(s) in the journal, state expected: {4}{5}' -f $given.action, $given.id, (Format-PcmUtcText $given.created_utc), $items.Count, $expect, $(if ($Once) { ' (one look)' } else { '' }))
-    $data = Read-PcmSnapshotData -Id ([long]$convert.snapshot_id) -All -NoCount
+    $data = Read-PcmSnapshotData -Id ([long]$convert.snapshot_id) -All -NoCount -Batch $convert
     $byGuid = @{}; foreach ($record in $data.Records) { $byGuid[[string]$record.object_guid] = $record }
     $items = @(Select-PcmTarget -Items $items -Where "the objects of batch $($convert.id)" -AllRecords @($data.Records) -InBatch -RecordOf { param($t) $byGuid[[string]$t.object_guid] } -Keys {
             param($t) $r = $byGuid[[string]$t.object_guid]
@@ -1463,6 +1560,15 @@ function Invoke-PcmCheckBatch {
             $intent = Get-PcmResourceIntent -Item $item
             $facts = @{}
             $state = $null
+            if (-not [string](Get-PcmValue $item 'step' '') -and -not $intent) {
+                $seen = if ($record) { $states[$guid] } else { $null }
+                $stage = if ($seen -and $seen -isnot [System.Management.Automation.ErrorRecord]) { [string](Get-PcmValue $seen 'RecipientType' '') } else { '' }
+                $why = [string](Get-PcmValue $item 'message' '')
+                $text = if ($expect -eq 'Provisioned') { 'not converted: Convert never started this object, nothing was changed on it' }
+                    else { 'not rolled back: Convert never started this object, so Recover has nothing to roll back for it' }
+                $results[$guid] = [pscustomobject]@{ Met = $false; Stage = $stage; Detail = ($text + $(if ($why) { " (journal: $why)" } else { '' })) }
+                continue
+            }
             if ($intent) {
                 $facts.Native = $true
                 $facts.NativeMode = Get-PcmResourceProtectionMode $intent
@@ -1536,7 +1642,12 @@ function Invoke-PcmCheckBatch {
     $context.CheckFinished = $true
     $context.NextOnFailure = $true
     $next = [System.Collections.Generic.List[string]]::new()
-    if ($met -eq $items.Count) {
+    $batchOpen = $expect -eq 'Provisioned' -and -not $isRecover -and $met -eq $items.Count -and -not (Test-PcmSameText ([string]$convert.status) 'Complete')
+    if ($batchOpen) {
+        Write-PcmLog -Context $context -Message ('The {0} object(s) followed are provisioned, but Convert batch {1} is {2}, not Complete: it still has work to resume (a room list, or an object that is not in the journal as done).' -f $items.Count, $convert.id, ([string]$convert.status).ToLowerInvariant()) -Level Error
+        $next.Add('Resume the batch first (nothing is converted twice), then look again:')
+        $next.Add((Get-PcmCommandLine -ActionName 'Convert' -ModeName 'Apply' -BatchId ([string]$convert.id)))
+    } elseif ($met -eq $items.Count) {
         switch ($expect) {
             'Provisioned' {
                 $next.Add(('Every object of batch {0} is provisioned. When AD, Exchange and Entra Connect are rebuilt, roll the batch back (Preview first, then -Mode Apply):' -f $convert.id))
@@ -1551,7 +1662,10 @@ function Invoke-PcmCheckBatch {
     } else {
         $next.Add(('{0} object(s) are not {1} yet (see the detail of each one above). Wait a few minutes, or fix what is named, then look again{2}:' -f ($items.Count - $met), $expect.ToLowerInvariant(), $(if ($Once) { ' (without -Once the command waits for you)' } else { '' })))
         $next.Add((Get-PcmCommandLine -ActionName 'Check' -BatchId ([string]$given.id) -ExpectName $expect -KeepFilters -NoOnce))
-        if ($expect -eq 'Provisioned') {
+        if ($expect -eq 'Provisioned' -and $hasRecover) {
+            $next.Add(('Recover already rolled back objects of Convert batch {0}, so this batch is not resumed. Convert again the objects that are not converted (Preview first, then -Mode Apply), choosing them with -Identity, -CsvPath or -Group:' -f $convert.id))
+            $next.Add((Get-PcmCommandLine -ActionName 'Convert'))
+        } elseif ($expect -eq 'Provisioned') {
             $next.Add('An object that Convert did not finish is resumed with the same batch (nothing is converted twice):')
             $next.Add((Get-PcmCommandLine -ActionName 'Convert' -BatchId ([string]$convert.id)))
         } elseif ($expect -eq 'Deprovisioned') {
@@ -1785,6 +1899,7 @@ function Set-PcmRowResult {
     <# Final status and detail of one report row, plus the console line. #>
     param([Parameter(Mandatory)][object]$Row, [Parameter(Mandatory)][ValidateSet('Success','Error','Pending','Skipped','Planned')][string]$Status, [string]$Detail = '', [string]$Field, [string]$Value)
     $Row.FinalStatus = $Status
+    $Detail = ConvertTo-PcmPlainMessage $Detail
     if ($Detail) { $Row.Detail = $Detail }
     if ($Field) { $Row[$Field] = $Value }
     $item = @{ Success = 'Ok'; Error = 'Fail'; Pending = 'Warn'; Skipped = 'Skip'; Planned = 'Info' }[$Status]
@@ -1801,7 +1916,7 @@ function Set-PcmRowResult {
 function Stop-PcmEntry {
     <# An object that fails in a phase: journal, report row, and it leaves the next phases. #>
     param([Parameter(Mandatory)][object]$Entry, [Parameter(Mandatory)][string]$Step, [Parameter(Mandatory)][string]$Message)
-    $text = $Message -replace '\s+', ' '
+    $text = (ConvertTo-PcmPlainMessage $Message) -replace '\s+', ' '
     Write-PcmJournal -ObjectGuid ([string]$Entry.Record.object_guid) -Step $Step -Outcome Fail -Detail $text -Item @{ status = 'Failed'; message = $text }
     Set-PcmRowResult -Row $Entry.Row -Status Error -Detail "Convert stopped: $text"
 }
@@ -1912,6 +2027,21 @@ function Invoke-PcmUserPlanSet {
     }
     $context.CurrentIdentity = ''
     return $done.ToArray()
+}
+
+function Select-PcmSharedWave {
+    <#
+    From the next shared mailboxes of a Convert, the ones that can start now: an object that needs no licence unit (already a shared mailbox, or already holding the temporary unit) can
+    always start, the others only while a unit is free. -NeedsUnit says by object ID whether an object needs a new unit. Returns Wave (to start) and Waiting (needs a unit, none is free).
+    #>
+    param([AllowEmptyCollection()][object[]]$Candidates = @(), [Parameter(Mandatory)][hashtable]$NeedsUnit, [int]$Free = 0)
+    $wave = [System.Collections.Generic.List[object]]::new()
+    $waiting = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in $Candidates) {
+        if (-not $NeedsUnit[[string]$entry.EntraId]) { $wave.Add($entry); continue }
+        if ($Free -ge 1) { $Free--; $wave.Add($entry) } else { $waiting.Add($entry) }
+    }
+    return [pscustomobject]@{ Wave = $wave.ToArray(); Waiting = $waiting.ToArray() }
 }
 
 function Invoke-PcmConvertSharedWave {
@@ -2260,16 +2390,24 @@ function Invoke-PcmConvertResourceWave {
 }
 
 function Find-PcmConvertedBatch {
-    <# The Convert batch that converted an object and that no Recover batch rolled back for it yet, or $null. #>
+    <#
+    The Convert batch that converted an object and that no Recover batch rolled back for it yet, or $null. The journal is read once per run (one query for every object, the latest
+    batch of each object kept) and the answers come from that index.
+    #>
     param([Parameter(Mandatory)][string]$ObjectGuid)
-    $rows = @(Invoke-PcmSql $context.Journal @"
-SELECT cb.id AS id, cb.created_utc AS created_utc FROM batch_item ci JOIN batch cb ON cb.id = ci.batch_id
-WHERE cb.action = 'Convert' AND ci.object_guid = @g COLLATE NOCASE AND ci.step IS NOT NULL AND ci.step <> '' AND ci.status <> 'Skipped'
+    if ($null -eq (Get-PcmValue $context 'ConvertedIndex' $null)) {
+        $index = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($row in @(Invoke-PcmSql $context.Journal @"
+SELECT ci.object_guid AS object_guid, cb.id AS id, cb.created_utc AS created_utc FROM batch_item ci JOIN batch cb ON cb.id = ci.batch_id
+WHERE cb.action = 'Convert' AND ci.step IS NOT NULL AND ci.step <> '' AND ci.status <> 'Skipped'
   AND NOT EXISTS (SELECT 1 FROM batch_item ri JOIN batch rb ON rb.id = ri.batch_id
                   WHERE rb.action = 'Recover' AND rb.convert_batch = cb.id COLLATE NOCASE AND ri.object_guid = ci.object_guid COLLATE NOCASE AND ri.status = 'Done')
-ORDER BY cb.created_utc DESC LIMIT 1
-"@ @{ g = $ObjectGuid } -As Rows)
-    if ($rows.Count) { return $rows[0] }
+ORDER BY cb.created_utc ASC
+"@ -As Rows)) { $index[[string]$row.object_guid] = $row }
+        $context.ConvertedIndex = $index
+    }
+    $found = $null
+    if ($context.ConvertedIndex.TryGetValue($ObjectGuid, [ref]$found)) { return $found }
     return $null
 }
 
@@ -2294,9 +2432,17 @@ function Invoke-PcmConvert {
     $resume = $null; $snapshotId = $Snapshot; $resumeItems = @{}
     $read = @{ Verb = 'convert' }
     if ($Batch) {
+        $context.CurrentOperation = 'Read-Batch'
         $resume = Get-PcmBatch $context.Journal -Id $Batch
         if (-not $resume -or $resume.action -ne 'Convert') { throw "Convert batch $Batch not found in $($config.Store.JournalPath)." }
+        $rollbacks = @(Invoke-PcmSql $context.Journal "SELECT id, status FROM batch WHERE action = 'Recover' AND convert_batch = @c COLLATE NOCASE ORDER BY created_utc" @{ c = [string]$resume.id } -As Rows)
+        if ($rollbacks.Count) {
+            $context.NoChangeMade = $true; $context.NextOnFailure = $true; $context.CurrentIdentity = ''
+            $context.NextSteps = @(('To convert the objects that Convert batch {0} did not finish, run a new Convert for them (Preview first, then -Mode Apply), choosing them with -Identity, -CsvPath or -Group:' -f $resume.id), (Get-PcmCommandLine -ActionName 'Convert'))
+            throw ('Convert batch {0} cannot be resumed: Recover batch {1} ({2}) already rolled back objects of it, and an object converted now could not be rolled back with it. Nothing was changed.' -f $resume.id, $rollbacks[-1].id, ([string]$rollbacks[-1].status).ToLowerInvariant())
+        }
         $snapshotId = [long]$resume.snapshot_id
+        $read.Batch = $resume
         $context.BatchId = [string]$resume.id
         foreach ($item in @(Get-PcmBatchItem $context.Journal $resume.id)) { $resumeItems[[string]$item.object_guid] = $item }
         $read.ObjectGuid = [string[]]@($resumeItems.Values | Where-Object { $_.status -notin @('Done','Skipped') } | ForEach-Object { [string]$_.object_guid })
@@ -2366,7 +2512,7 @@ function Invoke-PcmConvert {
         $row = New-PcmRow $record
         [void]$context.Rows.Add($row)
         $context.CurrentIdentity = $row.Identity
-        $blocking = @($assessment.Errors) + @($assessment.Findings | Where-Object { $_.Code -eq 'EXCHANGE_PLAN_PRESENT' })
+        $blocking = @($assessment.Errors) + @($assessment.Findings | Where-Object { $_.Code -eq 'EXCHANGE_PLAN_PRESENT' -and $_.Level -ne 'Error' })
         if ($resume) { $blocking = @($blocking | Where-Object { $_.Code -notin @('ALREADY_CLOUD_MAILBOX','EXCHANGE_PLAN_PRESENT') }) }
         $row.Warnings = (@($assessment.Warnings | ForEach-Object { $_.Message })) -join ' | '
         if ($blocking.Count) { Set-PcmRowResult -Row $row -Status Error -Detail ('Not converted: ' + (($blocking | ForEach-Object { $_.Message }) -join ' | ')); continue }
@@ -2406,7 +2552,7 @@ function Invoke-PcmConvert {
     if (-not $plan.Count) { throw 'No object can be converted (see the reasons above).' }
     Confirm-PcmApply ('Convert {0} object(s) to Exchange Online ({1} user(s), {2} shared, {3} native resources)?' -f $plan.Count, $planUsers.Count, $planShared.Count, $planResources.Count)
     if (-not $resume) {
-        $context.BatchId = New-PcmBatch $context.Journal Convert @{ SnapshotId = [long]$data.Snapshot.id; Environment = $config.Environment; Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $context.BatchId = New-PcmBatch $context.Journal Convert @{ SnapshotId = [long]$data.Snapshot.id; SnapshotRunId = [string]$data.Snapshot.run_id; SnapshotHash = [string]$context.SnapshotHash; Environment = $config.Environment; Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
             ToolVersion = $toolVersion; ScopeJson = (@{ Identity = $Identity; CsvPath = $CsvPath; SearchBase = $SearchBase; Group = $Group; MaxObjects = $MaxObjects; Identities = @(Get-PcmIdentityList).Count; Scope = $Scope; UsersMode = $config.Licensing.Users.Mode } | ConvertTo-Json -Compress) }
         foreach ($entry in $plan) {
             if ($entry -in $planResources) {
@@ -2472,38 +2618,52 @@ function Invoke-PcmConvert {
     # (resume), needs none. A stop is taken between two waves.
     $parallel = [Math]::Max(1, [int]$config.Licensing.Shared.Parallel)
     $keepFree = [Math]::Max(0, [int](Get-PcmValue $config.Licensing.Shared 'KeepFree' 0))
-    $next = 0
+    $queue = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in $planShared) { $queue.Add($entry) }
+    $wavesRun = 0; $unitWaited = $false
     $sharedClock = [Diagnostics.Stopwatch]::StartNew()
-    while ($next -lt $planShared.Count) {
-        if ($stopped -or (Test-PcmStop)) { $stopped = $true; for (; $next -lt $planShared.Count; $next++) { Set-PcmRowStopped $planShared[$next].Row }; break }
-        $context.CurrentOperation = 'Convert-Shared'
-        $candidates = @($planShared[$next..([Math]::Min($planShared.Count, $next + $parallel) - 1)])
-        $exo = Get-PcmExoStateSet -Id ([string[]]@($candidates | ForEach-Object { $_.EntraId })) -TagAttribute $config.Retention.TagAttribute
-        $free = 0; $freeNow = 0
+    $readUnits = {
+        $freeUnits = 0
         if ($sharedSku) {
             $now = @((Invoke-PcmGraph -Uri 'v1.0/subscribedSkus').value) | Where-Object { [string]$_.skuId -eq [string]$sharedSku.skuId } | Select-Object -First 1
-            if ($now) { $freeNow = Get-PcmFreeUnit $now; $free = $freeNow - $keepFree }
+            if ($now) { $freeUnits = Get-PcmFreeUnit $now }
         }
-        $wave = [System.Collections.Generic.List[object]]::new()
+        $freeUnits
+    }
+    while ($queue.Count) {
+        if ($stopped -or (Test-PcmStop)) { $stopped = $true; foreach ($entry in $queue) { Set-PcmRowStopped $entry.Row }; $queue.Clear(); break }
+        $context.CurrentOperation = 'Convert-Shared'
+        $candidates = @($queue.GetRange(0, [Math]::Min($parallel, $queue.Count)))
+        $exo = Get-PcmExoStateSet -Id ([string[]]@($candidates | ForEach-Object { $_.EntraId })) -TagAttribute $config.Retention.TagAttribute
+        $freeNow = & $readUnits
+        $needsUnit = @{}
         foreach ($entry in $candidates) {
             $isShared = $exo[$entry.EntraId] -and $exo[$entry.EntraId].Type -eq 'SharedMailbox'
             $holds = $sharedSku -and @(Get-PcmDirectLicence $entry.State.User | Where-Object { $_.skuId -eq [string]$sharedSku.skuId }).Count
-            if (-not $isShared -and -not $holds) { if ($free -lt 1) { break }; $free-- }
-            $wave.Add($entry)
+            $needsUnit[[string]$entry.EntraId] = -not $isShared -and -not $holds
         }
-        if (-not $wave.Count) {
-            for (; $next -lt $planShared.Count; $next++) {
-                $entry = $planShared[$next]
+        $pick = Select-PcmSharedWave -Candidates $candidates -NeedsUnit $needsUnit -Free ($freeNow - $keepFree)
+        if (-not $pick.Wave.Count) {
+            # The units that an earlier wave of this run gave back can take a moment to show in the tenant: wait for them once, with the polling settings, before giving up.
+            if ($wavesRun -gt 0 -and -not $unitWaited) {
+                $unitWaited = $true
+                $context.CurrentOperation = 'Wait-Unit'
+                $null = Wait-PcmCondition -Phase 'Waiting for a licence unit to be free' -TimeoutSeconds ([Math]::Min(300, (Get-PcmWaitSeconds 'MailboxTimeoutMinutes'))) -IntervalSeconds ([int]$config.Polling.IntervalSeconds) -Test { ((& $readUnits) - $keepFree) -ge 1 }
+                continue
+            }
+            foreach ($entry in $pick.Waiting) {
                 $message = if ($keepFree -gt 0) { "not started: $($sharedSku.skuPartNumber) has $freeNow free unit(s) and $keepFree must stay free (Licensing.Shared.KeepFree), so none can be used for the temporary licence; nothing was changed on this object. Free a unit or lower Licensing.Shared.KeepFree, then run Convert -Batch $($context.BatchId) again." }
                 else { "not started: no free unit of $($sharedSku.skuPartNumber) (a shared mailbox that failed keeps its temporary licence until it is finished); nothing was changed on this object. Free a unit, then run Convert -Batch $($context.BatchId) again." }
                 Write-PcmJournal -ObjectGuid ([string]$entry.Record.object_guid) -Step 'NoFreeUnit' -Outcome Fail -Detail $message -Item @{ status = 'Failed'; message = $message }
                 Set-PcmRowResult -Row $entry.Row -Status Error -Detail $message
+                [void]$queue.Remove($entry)
             }
-            break
+            continue
         }
-        Write-PcmProgress -Context $context -Phase 'Shared mailboxes' -Done $next -Total $planShared.Count -ElapsedSeconds $sharedClock.Elapsed.TotalSeconds
-        $next += $wave.Count
-        Invoke-PcmConvertSharedWave -Entries $wave.ToArray() -Tenant $tenant -PermissionIndex $permissionIndex -Originals $originals
+        Write-PcmProgress -Context $context -Phase 'Shared mailboxes' -Done ($planShared.Count - $queue.Count) -Total $planShared.Count -ElapsedSeconds $sharedClock.Elapsed.TotalSeconds
+        foreach ($entry in $pick.Wave) { [void]$queue.Remove($entry) }
+        $wavesRun++
+        Invoke-PcmConvertSharedWave -Entries $pick.Wave -Tenant $tenant -PermissionIndex $permissionIndex -Originals $originals
     }
     if (-not $planShared.Count) { Write-PcmItem -Context $context -Status Skip -Text 'No shared mailbox in this batch.' }
     if (-not $stopped -and -not (Test-PcmStop) -and $roomLists.Count) {
@@ -2660,7 +2820,15 @@ function Invoke-PcmRecoverUserWave {
     # 6. One wait for all: MailUser with the on-premises GUID.
     $late = @(Wait-PcmExoStateSet -Phase 'Waiting for the on-premises mailboxes of the users' -Entries $users.ToArray() -TimeoutSeconds (Get-PcmWaitSeconds 'MailboxTimeoutMinutes') -Test { param($state, $entry) $state.Type -eq 'MailUser' -and $state.ExchangeGuid -eq [string]$entry.Record.exchange_guid } -OnReady {
             Write-PcmJournal -ObjectGuid ([string]$args[0].Item.object_guid) -Step 'MailUser' -Detail "MailUser with the on-premises GUID after $($args[2]) s" -Item @{ step = 'MailUser' } })
-    foreach ($entry in $late) { Stop-PcmRecoverEntry -Entry $entry -Step 'RecoverUser' -Message ('not a MailUser with the on-premises ExchangeGuid {0} yet' -f $entry.Record.exchange_guid); [void]$users.Remove($entry) }
+    $nowAt = if ($late.Count) { Get-PcmExoStateSet -Id (& $ids $late) -TagAttribute $config.Retention.TagAttribute } else { @{} }
+    foreach ($entry in $late) {
+        $shows = $nowAt[$entry.EntraId]
+        $held = $shows -and (Test-PcmToolHold -Set $HoldSet -Holds @($shows.Holds))
+        $why = if ($shows -and $shows.Type) { " (Exchange Online shows $($shows.Type))" } else { '' }
+        $hold = if ($held) { '' } else { '; the cloud mailbox is not under the case hold yet (it is added once the user is back: run Recover -Batch again to finish)' }
+        Stop-PcmRecoverEntry -Entry $entry -Step 'RecoverUser' -Message ('not a MailUser with the on-premises ExchangeGuid {0} yet{1}{2}' -f $entry.Record.exchange_guid, $why, $hold)
+        [void]$users.Remove($entry)
+    }
     # 7. Case hold, by object ID (the policy keeps it right when the UPN and the SMTP address differ), one wait.
     $ready = @($users) + @($back)
     $hold = Add-PcmRecoverHold -Entries $ready -HoldSet $HoldSet
@@ -2677,6 +2845,37 @@ function Invoke-PcmRecoverUserWave {
         Write-PcmJournal -ObjectGuid ([string]$entry.Item.object_guid) -Step 'Hold' -Outcome Info -Detail 'case hold added, not stamped yet' -Item @{ step = 'HoldPending' }
         Set-PcmRowResult -Row $entry.Row -Status Pending -Detail "back on-premises; case hold not stamped yet: run Recover -Batch $Batch again to check it (the hold is never removed from an object that is back)"
     }
+}
+
+function Invoke-PcmRecoverObjectSync {
+    <#
+    The shared identities that a delta cycle did not recreate are synchronised one by one on the Entra Connect server (Invoke-PcmEntraConnectObject, by the distinguished name of
+    the snapshot). Each answer is a step of the journal, so that a resumed Recover does not repeat a synchronisation that was done. Returns the entries synchronised by this run.
+    #>
+    param([Parameter(Mandatory)][object[]]$Entries)
+    $todo = @($Entries | Where-Object { $_.TargetedSync -ne 'Done' })
+    if (-not $todo.Count) { return @() }
+    $context.CurrentOperation = 'EntraConnect-SyncObject'
+    $withDn = @($todo | Where-Object { [string]$_.Record.distinguished_name })
+    $answers = @()
+    if ($withDn.Count) {
+        try { $answers = @(Invoke-PcmEntraConnectObject -Context $context -ObjectDn ([string[]]@($withDn | ForEach-Object { [string]$_.Record.distinguished_name })) -Caller $caller) }
+        catch { $failure = $_.Exception.Message; $answers = @($withDn | ForEach-Object { [pscustomobject]@{ Dn = [string]$_.Record.distinguished_name; Ok = $false; Detail = $failure } }) }
+    }
+    $synced = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in $todo) {
+        $dn = [string]$entry.Record.distinguished_name
+        $answer = $answers | Where-Object { Test-PcmSameText ([string]$_.Dn) $dn } | Select-Object -First 1
+        $ok = [bool]($answer -and $answer.Ok)
+        $detail = if (-not $dn) { 'the snapshot holds no distinguished name for this object' } elseif ($answer) { [string]$answer.Detail } else { 'no answer from Entra Connect' }
+        $entry.TargetedSync = if ($ok) { 'Done' } else { 'Failed' }
+        $entry.TargetedSyncDetail = $detail
+        if (-not $ok -and $detail -match 'no endpoint listening' -and ((Test-PcmSameText $context.Config.EntraConnect.Mode 'Remoting') -or (Test-PcmSameText $context.Config.EntraConnect.Mode 'Script'))) { $context.FullSyncOnServerOnly = $true }
+        Write-PcmJournal -ObjectGuid ([string]$entry.Item.object_guid) -Step 'TargetedSync' -Outcome $(if ($ok) { 'Ok' } else { 'Fail' }) -Detail $detail -Item @{ step = 'TargetedSync'; result_json = (@{ cloudGuid = [string]$entry.CloudGuid; state = [string]$entry.TargetedSync } | ConvertTo-Json -Compress) }
+        Write-PcmItem -Context $context -Status $(if ($ok) { 'Ok' } else { 'Warn' }) -Icon Sync -Text ('{0}: Entra Connect, targeted synchronisation of the object: {1}' -f $entry.Row.Identity, $detail)
+        if ($ok) { $synced.Add($entry) }
+    }
+    return @($synced)
 }
 
 function Invoke-PcmRecoverSharedWave {
@@ -2698,7 +2897,13 @@ function Invoke-PcmRecoverSharedWave {
         foreach ($entry in $hold.Stamped) { Write-PcmJournal -ObjectGuid ([string]$entry.Item.object_guid) -Step 'Hold' -Detail "case hold stamped after $($hold.Seconds[$entry.EntraId]) s" -Item @{ step = 'Hold' } }
         $fresh = @($hold.Stamped)
     }
+    $deleted = [System.Collections.Generic.List[object]]::new()
     foreach ($entry in @($Entries | Where-Object { $_.Path -eq 'SharedDeleted' })) {
+        if (Get-PcmValue $entry 'AwaitInactive' $false) {
+            Write-PcmItem -Context $context -Status Info -Text ('{0}: identity deleted by an earlier run: waiting until the mailbox {1} is inactive' -f $entry.Row.Identity, $entry.CloudGuid)
+            $deleted.Add($entry)
+            continue
+        }
         Write-PcmItem -Context $context -Status Info -Text ('{0}: identity deleted by an earlier run (mailbox {1} inactive): recycle bin and recreated object checked' -f $entry.Row.Identity, $entry.CloudGuid)
         $toPurge.Add($entry)
     }
@@ -2715,12 +2920,18 @@ function Invoke-PcmRecoverSharedWave {
         if ($fresh.Count) {
             . $pause
             foreach ($entry in $fresh) { $entry.CloudGuid = $entry.Exo.ExchangeGuid }
+            # Written before the identities are deleted: a run that stops during or after the deletion still knows which cloud mailbox to wait for.
+            foreach ($entry in $fresh) { Write-PcmJournal -ObjectGuid ([string]$entry.Item.object_guid) -Step 'Deleting' -Outcome Info -Detail ('identity about to be deleted, cloud mailbox {0}' -f $entry.CloudGuid) -Item @{ step = 'Deleting'; result_json = (@{ cloudGuid = [string]$entry.CloudGuid } | ConvertTo-Json -Compress) } }
             $answers = Invoke-PcmGraphBatch -Requests @($fresh | ForEach-Object { @{ Method = 'DELETE'; Url = ('/users/{0}' -f $_.EntraId) } })
-            $deleted = [System.Collections.Generic.List[object]]::new()
             for ($i = 0; $i -lt $fresh.Count; $i++) {
-                if ($answers[$i].Ok -or $answers[$i].Status -eq 404) { $deleted.Add($fresh[$i]) }
+                if ($answers[$i].Ok -or $answers[$i].Status -eq 404) {
+                    Write-PcmJournal -ObjectGuid ([string]$fresh[$i].Item.object_guid) -Step 'Deleted' -Detail ('identity deleted, cloud mailbox {0}' -f $fresh[$i].CloudGuid) -Item @{ step = 'Deleted'; result_json = (@{ cloudGuid = [string]$fresh[$i].CloudGuid } | ConvertTo-Json -Compress) }
+                    $deleted.Add($fresh[$i])
+                }
                 else { Stop-PcmRecoverEntry -Entry $fresh[$i] -Step 'RecoverShared' -Message ('identity not deleted ({0}): {1}' -f $answers[$i].Status, $answers[$i].Error) }
             }
+        }
+        if ($deleted.Count) {
             # Each mailbox inactive (no filter on ExchangeGuid in Exchange Online: one call per mailbox and round).
             $clock = [Diagnostics.Stopwatch]::StartNew()
             $null = Wait-PcmCondition -Phase 'Waiting for the inactive mailboxes' -TimeoutSeconds 900 -IntervalSeconds 15 -Test {
@@ -2732,13 +2943,21 @@ function Invoke-PcmRecoverSharedWave {
                 }
                 -not $deleted.Count
             }
-            foreach ($entry in $deleted) { Stop-PcmRecoverEntry -Entry $entry -Step 'RecoverShared' -Message ("identity deleted but mailbox {0} not inactive after 15 min: check it before anything else (Entra ID recycle bin, 30 days)" -f $entry.CloudGuid) }
+            foreach ($entry in $deleted) { Stop-PcmRecoverEntry -Entry $entry -Step 'RecoverShared' -Message ("identity deleted but mailbox {0} not inactive after 15 min: check it before anything else (Entra ID recycle bin, 30 days), then run Recover -Batch again" -f $entry.CloudGuid) }
         }
         if ($toPurge.Count) {
             $binUrl = { param($entry) '/directory/deletedItems/{0}' -f $entry.EntraId }
             $answers = Invoke-PcmGraphBatch -Requests @($toPurge | ForEach-Object { @{ Method = 'GET'; Url = ((& $binUrl $_) + '?$select=id') } })
             $binned = [System.Collections.Generic.List[object]]::new()
-            for ($i = 0; $i -lt $toPurge.Count; $i++) { if ($answers[$i].Ok) { $binned.Add($toPurge[$i]) } }
+            $unread = [System.Collections.Generic.List[object]]::new()
+            for ($i = 0; $i -lt $toPurge.Count; $i++) {
+                if ($answers[$i].Ok) { $binned.Add($toPurge[$i]) }
+                elseif ($answers[$i].Status -ne 404) {
+                    Stop-PcmRecoverEntry -Entry $toPurge[$i] -Step 'RecoverShared' -Message ('the Entra ID recycle bin could not be read ({0}): {1}. The identity is not confirmed as deleted permanently and nothing more was changed on it: run Recover -Batch again' -f $answers[$i].Status, $answers[$i].Error)
+                    $unread.Add($toPurge[$i])
+                }
+            }
+            foreach ($entry in $unread) { [void]$toPurge.Remove($entry) }
             if ($binned.Count) {
                 . $pause
                 $answers = Invoke-PcmGraphBatch -Requests @($binned | ForEach-Object { @{ Method = 'DELETE'; Url = (& $binUrl $_) } })
@@ -2750,10 +2969,10 @@ function Invoke-PcmRecoverSharedWave {
                 }
                 $null = Wait-PcmCondition -TimeoutSeconds 300 -IntervalSeconds 10 -Test {
                     $answers = Invoke-PcmGraphBatch -Requests @($binned | ForEach-Object { @{ Method = 'GET'; Url = ((& $binUrl $_) + '?$select=id') } })
-                    for ($i = $binned.Count - 1; $i -ge 0; $i--) { if (-not $answers[$i].Ok) { $binned.RemoveAt($i) } }
+                    for ($i = $binned.Count - 1; $i -ge 0; $i--) { if (-not $answers[$i].Ok -and $answers[$i].Status -eq 404) { $binned.RemoveAt($i) } }
                     -not $binned.Count
                 }
-                foreach ($entry in $binned) { Stop-PcmRecoverEntry -Entry $entry -Step 'RecoverShared' -Message 'identity still in the Entra ID recycle bin: the next sync would restore it'; [void]$toPurge.Remove($entry) }
+                foreach ($entry in $binned) { Stop-PcmRecoverEntry -Entry $entry -Step 'RecoverShared' -Message 'identity not confirmed as deleted permanently: it is still in the Entra ID recycle bin, or the recycle bin could not be read (the next sync would restore it)'; [void]$toPurge.Remove($entry) }
             }
             foreach ($entry in $toPurge) {
                 Write-PcmJournal -ObjectGuid ([string]$entry.Item.object_guid) -Step 'Purged' -Detail 'identity deleted permanently' -Item @{ step = 'Purged' }
@@ -2773,7 +2992,7 @@ function Invoke-PcmRecoverSharedWave {
     Write-PcmItem -Context $context -Status Ok -Icon Sync -Text "Entra Connect delta cycle: $state"
     $waiting = [System.Collections.Generic.List[object]]::new()
     foreach ($entry in $toPurge) { $waiting.Add($entry) }
-    $null = Wait-PcmCondition -Phase 'Waiting for Entra Connect to recreate the identities' -TimeoutSeconds (Get-PcmWaitSeconds 'SyncTimeoutMinutes') -IntervalSeconds $interval -Test {
+    $recreated = {
         $answers = Invoke-PcmGraphBatch -Requests @($waiting | ForEach-Object {
                 @{ Method = 'GET'; Url = ('/users?$filter={0}&$select=id' -f [uri]::EscapeDataString(("onPremisesImmutableId eq '{0}'" -f ([string]$_.Record.immutable_id).Replace("'", "''")))) } })
         $found = @{}
@@ -2793,7 +3012,19 @@ function Invoke-PcmRecoverSharedWave {
         }
         -not $waiting.Count
     }
-    foreach ($entry in $waiting) { Set-PcmRowResult -Row $entry.Row -Status Pending -Detail "identity deleted permanently, mailbox inactive; not recreated by Entra Connect yet: run a delta sync, then Recover -Batch $Batch again" }
+    $null = Wait-PcmCondition -Phase 'Waiting for Entra Connect to recreate the identities' -TimeoutSeconds (Get-PcmWaitSeconds 'SyncTimeoutMinutes') -IntervalSeconds $interval -Test $recreated
+    if ($waiting.Count) {
+        # A delta cycle does not recreate an identity that Entra Connect still holds as exported: each object that is still missing is synchronised on its own, then the wait goes on.
+        $synced = @(Invoke-PcmRecoverObjectSync -Entries @($waiting))
+        if ($synced.Count) {
+            $null = Wait-PcmCondition -Phase 'Waiting for Entra Connect to recreate the identities' -TimeoutSeconds ([Math]::Min(600, (Get-PcmWaitSeconds 'SyncTimeoutMinutes'))) -IntervalSeconds $interval -Test $recreated
+        }
+    }
+    foreach ($entry in $waiting) {
+        $tried = if ($entry.TargetedSyncDetail) { " (targeted synchronisation of the object: $($entry.TargetedSyncDetail))" } else { '' }
+        Set-PcmRowResult -Row $entry.Row -Status Pending -Detail "identity deleted permanently, mailbox inactive; Entra Connect did not recreate it${tried}: run a full synchronisation on the Entra Connect server, then run Recover -Batch $Batch again"
+        $context.FullSyncNeeded = $true
+    }
 }
 
 function Get-PcmOwnedResourceContact {
@@ -2988,10 +3219,20 @@ function Invoke-PcmRecoverResourceWave {
     $context.CurrentIdentity = ''
 }
 
+function Get-PcmBatchUsersMode {
+    <# Licensing.Users.Mode that Convert recorded in a batch ('' when the batch did not record it). #>
+    param([AllowNull()][object]$Row)
+    $text = [string](Get-PcmValue $Row 'scope_json' '')
+    if (-not $text) { return '' }
+    try { $scope = $text | ConvertFrom-Json -ErrorAction Stop } catch { return '' }
+    return [string](Get-PcmValue $scope 'UsersMode' '')
+}
+
 function Invoke-PcmRecover {
     $config = $context.Config
     if (-not $Batch) { throw '-Batch is required: the ID of the Convert batch to roll back (printed at the end of Convert).' }
     $context.Journal = Open-PcmStore -Path $config.Store.JournalPath -Root $context.Root -Kind Journal
+    $context.CurrentOperation = 'Read-Batch'
     $convert = Get-PcmBatch $context.Journal -Id $Batch
     if ($convert -and $convert.action -eq 'Recover' -and $convert.convert_batch) {
         $given = $convert
@@ -3005,7 +3246,7 @@ function Invoke-PcmRecover {
     if ($resume) { $context.ResumeBatchId = [string]$resume.id }
     $finished = $existing | Where-Object { $_.status -eq 'Complete' } | Select-Object -First 1
     if (-not $resume -and $finished) { throw "Convert batch $($convert.id) was already rolled back by Recover batch $($finished.id) (complete): nothing to do. Check shows the current state of the objects." }
-    $data = Read-PcmSnapshotData -Id ([long]$convert.snapshot_id) -Verb 'roll back' -All -NoCount
+    $data = Read-PcmSnapshotData -Id ([long]$convert.snapshot_id) -Verb 'roll back' -All -NoCount -Batch $convert
     $byGuid = @{}; foreach ($record in $data.Records) { $byGuid[[string]$record.object_guid] = $record }
     $convertItems = @(Get-PcmBatchItem $context.Journal $convert.id | Where-Object { $_.status -ne 'Skipped' -and $_.step -and ($_.entra_id -or (Get-PcmResourceIntent -Item $_)) })
     $done = @{}; $previous = @{}
@@ -3020,6 +3261,13 @@ function Invoke-PcmRecover {
             @([string]$t.identity, [string]$t.object_guid) + $(if ($r) { @([string]$r.primary_smtp_address, [string]$r.user_principal_name, [string]$r.sam_account_name) } else { @() }) })
     $targets = @(Limit-PcmTarget -Items $targets)
     Write-PcmTargetHeader -Count $targets.Count
+    # The Exchange plan of the users is taken back the way Convert gave it: another Licensing.Users.Mode now would remove it from the wrong place, so the run stops before any change.
+    $batchMode = Get-PcmBatchUsersMode -Row $convert
+    if ($batchMode -and -not (Test-PcmSameText $batchMode ([string]$config.Licensing.Users.Mode)) -and @($targets | Where-Object { -not (Get-PcmResourceIntent -Item $_) -and (Test-PcmSameText ([string]$_.kind) 'User') }).Count) {
+        $context.NoChangeMade = $true; $context.NextOnFailure = $true; $context.CurrentIdentity = ''
+        $context.NextSteps = @(('Set Licensing.Users.Mode back to {0} in the configuration (with the same GroupId or SkuPartNumber as at Convert), then run the same command again:' -f $batchMode), (Get-PcmCommandLine -ActionName 'Recover' -ModeName $effectiveMode -BatchId ([string]$convert.id) -KeepFilters))
+        throw ('Convert batch {0} gave the Exchange plan of its users with Licensing.Users.Mode = {1}, and the configuration now says {2}: the rollback would take the plan away from the wrong place. Nothing was changed.' -f $convert.id, $batchMode, $config.Licensing.Users.Mode)
+    }
     $context.NativeResourceScope = @($targets | Where-Object { Get-PcmResourceIntent -Item $_ }).Count -gt 0
     $requiresHold = @($targets | Where-Object {
             $intent = Get-PcmResourceIntent -Item $_
@@ -3105,15 +3353,20 @@ function Invoke-PcmRecover {
             }
             continue
         }
-        $entry = [pscustomobject]@{ Item = $item; Record = $record; Row = $row; EntraId = [string]$item.entra_id; Exo = $null; Path = ''; CloudGuid = ''; Original = @(Get-PcmOriginalLicence $item) }
+        $entry = [pscustomobject]@{ Item = $item; Record = $record; Row = $row; EntraId = [string]$item.entra_id; Exo = $null; Path = ''; CloudGuid = ''; AwaitInactive = $false; Original = @(Get-PcmOriginalLicence $item); TargetedSync = ''; TargetedSyncDetail = '' }
         $exo = $exoStates[$entry.EntraId]
         if (-not $exo) { $exo = Get-PcmExoState -Identity $entry.EntraId -TagAttribute $config.Retention.TagAttribute }
         $entry.Exo = $exo
         $row.ExchangeOnline = $exo.Type; $row.Holds = ($exo.Holds -join ', ')
         $lastStep = if ($previous.ContainsKey($guid)) { [string](Get-PcmValue $previous[$guid] 'step' '') } else { '' }
-        if ($item.kind -ne 'User' -and $lastStep -in @('Inactive', 'Purged') -and -not $exo.Type) {
+        if ($item.kind -ne 'User' -and $lastStep -in @('Deleting', 'Deleted', 'Inactive', 'Purged', 'TargetedSync') -and -not $exo.Type) {
             $result = $null; try { $result = [string](Get-PcmValue $previous[$guid] 'result_json' '') | ConvertFrom-Json } catch { $result = $null }
-            $entry.Path = 'SharedDeleted'; $entry.CloudGuid = [string](Get-PcmValue $result 'inactiveGuid' ''); $row.ExchangeOnline = 'inactive'
+            $entry.Path = 'SharedDeleted'
+            $entry.CloudGuid = [string](Get-PcmValue $result 'inactiveGuid' '')
+            if (-not $entry.CloudGuid) { $entry.CloudGuid = [string](Get-PcmValue $result 'cloudGuid' '') }
+            $entry.AwaitInactive = $lastStep -in @('Deleting', 'Deleted')
+            if ($lastStep -eq 'TargetedSync' -and (Test-PcmSameText ([string](Get-PcmValue $result 'state' '')) 'Done')) { $entry.TargetedSync = 'Done'; $entry.TargetedSyncDetail = 'done by an earlier run' }
+            $row.ExchangeOnline = if ($entry.AwaitInactive) { 'identity deleted' } else { 'inactive' }
             [void]$plan.Add($entry); continue
         }
         if (-not $exo.Type) { Set-PcmRowResult -Row $row -Status Error -Detail ("no Exchange Online recipient for {0}: the identity was deleted or replaced outside this batch. Check it in Entra ID and Exchange Online; nothing was changed." -f $entry.EntraId); continue }
@@ -3150,7 +3403,7 @@ function Invoke-PcmRecover {
     Confirm-PcmApply (('Roll back {0} object(s) of Convert batch {1}?' -f $plan.Count, $convert.id) + $lossWarning)
     if ($resume) { $context.BatchId = [string]$resume.id }
     else {
-        $context.BatchId = New-PcmBatch $context.Journal Recover @{ ConvertBatch = $convert.id; SnapshotId = [long]$convert.snapshot_id; Environment = $config.Environment
+        $context.BatchId = New-PcmBatch $context.Journal Recover @{ ConvertBatch = $convert.id; SnapshotId = [long]$convert.snapshot_id; SnapshotRunId = [string]$context.SnapshotRunId; SnapshotHash = [string]$context.SnapshotHash; Environment = $config.Environment
             Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name; ToolVersion = $toolVersion; ScopeJson = (@{ Identity = $Identity; CsvPath = $CsvPath; SearchBase = $SearchBase; Group = $Group; MaxObjects = $MaxObjects; Identities = @(Get-PcmIdentityList).Count; Scope = $Scope } | ConvertTo-Json -Compress) }
     }
     foreach ($entry in $plan) {
@@ -3222,7 +3475,19 @@ WHERE cb.action = 'Convert' AND ci.kind = 'User' AND ci.step IS NOT NULL
     $complete = $counts.done -eq @($convertItems).Count
     Set-PcmBatch $context.Journal $context.BatchId $(if ($complete) { 'Complete' } else { 'Partial' }) $counts
     $context.NextOnFailure = $true
-    $context.NextSteps = @(if (-not $complete) { 'Some objects are not back yet. Fix what is named above, then resume them (nothing is rolled back twice):'; (Get-PcmCommandLine -ActionName 'Recover' -ModeName 'Apply' -BatchId ([string]$convert.id) -KeepFilters) })
+    $context.NextSteps = @(if (-not $complete) {
+            if (Get-PcmValue $context 'FullSyncNeeded' $false) {
+                $server = if ([string](Get-PcmValue $config.EntraConnect 'Server' '')) { [string]$config.EntraConnect.Server } else { 'the Entra Connect server' }
+                if (Get-PcmValue $context 'FullSyncOnServerOnly' $false) {
+                    "Entra Connect did not recreate every deleted identity: the synchronisation of each object cannot be reached from a remote session. This command works only in a session opened ON the Entra Connect server ($server) itself, not through remoting or a script run remotely. Run a full synchronisation there (it can take a long while), in PowerShell on that server:"
+                } else {
+                    "Entra Connect did not recreate every deleted identity, even after it synchronised each object on its own. Run a full synchronisation on $server (it can take a long while), in PowerShell on that server:"
+                }
+                'Start-ADSyncSyncCycle -PolicyType Initial'
+                'Then resume the rollback (nothing is rolled back twice):'
+            } else { 'Some objects are not back yet. Fix what is named above, then resume them (nothing is rolled back twice):' }
+            (Get-PcmCommandLine -ActionName 'Recover' -ModeName 'Apply' -BatchId ([string]$convert.id) -KeepFilters)
+        })
     $createdLists = @(Get-PcmTenantChange $context.Journal $convert.id | Where-Object kind -eq 'NativeRoomList' |
         ForEach-Object { [string]$_.original_json | ConvertFrom-Json -ErrorAction Stop } | Where-Object { $_.operation -eq 'Create' -and $_.creationAttempted })
     if ($createdLists.Count) {
@@ -3260,6 +3525,13 @@ function Write-PcmBatchRecord {
             Status = [string]$outcome.Status; ExitCode = [int]$outcome.ExitCode; Done = [int]$outcome.Counts.Success; Pending = [int]$outcome.Counts.Pending; Errors = [int]$outcome.Counts.Error
             Skipped = [int]$outcome.Counts.Skipped; LogFile = [string]$context.LogFile }
     }
+    if (-not $isFollowUp -and -not [bool](Get-PcmValue $context 'RunReachedEnd' $false)) {
+        $open = Get-PcmBatch $context.Journal -Id $batchId
+        if ($open -and (Test-PcmSameText ([string]$open.status) 'Running')) {
+            $items = @(Get-PcmBatchItem $context.Journal $batchId)
+            Set-PcmBatch $context.Journal $batchId 'Partial' @{ done = @($items | Where-Object status -eq 'Done').Count; failed = @($items | Where-Object status -eq 'Failed').Count; running = @($items | Where-Object status -in @('Running', 'Planned')).Count } -Note 'The run ended before it finished: resume the batch with the same command.'
+        }
+    }
     $convertId = [string](Get-PcmValue $context 'ConvertBatchId' '')
     if (-not $convertId) {
         $row = Get-PcmBatch $context.Journal -Id $batchId
@@ -3270,6 +3542,7 @@ function Write-PcmBatchRecord {
     if ($report.Html) {
         $context.GlobalReportPath = [string]$report.Html
         $lines = @(('Global report of batch {0} (every run and every object of the batch):' -f $convertId), [string]$report.Html)
+        if ($report.EventsCsv) { $lines += @(('Events of batch {0} (CSV, one line per event of every object):' -f $convertId), [string]$report.EventsCsv) }
         $context.NextSteps = @(@($context.NextSteps) + $lines)
         $context.FallbackNext = @(@($context.FallbackNext) + $lines)
     }
@@ -3279,6 +3552,7 @@ function Write-PcmBatchRecord {
 # Main
 # =================================================================================================
 try {
+    $context.RunReachedEnd = $false
     $context.CurrentOperation = 'Read-Configuration'
     $context.Config = Import-PcmConfiguration -Path $ConfigPath -Root $PSScriptRoot
     $config = $context.Config
@@ -3317,7 +3591,8 @@ try {
     $skipSnapshotCheck = $AcceptUnverifiedSnapshot -and -not (Test-PcmSameText $Action 'Collect')
     if ($skipSnapshotCheck) {
         $context.SnapshotCheck = 'skipped on request (-AcceptUnverifiedSnapshot)'
-        $banner['Integrity'] = @('Key', 'Skipped on request (-AcceptUnverifiedSnapshot): a snapshot file changed after its Collect does not stop this run')
+        $withoutHash = [IO.File]::Exists($config.Store.Path) -and -not [IO.File]::Exists($config.Store.Path + '.sha256')
+        $banner['Integrity'] = @('Key', $(if ($withoutHash) { 'Skipped on request (-AcceptUnverifiedSnapshot): this snapshot cannot be verified because it has no .sha256 file; this run goes on because -AcceptUnverifiedSnapshot was given' } else { 'Skipped on request (-AcceptUnverifiedSnapshot): a snapshot file changed after its Collect does not stop this run' }))
     }
     $banner['Config'] = @('Config', ('{0} {1} Environment {2}' -f (Split-Path $config._Path -Leaf), $dot, $config.Environment))
     if (@($context.ConfigOverrides).Count) { $banner['Settings'] = @('Key', ('{0} setting(s) differ from {1}: {2}{3}' -f @($context.ConfigOverrides).Count, (Split-Path $BaseConfigPath -Leaf), ((@($context.ConfigOverrides) | Select-Object -First 3) -join '; '), $(if (@($context.ConfigOverrides).Count -gt 3) { '; ...' } else { '' }))) }
@@ -3329,6 +3604,7 @@ try {
     Write-PcmPlan -Context $context -Titles (Get-PcmPlanTitle)
     if ($Action -notin @('Collect', 'Schedule')) { Test-PcmCloudModuleAvailable }
     switch ($Action) { 'Collect' { Invoke-PcmCollect } 'Schedule' { Invoke-PcmSchedule } 'Check' { if ($ResolveOnly) { Invoke-PcmResolveGroup } elseif ($Batch) { Invoke-PcmCheckBatch } else { Invoke-PcmCheck } } 'Convert' { Invoke-PcmConvert } 'Recover' { Invoke-PcmRecover } }
+    $context.RunReachedEnd = $true
 }
 catch {
     $failure = $_; $failureOperation = $context.CurrentOperation
@@ -3361,6 +3637,16 @@ finally {
         } catch { $null = $_ }
         $context.ExitCode = 1
     }
+    # A run that ends without reaching the end of the main block and without an error (Ctrl+C, a closed window, a stop of the host) is never a success.
+    $interrupted = $false
+    if (-not [bool](Get-PcmValue $context 'RunReachedEnd' $false) -and [int]$context.ExitCode -ne 1) {
+        $interrupted = $true
+        try {
+            $where = "Stopped at step '{0}' (operation {1}{2}): the run was interrupted before it finished (Ctrl+C, a closed window or a stop of the host)." -f $context.CurrentPhase, $context.CurrentOperation, $(if ($context.CurrentIdentity) { ', object ' + $context.CurrentIdentity } else { '' })
+            Write-PcmLog -Context $context -Message $where -Level Error
+        } catch { $null = $_ }
+        $context.ExitCode = 1
+    }
     if ($Action -eq 'Collect' -and (Get-Command Disconnect-PcmExchange -ErrorAction SilentlyContinue)) {
         try { Disconnect-PcmExchange -Context $context } catch { $context.Issues.Add([pscustomobject]@{ Message = "Exchange session: $($_.Exception.Message)"; Source = 'Exchange' }) }
     }
@@ -3376,7 +3662,7 @@ finally {
     if ($context.Journal) { try { Close-PcmStore $context.Journal } catch { $null = $_ } }
     $result = Complete-PcmRun -Context $context
     # A run whose pipeline was stopped by the time limit gives its exit code to the process only through the host.
-    if ($callTimeout) { try { $Host.SetShouldExit([int]$result.ExitCode) } catch { $null = $_ } }
+    if ($callTimeout -or $interrupted) { try { $Host.SetShouldExit([int]$result.ExitCode) } catch { $null = $_ } }
     if ($PassThru) { $result }
     exit $result.ExitCode
 }
@@ -3384,8 +3670,8 @@ finally {
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBtCeFdXjw38eaM
-# 0ONdn9j9ggpiNGJYhgMa5TvKWVcH7qCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCZdz/RZH/IxXkp
+# wWhRD8uPM1aE61BNUMuHT2C2Wv/CwqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -3462,23 +3748,23 @@ finally {
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCElWGSbdyx
-# 1eyGfa3wBb0iSXcNQgrAjQsPzKB4c/7TADANBgkqhkiG9w0BAQEFAASCAgBQPdm6
-# 1TN2SN/yRMXMQgUvIGBPl9chsYndMsqVU5ekf3rh8RTiqCYjjR6j9VoIgixhzBxL
-# mbqQcb9TgTGRDz9vkHIZdx1a8UnEDw+nVgCNqHdDX1yig9wKklTHsjDDa9Ipi6yx
-# rUzn15EOcHVpu3ZnM9mf72Z2oWjUPU6c49PXaNs7pLP0lrJ017fh0IJSljViABpU
-# gK4zpmnPNpkgK808fpF+nFiWv2Vshz4WDhmaEclGbHMDjvY4Y7YjrAQVf0Po7NNo
-# yqgvOTWwOPQTRlejOLaSzPQRMXdckFegnBUjPq7fUqMPNKisprhS2h11hPsEU8/z
-# x8KaKtwLpJwQGaA/MdSMvY0VwknGlj5ARwavbvjB0iNvxY++ixhQIpyAimfLDba3
-# ZpaXuY4UIlJY+qMqxFkWdHjBdcyVm9NR9Flq8f0EDyQiq84xwKESurn++UDbCpin
-# cgqPl5DhjWjygTHfRzGjzd/N8yuofUpmBrdL/K8TAmt3ksXvFj4TEpLCdPCclEdx
-# yot9j6IwdIcvmMPgGgxjeVGSbPVnPffThTrAu8ZJkCv1u3CIS28Q0bj0Crrf+XwH
-# WHq00kCG7alcqgU0BenaLwRup7A+MhULM61qYb9t71vJt8kygAK8OeEeg3+lqnvO
-# ZgTamSkqQFFHYJby03BP9YZxIgNK4AAFklMpEaGCFM4wghTKBgorBgEEAYI3AwMB
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDrJF1Py9/y
+# FR1Y1+9/JPHtNcxiuM1InAYec5GI0NiiXDANBgkqhkiG9w0BAQEFAASCAgBgNc2a
+# Zf3XXa0D/tUP+QfkaW0dEIIaYKrQFV0swbvGVD06M4IGniv6wXsMS8MxNJiK8gmi
+# gq0UWlmvs1IC5ORxSrBEvSpCQdTg/G+i7sEAtD3vGZpyIZz4hxmypoFAtN+lUOrB
+# 5Zrawl1Bvnz6UM+PankJBtUHP9I0P6SBSWwWIy0pzxfqwqe26tvW9NxSryfUt5ac
+# ZHgtqjkpaF+78ByVZ2K2SaANFpznV+XsCVBFwX1MJqPmUy0QwhnKpP4FVYr9vshk
+# Epj1fSNOXhrmTO7/1mZAxdsl1w5PvlYDlzosZPZBWOrLCsW+B1niIk6JX/YJ79G7
+# rYVI+YtEEoE+jTWstiZBpBhQn9q3inz1F3vmcNmMiSGNhaOC0RshdG3dSOJ3YNg6
+# mQq6Hpg9Yno0Vi6haUpPckveEASdDya1xkJ6ig71B2lzMjB3XBeEan2ZuSlLiOHY
+# XnpVoR8x/KHdVJJ90ztGbj/6NakcwkA+GIaGv/88RVv+8NSiawxjXLLKvvcBFGZc
+# VQnhYLa8lC78Kw1LwFyS7uVVllqIqE0itwSuNEDF1ag8W1x+3dNbymG/fF7QE3wc
+# 3cVbpBoXktWnhwsjf6jVmL+brQ0EAWPSnVtMuq5ICxmrJmqvfvqTTZLbyb+pzWyG
+# X/hk6c3uL4QraKtGTxoT+ShD5WKSTbNWqqbK+KGCFM4wghTKBgorBgEEAYI3AwMB
 # MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIC9Q3XxWV0RphlEPihF7bu1Bx/fSNPsgSl3ceBpOZm8uAggKIxh2JVAZ
-# oxgPMjAyNjExMTQwODE2MTFaMAMCAQECEG8vrDpHt0x5P5WycKpgEXGgghGnMIIE
+# BAIBBQAEIO019iMMwVkiXRyKrq2X6qCoZgR5Rl7ldu6SAWra2ku6AggvrXRzIh/v
+# 2hgPMjAyNjExMTUyMDA2MDZaMAMCAQECECeseSyF5mrejzdhaAdnfGKgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -3577,13 +3863,13 @@ finally {
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNDA4MTYxMVowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIAaf
-# fFE2jR1EGuZyDfy9uqT/zzDRcTKZW+N2WCktBH4HMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNTIwMDYwNlowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIGSm
+# jtOhtq3OV+OIlbeiQnpCYSXhnFGu06Fxa7UnmG0xMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiEAisvBLYo65WF5vhM0Vj7vDoi6qDDSpcuYFzXofhAahHYCIBth
-# 9EIGWKlBu4Vvll1KJPKTdlUwq+QCXa2jqkfu5baV
+# zj0EAwIERzBFAiEAkYUaLkkUgmmEzV1vWUGy0u0xzZCEJPN0Rk5zYgpnR6ICIGNX
+# M5bRw+Tx/A915nIIsOpI8R2fxH0jMgggB1KZP1MT
 # SIG # End signature block

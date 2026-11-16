@@ -2,7 +2,7 @@
 #  PRA Cloud Mailbox - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 2.0.0
+#  Version : 2.1.0
 #
 #  This file is read by Invoke-PraCloudMailbox.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
@@ -68,6 +68,9 @@
         # take a wave with -Group <name> when Active Directory is gone. A name, a sAMAccountName, a distinguished name or an SMTP address.
         # The group of Scope.GroupDN (Scope.Mode = 'Group') is always kept too. A group that is not found is a warning, not an error.
         TargetGroups                 = @()      # e.g. @('PRA-Wave1', 'PRA-Wave2')
+        # A Collect that finds no mailbox, or more than this percentage fewer than the last complete snapshot of the same scope, writes nothing and fails: a snapshot that
+        # lost most of its mailboxes would become the last complete one and push the good ones out of Store.KeepSnapshots. 100 accepts any size, an empty snapshot included.
+        MaxDropPercent               = 50       # 0 to 100
         # The daily task registered by -Action Schedule (Windows Task Scheduler, root folder).
         Schedule = @{
             TaskName = 'PraCloudMailbox Collect'    # the name of the task (not case sensitive); a task of this name is replaced
@@ -180,14 +183,16 @@
     # ---------------------------------------------------------------------
     # Entra Connect rebuilt after the disaster (Recover: delta cycles; shared mailboxes: scheduler paused).
     #   Mode = Remoting : Invoke-Command to Server with the current account (ADSync cmdlets)
-    #   Mode = Script   : ScriptPath -Operation Pause|Resume|Delta (any way to reach the server; exit 0 = done)
+    #   Mode = Script   : ScriptPath -Operation Pause|Resume|Delta (any way to reach the server; exit 0 = done). Server and CredentialPath are given to the script as
+    #                     -Server and -CredentialPath when it declares them: the signed sample needs no edit.
     #   Mode = Manual   : the operator does it when the tool asks
     # ---------------------------------------------------------------------
     EntraConnect = @{
-        Mode       = 'Manual'
-        Server     = ''                     # e.g. 'aadc01.contoso.com' (Remoting)
-        ScriptPath = ''                     # e.g. '.\config\EntraConnect.sample.ps1' (Script)
-        MinVersion = '2.5.76.0'
+        Mode           = 'Manual'
+        Server         = ''                 # e.g. 'aadc01.contoso.com' (Remoting, Script)
+        ScriptPath     = ''                 # e.g. '.\config\EntraConnect.sample.ps1' (Script)
+        CredentialPath = ''                 # e.g. '.\config\EntraConnect.cred.xml' (Script; empty = EntraConnect.cred.xml beside the script)
+        MinVersion     = '2.5.76.0'
     }
 
     Logging = @{

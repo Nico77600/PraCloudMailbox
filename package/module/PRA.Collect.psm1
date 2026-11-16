@@ -22,7 +22,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0
+    Version : 2.1.0
 #>
 #Requires -Version 7.5
 Set-StrictMode -Version Latest
@@ -88,7 +88,13 @@ function Connect-PcmExchange {
         throw ("Cannot open the remote session to Exchange on {0}: {1} Collect needs a domain-joined computer, an account allowed to use Exchange remote PowerShell, and an Exchange server that answers on {2} with Kerberos." -f $server, $_.Exception.Message.Trim(), $uri)
     }
     $Context.Server = $server
-    if (Get-Command Set-ADServerSettings -ErrorAction SilentlyContinue) { Set-ADServerSettings -ViewEntireForest $true -ErrorAction SilentlyContinue }
+    try {
+        if (-not (Get-Command Set-ADServerSettings -ErrorAction SilentlyContinue)) { throw 'the command Set-ADServerSettings is not available to this account' }
+        Set-ADServerSettings -ViewEntireForest $true -ErrorAction Stop
+    } catch {
+        Disconnect-PcmExchange -Context $Context
+        throw ("Collect cannot read the whole forest on {0}: {1}. Without it Exchange would answer for its own domain only, and the mailboxes of the other domains would be missing from the snapshot. Check that the account is in the Exchange role group View-Only Organization Management, wait a few minutes for the change to replicate, then run Collect again. Nothing was written." -f $server, $_.Exception.Message.Trim().TrimEnd('.'))
+    }
     $version = ''
     $shortName = ($server -split '\.')[0]
     try { $found = Get-ExchangeServer -ErrorAction Stop | Where-Object { $_.Name -eq $shortName } | Select-Object -First 1; if ($found) { $version = [string]$found.AdminDisplayVersion } } catch { $version = '' }
@@ -181,23 +187,45 @@ function Get-PcmGroupMemberDn {
             $dn = ConvertTo-PcmDistinguishedName $member
             if (-not $dn) { continue }
             $isGroup = $false
-            try { $null = Get-Group -Identity $dn -ErrorAction Stop @dc; $isGroup = $true } catch { $isGroup = $false }
+            try { $null = Get-Group -Identity $dn -ErrorAction Stop @dc; $isGroup = $true }
+            catch {
+                if (-not (Test-PcmNotFoundError -ErrorRecord $_)) { throw ('the member {0} of group {1} could not be read to tell whether it is a group: {2}' -f $dn, $current, $_.Exception.Message.Trim()) }
+                $isGroup = $false
+            }
             if ($isGroup) { $queue.Enqueue($dn) } elseif ($listed.Add($dn)) { [void]$result.Add($dn) }
         }
     }
     return $result.ToArray()
 }
 
+function Test-PcmNotFoundError {
+    <# Is this error the answer "there is no such object" (Exchange: ManagementObjectNotFoundException), as opposed to a read that failed (session, network, server busy)? #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$ErrorRecord)
+    $text = '{0} {1}' -f $ErrorRecord.FullyQualifiedErrorId, $ErrorRecord.Exception.Message
+    return $text -match 'ManagementObjectNotFound|couldn.t be found|could not be found|no such object|\b(group|object|mailbox|recipient|user)\b[^.]*\b(not found|does not exist)'
+}
+
+function Get-PcmLdapPath {
+    <# The LDAP path of a distinguished name for ADSI: the "/" of a name is escaped (ADSI reads an unescaped "/" as the end of the name), the domain controller is named when one is set. #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][string]$DistinguishedName, [AllowEmptyString()][string]$DomainController = '')
+    $escaped = $DistinguishedName.Replace('/', '\/')
+    if ($DomainController) { return "LDAP://$DomainController/$escaped" }
+    return "LDAP://$escaped"
+}
+
 function Get-PcmDirectoryObject {
     <#
     .SYNOPSIS
         One Active Directory object read with ADSI, whatever its class (user, computer, contact, group): class, names, GUID. $null when it cannot be read.
+    .PARAMETER Strict
+        $null only when the object does not exist; any other failure of the read (the domain controller does not answer) is thrown, so that it is not taken for a missing object.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$DistinguishedName)
-    $dc = [string]$Context.Config.Exchange.DomainController
-    $escaped = $DistinguishedName.Replace('/', '\/')
-    $path = if ($dc) { "LDAP://$dc/$escaped" } else { "LDAP://$escaped" }
+    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$DistinguishedName, [switch]$Strict)
+    $path = Get-PcmLdapPath -DistinguishedName $DistinguishedName -DomainController ([string]$Context.Config.Exchange.DomainController)
     $entry = $null
     try {
         $entry = New-Object System.DirectoryServices.DirectoryEntry($path)
@@ -210,7 +238,10 @@ function Get-PcmDirectoryObject {
             Class = $class; Name = (& $read 'name'); Sam = (& $read 'sAMAccountName'); Upn = (& $read 'userPrincipalName'); Smtp = (& $read 'mail')
             DisplayName = (& $read 'displayName'); Dn = $DistinguishedName; Guid = $(if ($bytes.Count -and $bytes[0] -is [byte[]]) { ([guid]$bytes[0]).ToString() } else { '' })
         }
-    } catch { return $null }
+    } catch {
+        if ($Strict -and -not (Test-PcmNotFoundError -ErrorRecord $_)) { throw }
+        return $null
+    }
     finally { if ($entry) { try { $entry.PSBase.Dispose() } catch { $null = $_ } } }
 }
 
@@ -298,15 +329,22 @@ function Get-PcmScopeMailbox {
             'OU' { $mailboxes = @(Get-Mailbox -OrganizationalUnit $scope.SearchBase -ResultSize Unlimited -RecipientTypeDetails $types -ErrorAction Stop @dc) }
             'Group' {
                 foreach ($dn in (Get-PcmGroupMemberDn -Context $Context -Identity $scope.GroupDN)) {
-                    $mailbox = Get-Mailbox -Identity $dn -ErrorAction SilentlyContinue @dc
+                    $mailbox = $null
+                    try { $mailbox = Get-Mailbox -Identity $dn -ErrorAction Stop @dc }
+                    catch {
+                        if (-not (Test-PcmNotFoundError -ErrorRecord $_)) { throw ("Collect stopped before writing the snapshot: the member {0} of the group {1} could not be read ({2}). Run Collect again; a member that cannot be read is never taken for a member without mailbox." -f $dn, $scope.GroupDN, $_.Exception.Message.Trim()) }
+                    }
                     if ($mailbox -and [string]$mailbox.RecipientTypeDetails -in $types) { $mailboxes += $mailbox; continue }
                     if ($mailbox) { [void]$Context.Excluded.Add(('{0}: {1} not in scope' -f $mailbox.Name, $mailbox.RecipientTypeDetails)); continue }
                     [void]$Context.Excluded.Add(('{0}: {1}' -f (Get-PcmMemberLabel -Context $Context -DistinguishedName $dn), (Get-PcmNoMailboxReason -Context $Context -DistinguishedName $dn)))
                 }
             }
             'Csv' {
-                $entries = @(Import-Csv -LiteralPath $scope.CsvPath)
-                if ($entries.Count -and -not $entries[0].PSObject.Properties['Identity']) { throw "Scope.CsvPath: column Identity missing ($($scope.CsvPath))." }
+                $csvText = Read-PcmCsvText -Path $scope.CsvPath
+                if ([string]::IsNullOrWhiteSpace($csvText)) { throw "Scope.CsvPath: the file is empty ($($scope.CsvPath))." }
+                $csvDelimiter = Get-PcmCsvDelimiter (($csvText -split '\r?\n', 2)[0])
+                if (-not $csvDelimiter) { throw "Scope.CsvPath: column Identity missing, or the columns are not separated by a comma or a semicolon ($($scope.CsvPath))." }
+                $entries = @(ConvertFrom-Csv -InputObject $csvText -Delimiter $csvDelimiter -ErrorAction Stop)
                 foreach ($entry in $entries) {
                     $identityText = ([string]$entry.Identity).Trim()
                     if (-not $identityText) { continue }
@@ -584,6 +622,8 @@ function Get-PcmTargetGroup {
         $queue.Enqueue([pscustomobject]@{ Source = $found; Guid = $topGuid; Depth = 1 })
         [void]$seen.Add($topGuid)
         $rows = [System.Collections.Generic.List[object]]::new()
+        $unreadable = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $unreadableList = [System.Collections.Generic.List[string]]::new()
         $count = 0
         try {
             while ($queue.Count) {
@@ -594,9 +634,10 @@ function Get-PcmTargetGroup {
                     if (-not (ConvertTo-PcmDistinguishedName $member)) { continue }
                     $dn = Resolve-PcmMemberDn -Context $Context -Member $member
                     if (-not $dn) { throw ('the member {0} cannot be found in Active Directory' -f (ConvertTo-PcmDistinguishedName $member)) }
-                    $object = Get-PcmDirectoryObject -Context $Context -DistinguishedName $dn
+                    $object = Get-PcmDirectoryObject -Context $Context -DistinguishedName $dn -Strict
                     $class = if ($object) { [string]$object.Class } else { 'Unknown' }
                     $guid = if ($object) { ([string]$object.Guid).ToLowerInvariant() } else { '' }
+                    if (-not $object -and $unreadable.Add($dn)) { $unreadableList.Add($dn) }
                     if ($class -eq 'Group' -and $guid) {
                         if ($seen.Add($guid)) {
                             $queue.Enqueue([pscustomobject]@{ Source = [pscustomobject]@{ DistinguishedName = $dn }; Guid = $guid; Depth = ($current.Depth + 1) })
@@ -616,6 +657,9 @@ function Get-PcmTargetGroup {
         } catch {
             [void]$warnings.Add(('Target group {0}: its members could not all be read ({1}); the group is not captured.' -f $value, $_.Exception.Message))
             continue
+        }
+        if ($unreadableList.Count) {
+            [void]$warnings.Add(('Target group {0}: {1} member(s) do not exist in Active Directory any more and are stored as Unknown, which a run skips ({2}{3}).' -f $value, $unreadableList.Count, (($unreadableList | Select-Object -First 3) -join '; '), $(if ($unreadableList.Count -gt 3) { '; ...' } else { '' })))
         }
         foreach ($row in $rows) { [void]$members.Add($row) }
         [void]$groups.Add([ordered]@{ group_guid = $topGuid; name = [string]$found.Name; sam_account_name = [string]$found.SamAccountName
@@ -687,8 +731,7 @@ function Get-PcmDelegateListLink {
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$DistinguishedName)
-    $dc = [string]$Context.Config.Exchange.DomainController
-    $path = if ($dc) { "LDAP://$dc/$DistinguishedName" } else { "LDAP://$DistinguishedName" }
+    $path = Get-PcmLdapPath -DistinguishedName $DistinguishedName -DomainController ([string]$Context.Config.Exchange.DomainController)
     $entry = New-Object System.DirectoryServices.DirectoryEntry($path)
     try { return @($entry.Properties['msExchDelegateListLink'] | ForEach-Object { [string]$_ }) }
     finally { $entry.Dispose() }
@@ -752,6 +795,7 @@ function Get-PcmSharedPermission {
             try {
                 foreach ($memberDn in (Get-PcmGroupMemberDn -Context $Context -Identity $resolved.Dn)) {
                     $member = Resolve-PcmTrustee -Context $Context -Trustee $memberDn
+                    if (-not $member.Resolved) { [void]$warnings.Add(('{0}: member {1} of group {2} could not be read ({3}); it is stored as Unknown' -f $Mailbox.PrimarySmtpAddress, $memberDn, $resolved.Name, $member.Note)) }
                     [void]$members.Add([ordered]@{
                         group_guid = $resolved.Guid; member_guid = $member.Guid; member_kind = $member.Kind; member_upn = $member.Upn
                         member_smtp = $member.Smtp; member_name = $member.Name; via_group_guid = $resolved.Guid; depth = 1
@@ -1136,15 +1180,15 @@ function Register-PcmCollectTask {
 
 Export-ModuleMember -Function Connect-PcmExchange, Disconnect-PcmExchange, Get-PcmRecipientType, Get-PcmScopeMailbox, Get-PcmGroupMemberDn,
     ConvertTo-PcmImmutableId, ConvertTo-PcmSizeBytes, ConvertTo-PcmMailboxRecord, Test-PcmExcludedTrustee, Resolve-PcmTrustee,
-    Get-PcmDelegateListLink, Get-PcmSharedPermission, Get-PcmContact, Get-PcmDistributionGroup, Get-PcmResourceSettings, Get-PcmTargetGroup, Find-PcmExchangeGroup, Get-PcmDirectoryObject,
+    Get-PcmDelegateListLink, Get-PcmSharedPermission, Get-PcmContact, Get-PcmDistributionGroup, Get-PcmResourceSettings, Get-PcmTargetGroup, Find-PcmExchangeGroup, Get-PcmDirectoryObject, Get-PcmLdapPath, Test-PcmNotFoundError,
     Test-PcmElevated, Test-PcmInteractiveHost, Test-PcmScheduleWindow, Hide-PcmPassword, Get-PcmScheduleSetting, Get-PcmDirectoryAccount, Get-PcmScheduleAccount, Test-PcmExchangeAccess,
     Test-PcmDomainController, Export-PcmUserRight, Test-PcmBatchLogonRight, Get-PcmScheduledCollectTask, Register-PcmCollectTask
 
 # SIG # Begin signature block
-# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKQYJKoZIhvcNAQcCoIImGjCCJhYCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCC52bOlZM83tRdc
-# YkfKqM6XvS1Vi0LD8lU4/AwlX0d9PqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDSPT7jbSPLyTCS
+# im++8Q0IYZnxo/P4WWyUcoEFpLEk1KCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -1216,28 +1260,28 @@ Export-ModuleMember -Function Connect-PcmExchange, Disconnect-PcmExchange, Get-P
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYEDCCGAwCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAHNvAqzIsa
-# ewA0CwgnVgwCjSA5kb79xexD22T1MzzYNzANBgkqhkiG9w0BAQEFAASCAgAQ5uHw
-# WadOCBnquznrQ9PAZO2aPyyCwx83/PVJ3pHec69KLhXOvoVVL5KyFW0tFPc9W09q
-# WbKwk2SmtxOMNhKBNCN/nOoTIErvp7CM6Z2P4mPB2+/sjeFE3QM3dW65zdFwxnyO
-# +3+mXHzvH+4rSbGG58zJsdte7V7wGgjrbwfVhzGGz2j9EAzs2GMYHMsiT7OzSKFp
-# pqb4qmTpe2DQN0cupVO5M3gkI2SBE3ys404Pbts0h0VS2Jn393aM+C22BIC4PfeP
-# XHRJWijQxpm2VV1X4OvLFdFuWqRgLBFsp2I+Tp6OCfyGWye9CycIrjQnbBL1Ano/
-# TSn2Rxh8tSZxX5rB7z2tJPrGLrg5s7gBce2nNu0eatDUGDH5VSHPNAVDi6MH1KrL
-# mfi5yWrHOV+ejNL/CjyMZr+aYzU6hHkD6FWj/G51UFPukNqtA8fvuKKH8Fg5FxPJ
-# QP2S4Qk8BtvlwnwMeffQVCfPWxU7n8Moui0hu4d9WqNj5s+++5WGC6Z+SAV1qsEl
-# warZgXaHXmfMEucOl4XUgn5fYf9FKGSIICDOIN41BNSN0MWcOKMgNB4kLAbMNWke
-# Zr4kh5OBlDInlJG663WG1ftiIVFrojH5KPcHLQ3GnG714j/axrjjYuqnKITllB0V
-# 1+4qkN/INkYAXmC6qkWRepa7yZ6PKjYePt+N+aGCFM4wghTKBgorBgEEAYI3AwMB
-# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCC9SlCr7kau
+# xPSOo7Sj6JZJySGdPUtd5T1CTQ0V4v0bdjANBgkqhkiG9w0BAQEFAASCAgCQrLv1
+# xzG9kNFJX7xr7HV+8cNt7Kkj84lPuN1Na8xqzUHH8aPh9JtNEnN9b2hcAc4rJYTP
+# aQxO7QR6auBQFJE4faN2M6FsVsgIBuLM+PAXOH48BzjV7nZBMApAg6z2+s0WnIBb
+# xt7c1528XVpguSTpKOpL/TQ8t942/4Krp+lxjfiVA7pNDx95rlm3UHq8uZBKqnza
+# BCAZEViTNiBn52RhUD8C4lBHl1TPm/Eh0sprY6BfvrfL71CKPrlGIIdTwj3e4VbN
+# VYTYId/jmuf61e6xPFFsX2eG01K9oCFABDpO6/maEi5uwPHcki/W6/r0+zipOI8K
+# BufSgI7RUERniTs/aNrfb4npHpX5UbP2ZpLs3Ab1O/QdbooWkovk1OTKII22lW4+
+# /OavKeM7WwlgLwGTe1XeFlccIZY+rFX7eTWTLEYOMdcGIFyKzZd5MtTmQ9EvICx3
+# e32orFvCP+GikCILwzQc9HIUkM942v/gYGXlIIla5Di8U0I4NN4Liav0Wtus/CWX
+# bDhrVx1N7HkZAHp4eveXjIen09u5GXsxwG4IB7+8JIkuP/zUoEZUPRRPdkwvaqXw
+# aeDE5HGjNTkydubiKoVDqExBvc52I+/07ikFUZ6h5S/fupZe7u2ewqz/t+aKAo9J
+# oogUqJJgf7dhd3FxgXKZ5dEeUcSHilzacdzf26GCFM0wghTJBgorBgEEAYI3AwMB
+# MYIUuTCCFLUGCSqGSIb3DQEHAqCCFKYwghSiAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIPQP2cVkDsSQ/rzAchRChvIKMSLeGY+Zw0MSj8dSJ1f/AggbQcV28zD4
-# whgPMjAyNjExMTQwODE2NTBaMAMCAQECEG0UfQv9MjF5ezymo7KJmu2gghGnMIIE
+# BAIBBQAEIFV8UDCRvAO2sPH9CT8aS4/4g1g9MXXWSprg3QBZvIbxAggdDFdV3hUo
+# vhgPMjAyNjExMTUyMDA2MjNaMAMCAQECEC03jk20t9kBXd3hG+/YlXygghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -1332,17 +1376,17 @@ Export-ModuleMember -Function Connect-PcmExchange, Disconnect-PcmExchange, Get-P
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlUwggJRAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNDA4MTY1MFowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEII+/
-# DJGB52ZElAvvT9mFEWM+AFG/CjGRKxuunXCoyKMpMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNTIwMDYyM1owKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIEni
+# b+U+yHzZCtM8GBgDwm6TrWljqb5Oc61vDi9XHrBLMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiB022c4AFNKCjK8771ezNWpXjJzulc/6Wo7GVEtwzl4/AIhAIwY
-# Uy5P/Mq+NqQeqlKZxk2UJkXuFHnLuGxwk/4d1VQu
+# zj0EAwIERjBEAiB8HVWnVsX389knvqDh5FGMaOv3d9LEkCNOO2a86ehJQgIgXSKf
+# bgypOmSToQCTh0zM9Mjm8kujoFv/hX/do/CQQR4=
 # SIG # End signature block

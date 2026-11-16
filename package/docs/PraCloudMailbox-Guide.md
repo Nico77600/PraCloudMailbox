@@ -1,14 +1,14 @@
 ﻿---
 title: PRA Cloud Mailbox
 subtitle: Administrator guide
-version: 2.0.0
+version: 2.1.0
 author: Nicolas Fabert
-updated: 2026-11-12
+updated: 2026-11-15
 ---
 
 # PRA Cloud Mailbox — Administrator guide
 
-> Exchange disaster recovery, **scenario 2**: Active Directory, Exchange and Entra Connect are lost at the same time. Users and shared mailboxes get a mailbox in **Exchange Online on their existing identities** — the Teams storage of each user becomes his mailbox, so Teams keeps working and nothing is lost — and **everything is rolled back** when the on-premises infrastructure is rebuilt, without losing the mails received in the cloud.
+> Exchange disaster recovery, **scenario 2**: Active Directory, Exchange and Entra Connect are lost at the same time. Users and shared mailboxes get a mailbox in **Exchange Online on their existing identities** — the Teams storage of each user becomes their mailbox, so Teams keeps working and nothing is lost — and **everything is rolled back** when the on-premises infrastructure is rebuilt, without losing the mails received in the cloud.
 
 > [!IMPORTANT]
 > Files downloaded from the Internet may be blocked by Windows and fail to run. Before using this project, unblock every file in the downloaded folder:
@@ -57,7 +57,7 @@ In a hybrid organisation, a mailbox hosted on-premises is only a *mail user* for
 
 **Scenario 2** is worse: Active Directory, Exchange **and** Entra Connect are lost (ransomware, loss of the site). The users can still sign in to Microsoft 365 — their Entra ID objects and password hashes are in the cloud — and Teams keeps working, but their mailboxes are unreachable and nothing can be written in AD any more. *PRA* stands for *Plan de Reprise d'Activité*, the disaster recovery plan.
 
-PRA Cloud Mailbox gives every user and shared mailbox in scope a mailbox in Exchange Online **on the same identity** (same objectId, same SMTP and X500 addresses), entirely from the cloud, and rolls everything back once AD, Exchange and Entra Connect are rebuilt. No data is migrated: the cloud mailboxes start with what the cloud already holds — for a user, his Teams storage.
+PRA Cloud Mailbox gives every user and shared mailbox in scope a mailbox in Exchange Online **on the same identity** (same objectId, same SMTP and X500 addresses), entirely from the cloud, and rolls everything back once AD, Exchange and Entra Connect are rebuilt. No data is migrated: the cloud mailboxes start with what the cloud already holds — for a user, their Teams storage.
 
 Why a snapshot: after the disaster nothing on-premises can be read. The list of the objects, their GUIDs, their X500 addresses and the permissions of the shared mailboxes (FullAccess with AutoMapping, SendAs, SendOnBehalf) must therefore be collected **before**, regularly, and stored in a file that is copied to the cloud admin server.
 
@@ -142,6 +142,8 @@ The mails received in the cloud during the disaster are **never deleted**: those
 - It never deletes a shared mailbox identity before the case hold is stamped on the mailbox (`InPlaceHolds`): otherwise the mailbox would be soft-deleted, not inactive, and purged after 30 days.
 - It never lifts a hold from an object that is already back on-premises.
 - It never handles a room or equipment mailbox unless `Scope.ConvertRooms` is set (`KIND_NOT_SUPPORTED` otherwise). The default `SynchronizedShared` path retains the released shared-mailbox behaviour; `CloudResource` is a separate opt-in lifecycle for native resources excluded from synchronisation (chapter 6.2). Neither path automatically merges cloud reservations into the native calendar.
+- It never recreates contacts, distribution groups, mail-enabled security groups, dynamic distribution groups or Microsoft 365 groups. Collect can store contacts, distribution groups (distribution and mail-enabled security) and dynamic distribution groups in the snapshot (`Collect.Contacts`, `Collect.DistributionGroups`, `Collect.DynamicDistributionGroups`), for reference only: Check, Convert and Recover never read them. Microsoft 365 groups are cloud objects: they are not collected and not handled. The members of the groups named in `Collect.TargetGroups` (and of `Scope.GroupDN`) are used for one thing, to choose the objects of a run with `-Group`. The only groups the tool changes are the licence group (its source of authority moves to the cloud, chapter 9) and the room lists of the native resources (chapter 6.2).
+- It restores calendar settings (booking policies, work hours, booking delegates) only for the native rooms and equipment of the `CloudResource` mode (chapter 6.2). The calendar of a user or of a shared mailbox is not touched, and no calendar-folder permission is restored.
 
 # Part II · Set up
 
@@ -262,14 +264,16 @@ The Collect account uses the cmdlets that the code imports from the remote sessi
 | the package folder | read (execute) only | everyone: the integrity check refuses a package that changed |
 | the snapshot and its backups | a **restricted** access list, never **Domain Users** | the administrators of the tool and the backup account |
 
+The tool creates the `data`, `logs` and `reports` folders itself when they are missing, **private from the first moment**: no inherited permission, full control for the account that runs it, SYSTEM and the local Administrators only. A folder that already exists is left exactly as you set it. If a folder cannot be created, or cannot be made private, the run stops and says why. The letter case of these folder names does not matter in the configuration (`.\Logs` is the same as `.\logs`).
+
 <!-- icon: download -->
 ## 5. Installation
 
 1. Download `PraCloudMailbox-<version>.zip` and its `.sha256` file from the release page. Compare the hash of the zip with the one in the `.sha256` file (the file holds `<hash>  <file name>`; the letters can be capital or small):
 
 ```powershell
-(Get-FileHash .\PraCloudMailbox-2.0.0.zip -Algorithm SHA256).Hash
-Get-Content .\PraCloudMailbox-2.0.0.zip.sha256
+(Get-FileHash .\PraCloudMailbox-2.1.0.zip -Algorithm SHA256).Hash
+Get-Content .\PraCloudMailbox-2.1.0.zip.sha256
 ```
 
 2. Extract it, copy the folder to `C:\PRA\PraCloudMailbox` on the cloud admin server and on any other server that runs Collect, and unblock the files.
@@ -323,7 +327,7 @@ There is no unsigned mode, switch or environment bypass. **Not covered, by desig
 | `Environment` | Label used in the backup file names; a batch only continues in its own environment |
 | `Exchange` | `Server` (host name of an Exchange server, **required by Collect**), `DomainController` (the same DC for every read of a run). `ConnectionMode` of 1.x is gone: `Local` is refused with a migration message, `Remote` is ignored |
 | `Scope` | `Mode` (`Auto`, `OU`, `Group`, `Csv`), `SearchBase`, `GroupDN`, `CsvPath` (column `Identity`: UPN, SMTP, sAMAccountName, DN or GUID), `IncludeUsers`, `IncludeShared`, `IncludeRoom`, `IncludeEquipment`, `ExcludeSamAccountNames`, `ConvertRooms` (default `$false`), `ResourceMode` (`SynchronizedShared`, default, or `CloudResource` for unsynchronised native resources) |
-| `Collect` | `SharedPermissions`, `ExpandGroupTrustees` (groups used as trustees: members stored and granted one by one), `ExcludeTrustees` (wildcards), `MailboxStatistics`, `Contacts`, `ContactsSearchBase`, `DistributionGroups`, `DistributionGroupsSearchBase`, `DynamicDistributionGroups`, `TargetGroups` (groups kept **with all their members**, nested groups, computers and contacts included, so that `-Group` works after the disaster; `Scope.GroupDN` is always kept too; a group that is not found is a warning) |
+| `Collect` | `SharedPermissions`, `ExpandGroupTrustees` (groups used as trustees: members stored and granted one by one), `ExcludeTrustees` (wildcards), `MailboxStatistics`, `Contacts`, `ContactsSearchBase`, `DistributionGroups`, `DistributionGroupsSearchBase`, `DynamicDistributionGroups`, `TargetGroups` (groups kept **with all their members**, nested groups, computers and contacts included, so that `-Group` works after the disaster; `Scope.GroupDN` is always kept too; a group that is not found is a warning), `MaxDropPercent` (0 to 100, default 50: a Collect that finds no mailbox, or more than this percentage fewer than the last complete snapshot of the same scope, writes nothing and fails; 100 accepts any size) |
 | `Store` | `Path` (snapshots), `KeepSnapshots`, `BackupFolder` (a consistent copy and its `.sha256` after each Collect), `MaxSnapshotAgeDays` (Check warns beyond), `JournalPath` (journal of Convert and Recover, cloud side) |
 | `Cloud` | `SignIn` (`Certificate` or `Interactive`), `UserPrincipalName` (the administrator proposed at an interactive sign-in), `TenantId`, `Organization`, `AppId`, `CertificateThumbprint`, `DefaultUsageLocation` (two letters, for the objects without usageLocation) |
 | `Exo` | `MinModuleVersion` (default `3.10.1`, the run stops before any change when the module is older; it cannot go under the built-in minimum) |
@@ -332,7 +336,7 @@ There is no unsigned mode, switch or environment bypass. **Not covered, by desig
 | `Recover` | `WaveSize` (shared mailboxes rolled back together, 1 to 1000; 0 or absent = the value of `Licensing.Shared.Parallel`; Recover uses no licence unit) |
 | `Retention` | `TagAttribute`, `TagValue` (written on the shared mailboxes), `HoldPolicy` (case hold policy of Recover), `HoldPolicyLimit` (mailboxes per policy before a sibling is created, 1 to 1000, default 1000) |
 | `Resources` | `LicensingGroupId` (old protected native journals only; unused for new resources), `OnPremisesRoutingDomain` (destination domain of the rebuilt native resources), `OnPremisesReady` (explicit operator assertion, default `$false`), `AllowUnprotectedDeletion` (explicit cloud-bookings/messages loss acknowledgement, default `$false`), `Parallel` (native resource waves, 1 to 1000, default 100) |
-| `EntraConnect` | `Mode` (`Remoting`, `Script`, `Manual`), `Server`, `ScriptPath`, `MinVersion` (chapter 6.1) |
+| `EntraConnect` | `Mode` (`Remoting`, `Script`, `Manual`), `Server`, `ScriptPath`, `CredentialPath` (`Script` mode: the credential file given to the script), `MinVersion` (chapter 6.1) |
 | `Logging`, `Report` | Folders; `Report.Enabled` |
 
 System mailboxes (HealthMailbox, SystemMailbox, DiscoverySearchMailbox...) and system or administration trustees (NT AUTHORITY, SIDs, Exchange and domain admin groups) are always excluded.
@@ -353,15 +357,26 @@ In every mode Recover puts the licences back **exactly** as they were (direct as
 
 ### 6.1 Entra Connect
 
-Recover needs, on the rebuilt Entra Connect server: delta cycles, and the scheduler paused while shared identities are deleted (a cycle at the wrong moment restores a deleted object).
+Recover needs, on the rebuilt Entra Connect server: delta cycles, the scheduler paused while shared identities are deleted (a cycle at the wrong moment restores a deleted object), and, only when a delta cycle does not recreate a deleted identity, the synchronisation of that one object.
 
 | `EntraConnect.Mode` | How | Requirements |
 |---|---|---|
-| `Remoting` | `Invoke-Command -ComputerName <Server>` with the current account, ADSync cmdlets | WinRM to the server, account in `ADSyncAdmins` |
-| `Script` | `<ScriptPath> -Operation Pause \| Resume \| Delta` | any access path (another account, a jump host, Azure Run Command...). Output: one line of state, logged. `exit 0` = done, any other exit code or an exception = failed |
-| `Manual` | the tool asks the operator, who confirms | interactive console (not with `-Force`) |
+| `Remoting` | `Invoke-Command -ComputerName <Server>` with the current account, ADSync cmdlets (for one object: `Invoke-ADSyncSingleObjectSync`, from Entra Connect 2.x, then a full synchronisation of the Active Directory connector with `Set-ADSyncSchedulerConnectorOverride`) | WinRM to the server, account in `ADSyncAdmins` |
+| `Script` | `<ScriptPath> -Operation Pause \| Resume \| Delta \| SyncObject` (`SyncObject` also gets `-ObjectDn <distinguished name>`, one call per object), plus `-Server <EntraConnect.Server>` and `-CredentialPath <EntraConnect.CredentialPath>` when the script declares those parameters | any access path (another account, a jump host, Azure Run Command...). Output: one line of state, logged. `exit 0` = done, any other exit code or an exception = failed |
+| `Manual` | the tool asks the operator, who confirms; for one object it gives the exact `Invoke-ADSyncSingleObjectSync -DistinguishedName '<dn>' -NoHtmlReport` command and the connector full synchronisation to use when it fails | interactive console (not with `-Force`) |
 
-`config\EntraConnect.sample.ps1` implements the `Script` contract with PowerShell remoting and a credential saved with `Export-Clixml`: copy it and adapt the server name.
+`config\EntraConnect.sample.ps1` implements the `Script` contract with PowerShell remoting and a credential saved with `Export-Clixml`. It is signed and **runs as it is**: do not edit it, because an edited file no longer matches the package inventory and the tool refuses it (so does a copy of it in `config\`). Set the configuration instead:
+
+```powershell
+EntraConnect = @{
+    Mode           = 'Script'
+    ScriptPath     = '.\config\EntraConnect.sample.ps1'
+    Server         = 'aadc01.contoso.com'                 # given to the script as -Server
+    CredentialPath = '.\config\EntraConnect.cred.xml'     # given as -CredentialPath; empty = EntraConnect.cred.xml beside the script
+}
+```
+
+Create the credential file once, with the account that runs the tool: `Get-Credential CONTOSO\svc-pra-sync | Export-Clixml .\config\EntraConnect.cred.xml` (only that Windows account, on that computer, can read it back). A script of your own, outside the package, receives `-Server` and `-CredentialPath` only when it declares them; one that does not declare them is called with `-Operation` alone, as before.
 
 ### 6.2 Unsynchronised native resource lifecycle
 
@@ -431,6 +446,10 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Collect -Identity compta@contoso
 
 Steps: Exchange on-premises connection, mailboxes in scope, shared mailbox permissions, contacts and distribution groups, target groups, saving the snapshot. Collect reads Exchange through a **remote session** (`New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri http://<Exchange.Server>/PowerShell/ -Authentication Kerberos`, then `Import-PSSession` of the cmdlets it uses): every object is a deserialized copy, and the code reads sizes, multi-valued properties, AD identifiers and enums accordingly. A snapshot is written with the status *Running* and marked *Complete* at the end: an interrupted Collect never replaces the last good snapshot. A snapshot of one object (`-Identity -Mode Apply`) asks for a confirmation, because it becomes the last snapshot.
 
+**A Collect that lost its mailboxes is refused.** A Collect that finds no mailbox, or more than `Collect.MaxDropPercent` (default 50) percent fewer than the last complete snapshot of the same scope, writes nothing and ends with `RESULT: FAIL` (exit code 1): the last good snapshot stays the last complete one and is never pushed out by `Store.KeepSnapshots`. A Preview shows the same refusal as a warning. When the drop is expected (mailboxes moved, scope narrowed), raise `Collect.MaxDropPercent` for the run (100 accepts any size). Collect also stops when it cannot set `ViewEntireForest` on the Exchange session (without it only the home domain would be read), and when a read of Exchange fails in the middle of a group (a member that cannot be read is never taken for a member without mailbox). A group member that does not exist any more in Active Directory is kept as *Unknown*, counted as a warning of the Collect and listed in the issues of the snapshot.
+
+**Which snapshots are kept.** After a successful Collect the oldest snapshots beyond `Store.KeepSnapshots` are deleted, **except** the snapshot of a Convert batch that is not rolled back yet (when the journal `Store.JournalPath` is on the same computer): the run says which ones it kept. If the journal cannot be read, nothing is deleted. A computer that collects without the journal cannot know: keep `Store.KeepSnapshots` high enough, and remember that `Store.BackupFolder` keeps a copy of every snapshot written.
+
 **Target groups.** Groups named in `Collect.TargetGroups` (a name, a sAMAccountName, a distinguished name or an SMTP address) and the group of `Scope.GroupDN` are stored with **every member**: nested groups are followed (a cycle is safe), and users, computers, contacts and groups are all kept with their class (tables `target_group` and `target_member`). After the disaster this is what lets `-Group` select a wave when AD is gone, and tells **why** a member is skipped. A configured group that is not found is a warning; the rest of the Collect goes on. With `Scope.Mode = 'Group'`, the members that are not mailboxes are reported as excluded, with their reason.
 
 ### Scheduling
@@ -489,10 +508,12 @@ What the verification does:
 | State | Meaning | What the tool does |
 |---|---|---|
 | **Verified** | the hash of the file is the one of the `.sha256` | goes on: *Snapshot file verified: it matches the .sha256 written by Collect.* |
-| **Not verifiable** | no `.sha256` beside the file (an old snapshot, or a copy made without it) | a **warning** only: the tool cannot prove the file is the one written by Collect |
+| **Not verifiable** | no `.sha256` beside the file (an old snapshot, or a copy made without it) | a Preview and a Check only **warn**; a **Convert or a Recover in Apply mode stops, nothing changed**: the tool cannot prove the file is the one written by Collect. Copy the `.sha256` with the file, or give `-AcceptUnverifiedSnapshot` when you know the file is the right one |
 | **Changed** | the hash differs, or the `.sha256` holds no hash | **stops, nothing changed**: restore the snapshot from the external backup |
 
-With `-AcceptUnverifiedSnapshot` (Check, Convert, Recover) the run goes on although the snapshot changed. Use it only when you know why the file changed and accept it as it is. The run says so in the banner, the log, the summary and the report, and the next steps keep the switch. The console shows the light **Snapshot** as Verified, Not verifiable or Changed (red).
+With `-AcceptUnverifiedSnapshot` (Check, Convert, Recover) the run goes on although the snapshot changed or has no `.sha256`. Use it only when you know why and accept the file as it is. The run says so in the banner, the log, the summary and the report, and the next steps keep the switch. The console shows the light **Snapshot** as Verified, Not verifiable or Changed (red). Collect keeps the previous `.sha256` until the new one is written, and writes it again for the database as it is when a Collect fails after it opened the database, so a failed Collect does not leave the good snapshot without its hash.
+
+**A batch is tied to its snapshot.** Convert records, in the journal, the run of Collect and a digest of the content (mailboxes, permissions, group members) of the snapshot it was made from; Recover and `Check -Batch` use the same snapshot, found by its run and not by its number, and **stop, nothing changed**, when the snapshot is missing or its content is not the one the batch was made from (`-AcceptUnverifiedSnapshot` accepts a different content). When it is missing, the message points to `Store.BackupFolder`: every Collect writes a copy named `PraCloudMailbox_<Environment>_snapshot<number>_<date>.db` there, which is never deleted; copy it over `Store.Path` with its `.sha256` and run the command again. A batch made before this version has no record: the tool uses the number written in the journal and warns that it cannot prove the snapshot.
 
 <!-- icon: check -->
 ## 8. Check
@@ -521,7 +542,8 @@ Steps: snapshot, Microsoft 365 connection, tenant prerequisites, objects. An obj
 | `LICENCE_GROUP_SOA` | Info | Licence group synchronised from AD: switched to the cloud at Convert, back to AD with the last user |
 | `SHARED_LICENCE` | Error / Ok | Temporary licence of the shared mailboxes: SKU, Exchange plan, one free unit |
 | `ENTRA_NOT_FOUND` | Error | No Entra ID object (neither by onPremisesImmutableId nor by UPN) |
-| `ENTRA_MATCHED_BY_UPN` | Warn | Found by UPN only: check the source anchor |
+| `ENTRA_MATCHED_BY_UPN` | Warn | Found by UPN only (the mailbox GUID is the one of the snapshot): check the source anchor |
+| `ENTRA_WRONG_OBJECT` | Error | Found by UPN only **and** its mailbox GUID is not the one of the snapshot: the account is probably another person's. Nothing is changed on it and the object is not converted. Fix the source anchor or the UPN in Entra ID, or leave the object out |
 | `ENTRA_NOT_SYNCED` | Error | Cloud-only object |
 | `ALREADY_CLOUD_MANAGED` | Warn | Source of authority already in the cloud: a Convert already started |
 | `PROVISIONING_ERROR` | Warn | Unresolved provisioning errors in Entra ID |
@@ -559,7 +581,9 @@ Steps: snapshot, Microsoft 365 connection, tenant prerequisites, objects. An obj
 | `Deprovisioned` | A `MailUser` with the on-premises ExchangeGuid, synchronised from AD again, the source of authority back in AD. A native resource: its cloud identity is gone |
 | `Retained` | The cloud data is protected as the journal says: a case hold of the tool on the cloud mailbox of a user, an inactive mailbox for a shared mailbox, nothing for a native resource without protection. It connects to Security & Compliance when users are in the batch |
 
-Without `-Once` the check waits, with the `Polling` settings (`MailboxTimeoutMinutes`, `SyncTimeoutMinutes`, `HoldTimeoutMinutes`), until every object is in the expected state or the time is over; with `-Once` it looks one time. Objects not in the expected state end the run with exit code 1 and a plain next step (the command to look again, and the command to resume the Convert or the Recover). Every run on a batch updates its **global report** (chapter 12). The `-Identity`, `-CsvPath`, `-SearchBase`, `-Group`, `-Scope` and `-MaxObjects` options narrow the objects that are followed.
+Without `-Once` the check waits, with the `Polling` settings (`MailboxTimeoutMinutes`, `SyncTimeoutMinutes`, `HoldTimeoutMinutes`), until every object is in the expected state or the time is over; with `-Once` it looks one time. Objects not in the expected state end the run with exit code 1 and a plain next step (the command to look again, and the command to resume the Convert or the Recover). Every run on a batch updates its **global report** (chapter 12).
+
+**Every object of the batch is followed**, also the ones that Convert never started (no licence unit left, a stop, an error at the first step). They are listed as *not converted: Convert never started this object, nothing was changed on it* (or *not rolled back* after a Recover) and count as not in the expected state. With `-Expect Provisioned`, the check never says that every object is provisioned while the Convert batch is not **Complete**: the run ends with exit code 1 and proposes to resume the batch first (`Convert -Mode Apply -Batch <id>`). When a Recover already rolled back objects of the batch, the next step is not to resume it (see chapter 9) but to convert the leftovers again with a new Convert. The `-Identity`, `-CsvPath`, `-SearchBase`, `-Group`, `-Scope` and `-MaxObjects` options narrow the objects that are followed.
 
 <!-- icon: cloud -->
 ## 9. Convert
@@ -582,6 +606,9 @@ Steps: snapshot, Microsoft 365 connection, readiness (the rules of Check), plan 
 - **Users**: in waves of 500, phase by phase for the whole wave: ExchangeGuid cleared (one Exchange Online call each), source of authority to the cloud (Graph batches of 20), **one** wait for the wave until Exchange Online no longer sees them as synchronised, usageLocation (Graph batches), then the plan: membership of the licence group checked and added by Graph batches, or the Kiosk / direct plan user by user. Then the tool polls every `Polling.IntervalSeconds` all the users together (filters of 50) until each one is a UserMailbox (`MailboxTimeoutMinutes`). A user still waiting at the timeout is *Pending*: run the same command with `-Batch` later.
 - **Licence group synchronised from AD** (Group mode): its source of authority goes to the cloud once, before the first user; the journal records it.
 - **Shared mailboxes**: in waves of `Licensing.Shared.Parallel` (100 by default), one temporary unit of `Licensing.Shared.SkuPartNumber` each and **never more than the free units** at the start of the wave, minus `Licensing.Shared.KeepFree` (0 by default): a shared mailbox that failed keeps its temporary licence, and no object is started without a unit (never left half-converted). Each wave goes phase by phase: identity start as for the users, temporary licence (Exchange can refuse a licence assignment for a few seconds after a usageLocation change, so it is retried for 45 s), one wait for all the mailboxes, `Type Shared` asked again until it is effective, tag, licence put back as before, **one** pause of 60 s for the wave, type checked, then the permissions of the snapshot, granted and read back: FullAccess with AutoMapping as collected, SendAs, SendOnBehalf; group trustees as their members.
+- **Licence units across the waves**: an object that needs no unit (already a shared mailbox, or already holding the temporary licence) is never failed for a missing unit; only the objects that need one wait for one. A wave that finds no free unit waits **once** (the `Polling` settings, 5 minutes at most) for the units that the previous wave gave back. If none comes, the objects that need a unit are marked *Failed* (*not started: no free unit of … nothing was changed on this object*), the others go on, and the batch is *Partial*: free a unit, then resume with `-Batch`.
+- **A batch that Recover touched is not resumed**: once a Recover batch exists for a Convert batch, `Convert -Batch <id>` stops with *Convert batch … cannot be resumed: Recover batch … already rolled back objects of it, and an object converted now could not be rolled back with it. Nothing was changed.* An object converted into that batch could never be rolled back, because Recover refuses a batch it has already finished. To convert the objects that the batch did not finish, run a **new Convert** for them (Preview first, then `-Mode Apply`), choosing them with `-Identity`, `-CsvPath` or `-Group`; the next steps say so.
+- **An interrupted run is a failed run**: Ctrl+C, a closed window or a stop of the host before the end of the run ends with `RESULT: FAIL` and exit code 1 (never `PASS`), says at which step and on which object it stopped, and gives the command that resumes it. The rows still *Planned* count as *Pending*, and the batch the run left *Running* becomes *Partial* with a note.
 - **Resume** (`-Batch`): only the objects not *Done* are taken again; objects that already hold their licence do not count in the capacity check. `-Identity`, `-CsvPath`, `-SearchBase`, `-Group`, `-Scope` and `-MaxObjects` narrow the objects of the batch that are resumed; an object outside the batch is refused.
 - **Already converted**: an object that an earlier batch converted is refused, and the message names that batch (*… is already converted by Convert batch …: nothing was changed.*), with the command to continue it.
 - **Stop** (from the console, chapter 13.1): the wave in progress is finished (500 users or `Parallel` shared mailboxes), no new wave is started; the objects not started stay *Planned* and the batch *Partial*: resume it with `-Batch`.
@@ -639,11 +666,14 @@ Run it once AD, Exchange and Entra Connect are rebuilt and synchronising. Steps:
 | User with a cloud mailbox | Case hold lifted if present (any other hold stops the user: remove it first), source of authority back to AD (Graph batches), **one** delta cycle for the wave (skipped when already synchronised), Exchange plan removed (licences as before Convert), **one** wait for the wave until each one is a MailUser with the on-premises ExchangeGuid, case hold added to the wave and **one** wait for the stamps. The cloud mailbox stays as ComponentShared with its content, under the hold |
 | Already back on-premises (synchronised MailUser, on-premises GUID) | Case hold added if missing and checked; **never lifted** |
 | SharedMailbox | Case hold added to the wave and checked (otherwise nothing is deleted), scheduler paused **once for the wave**, identities deleted (Graph batches), inactive mailboxes checked, identities deleted permanently, scheduler resumed (always, even after an error), **one** delta cycle for the wave, new objects checked as MailUser with the on-premises GUID |
-| Shared identity deleted by an earlier run | Recycle bin checked (purged if needed), delta cycle, recreated object checked |
+| Shared identity deleted by an earlier run | Recycle bin checked (purged if needed), delta cycle, recreated object checked, then the targeted synchronisation below if it is still missing |
 | Shared mailbox whose Convert stopped half-way (MailUser or UserMailbox) | Rolled back like a user (temporary licence put back as before); never deleted |
 
 - One scheduler pause and one delta cycle serve all the shared mailboxes of a wave.
+- **An identity that the delta cycle does not recreate.** After the delta cycle the tool waits for the new objects (`Polling.SyncTimeoutMinutes`). A deleted identity that is still missing at the end of the wait is synchronised on its own, by its distinguished name in the snapshot, through the Entra Connect mode of the configuration (`Invoke-ADSyncSingleObjectSync` reads the object from Active Directory, synchronises it and exports it; a remote session often cannot reach the management service that this cmdlet needs, and then the objects that are left share one cycle in which the Active Directory connector runs a full synchronisation, `Set-ADSyncSchedulerConnectorOverride -FullSyncRequired` followed by `Start-ADSyncSyncCycle -PolicyType Delta`). The step is a line of the run (*Entra Connect, targeted synchronisation of the object*), an event of the journal and of the global report, so a resumed Recover never repeats it. The tool then waits again, for up to ten minutes. If the object is still missing, the object stays *Pending* and the run ends with `RESULT: PENDING`: the Next steps give the full synchronisation to run on the Entra Connect server (`Start-ADSyncSyncCycle -PolicyType Initial`; the tool never starts it by itself, it can take a long while) and the same Recover command to run after it.
 - **Licence group**: given back to AD only when no converted user of any Convert batch of the journal is left.
+- **The licence mode is the one of the batch**: Convert records the `Licensing.Users.Mode` (`Group`, `Kiosk` or `Direct`) it used. Recover takes the Exchange plan of the users back the way Convert gave it, so when the configuration says another mode now, the run stops **before any change**: *Convert batch … gave the Exchange plan of its users with Licensing.Users.Mode = … and the configuration now says …*. Set the mode back (with the same `GroupId` or `SkuPartNumber` as at Convert) and run the same command again. A batch without users, or made before the mode was recorded, is not concerned.
+- **A shared mailbox whose identity was deleted** is journaled around the deletion (*identity about to be deleted*, then *identity deleted*, with the cloud mailbox GUID). A run that stops during or after the deletion (the mailbox is not inactive within 15 minutes, a crash) therefore resumes at the wait for the inactive mailbox instead of saying that there is nothing to roll back: run `Recover -Batch <id>` again. A recycle bin that cannot be read is no longer taken for a purged identity: the object is reported as *Failed* (*the Entra ID recycle bin could not be read … run Recover -Batch again*) and the next run confirms it.
 - A Recover batch is linked to its Convert batch; running Recover again resumes it. Once complete, Recover refuses to run again on the same Convert batch (*Convert batch … was already rolled back by Recover batch …*).
 - **A wave**: `-Identity`, `-CsvPath`, `-SearchBase` or `-Group` (chapter 9.1) select the objects of the batch to roll back; the others wait for the next run with the same `-Batch`. **Stop** (from the console, chapter 13.1): the wave in progress is finished, no new wave is started; the objects not started stay *Pending*, the scheduler is resumed as always.
 - The case hold overflow (`Retention.HoldPolicyLimit`) opens a sibling policy in the same case for the extra mailboxes.
@@ -670,9 +700,11 @@ Each run writes:
 |---|---|
 | `logs\PRA_<date>_<run>.log` | every step with its time; last line `RESULT: PASS`, `RESULT: PENDING` (exit code 2), `RESULT: FAIL` or `RESULT: CANCELLED` |
 | `logs\PRA_<date>_<run>.transcript.txt` | the PowerShell transcript of the run |
-| `reports\PRA_<date>_<run>.csv` | one row per object |
+| `reports\PRA_<date>_<run>.csv` | one row per object; UTF-8 with a byte order mark, semicolon as separator, and a text that starts like a formula (`=`, `+`, `-`, `@`) gets a leading apostrophe |
 | `reports\PRA_<date>_<run>.html` | the same, self-contained (no external resource): result, counters, next step, the settings of the run that differ from the file, the skipped members, a filterable table |
-| `reports\PraCloudMailbox_<environment>_batch<id>_global.html` and `.csv` | the **global report** of a batch |
+| `reports\PraCloudMailbox_<environment>_batch<id>_global.html` | the **global report** of a batch: every object and every step of its journey |
+| `reports\PraCloudMailbox_<environment>_batch<id>_global.csv` | the same objects, one line each, for Excel |
+| `reports\PraCloudMailbox_<environment>_batch<id>_global_events.csv` | every step of every object, one line each (the journeys) |
 
 ![HTML report of a Convert](images/report-convert-light.png)
 
@@ -684,11 +716,11 @@ Each run writes:
 | `FinalStatus` | `Planned`, `AlreadyDone`, `Success`, `Error`, `Pending`, `Skipped` |
 | `Detail`, `Warnings` | the explanation, and what to look at |
 
-**The global report.** One page per Convert batch, written at the end of every Convert, Recover and `Check -Batch` run (its path is in the next steps, and the two files are replaced at each run). It follows the batch end to end: every Convert run, every resume, every follow-up and every Recover wave, with the source of each run (which group, which list), and, for each object, its journey. The report carries no script and no external resource.
+**The global report.** One page per Convert batch, written at the end of every Convert, Recover and `Check -Batch` run (its path is in the next steps, and the three files are replaced at each run). It follows the batch end to end: every Convert run, every resume, every follow-up and every Recover wave, with the source of each run (which group, which list), and, for each object, its journey. The report has no limit: every object and every event of the journal is in it, however many there are. It is one self-contained page with no external resource and no network access. The totals, the batches, the runs and the settings of each run are plain HTML, readable even when scripts are blocked. The objects, their events and the follow-up check are stored compressed (gzip, not encrypted) and read by the script of the page in a current desktop Microsoft Edge or Google Chrome; the objects are shown through a virtual grid (at most 200 rows exist in the page), and a click on an object opens its whole journey, built from the events, in pages of 100. The page can be opened on a journey directly, with `#object=<identity or object GUID>` at the end of its address. The two CSV files hold the same data without any script: `…_global.csv` has one line per object (`ObjectGuid`, `Identity`, `Kind`, `Verdict`, `Batches`, `Stages`, `Note`, `EventCount`) and `…_global_events.csv` one line per event (`ObjectGuid`, `Identity`, `Kind`, `Time`, `Batch`, `Action`, `Step`, `Outcome`, `Detail`; the events of the batch itself have no object). Both are UTF-8 with a byte order mark, with a semicolon as separator, and a text that starts like a formula gets a leading apostrophe.
 
 ![The global report of a batch](images/report-global-light.png)
 
-Exit codes: `0` done, `1` failed (or an object is not ready for Check), `2` done, next step required (an object is *Pending*: run the same command again later). **Next steps are always printed**, also after a failure (exit code 1): what the run kept in the journal, whether anything was changed, and the exact command to run again, with the same options, in the form `.\Invoke-PraCloudMailbox.ps1 -Action …`, to run from the package folder (`-ConfigPath` is repeated only when it is not the default file). The error block of the summary lists the first five object errors, then *... and … more, see the report*, then the line that says where the run stopped. An operator who answers no to the confirmation ends the run with exit code 1, the title *… cancelled - nothing was written*, the verdict `RESULT: CANCELLED` and no error: nothing was written.
+Exit codes: `0` done, `1` failed (or an object is not ready for Check, or the run was interrupted before its end: Ctrl+C, a closed window), `2` done, next step required (an object is *Pending*: run the same command again later). **Next steps are always printed**, also after a failure (exit code 1): what the run kept in the journal, whether anything was changed, and the exact command to run again, with the same options, in the form `.\Invoke-PraCloudMailbox.ps1 -Action …`, to run from the package folder (`-ConfigPath` is repeated only when it is not the default file). The error block of the summary lists the first five object errors, then *... and … more, see the report*, then the line that says where the run stopped. An operator who answers no to the confirmation ends the run with exit code 1, the title *… cancelled - nothing was written*, the verdict `RESULT: CANCELLED` and no error: nothing was written.
 
 # Part IV · Maintain
 
@@ -699,8 +731,8 @@ Exit codes: `0` done, `1` failed (or an object is not ready for Check), `2` done
 |---|---|
 | `Invoke-PraCloudMailbox.ps1` | entry script: parameters, edition check, the package integrity bootstrap, the run context, the four actions (`Invoke-PcmCollect`, `Invoke-PcmCheck`, `Invoke-PcmCheckBatch`, `Invoke-PcmConvert`, `Invoke-PcmRecover`) and their helpers (targets, licence need, assessment of the current state, journal) |
 | `PraCloudMailbox.psd1`, `PraCloudMailbox.psm1` | the manifest (the single source of the tool version, read by `Get-PcmToolVersion`) and the root module that loads `PRA.Common` and `PRA.Store` |
-| `module\PRA.Common.psm1` | console theme, banner, steps, summary card, log, configuration (`Import-PcmConfiguration`), audit (log + transcript), results and reports (`Complete-PcmRun`), the global report, the cloud module report |
-| `module\PRA.Store.psm1` | SQLite (System.Data.SQLite in `lib\sqlite`): snapshot schema 3, journal schema 2; older stores remain readable; the `.sha256` helpers |
+| `module\PRA.Common.psm1` | console theme, banner, steps, summary card, log, configuration (`Import-PcmConfiguration`), audit (log + transcript), private creation of the data, log and report folders, results and reports (`Complete-PcmRun`), the global report (`templates\GlobalReport.template.html`), the cloud module report |
+| `module\PRA.Store.psm1` | SQLite (System.Data.SQLite in `lib\sqlite`): snapshot schema 3, journal schema 3; older stores remain readable; the `.sha256` helpers |
 | `module\PRA.Collect.psm1` | Collect (remote Exchange session): scope, mailboxes, permissions, groups expanded, contacts and distribution groups, target groups |
 | `module\PRA.Cloud.psm1` | cloud: connections (certificate or interactive), Graph with retries, tenant facts, readiness rules (`Get-PcmReadiness`, pure functions), the follow-up of a batch, source of authority, licences, permissions, case hold, Entra Connect operations |
 | `module\PRA.Gui.psm1`, `PRA.Gui.*.ps1`, `PRA.Gui.xaml` | the console (`-Gui`): the five pages, the state read from the files, the runs in a child process (chapter 13.1) |
@@ -738,6 +770,9 @@ Stop | The window creates the file `PRA_STOP_FILE`; the run checks it before eac
 
 - **Which objects** (Task page): one mailbox, everything, an OU picked from the snapshot, a group (the **Check** button runs the engine with `-Group … -ResolveOnly`), or a CSV file. A rollback wave is a ticked grid, written to `logs\gui\wave-<batch>-<time>.csv` (`Identity` = object GUID) and passed with `-CsvPath`.
 - **Schedule the daily Collect** (Collect page): a button that asks one question, then runs `-Action Schedule -Mode Apply -Force` in the child PowerShell like the other actions. The child asks for the account and its password in its own window; the console must have been started as administrator. When the run ends, the lights are read again (the light **Daily Collect**).
+- **A preview is only good for the files it was made on**: the window remembers the content of the configuration file of the run (the copy made for it and the file it comes from), of the engine, of the modules, of the list or CSV file, and the snapshot it read. If one of them changes after the preview, the next step is refused (*The run is refused: the task, the objects or the settings changed since the preview. Preview again.*) and the preview must be run again. A Check or a Convert of new objects is run with `-Snapshot <id>`: the Apply reads the snapshot the preview read, never one that a Collect wrote in between.
+- **Continue an interrupted rollback stays on its wave**: the objects of the wave that were not rolled back yet are written to a CSV file and passed with `-CsvPath`, so the continuation does not widen to the whole batch. A rollback wave that ended normally is no longer listed as interrupted. The command given in the Next steps carries the same `-CsvPath`.
+- **Thousands of objects**: the lists of the window are looked up by GUID and virtualized, and the snapshot hash and the scheduled tasks are read again only when they changed, so a preview of several thousand objects and each keystroke stay fast. The activity log says where the complete log is.
 - **Tables**: `DataTable` views, so that 21,000 objects filter as you type and the boxes bind both ways.
 - **Files**: `logs\gui\<id>.events.jsonl`, `.stop`, `.stdout.txt`, `.stderr.txt`; the wave lists are kept, the logs name them.
 - **Theme**: the buttons System / Light / Dark.
@@ -750,7 +785,7 @@ Every command of this tool has the noun prefix `Pcm`; PRA Remote Mailbox uses `P
 <!-- icon: database -->
 ## 14. The databases
 
-Two SQLite files, never mixed up: each one records its kind and the tool refuses the other. The snapshot uses **schema 3** and the journal **schema 2**; snapshots of schema 1 and 2 and the journal of schema 1 remain readable without modification (they are upgraded only when a command that writes opens them), and a snapshot without the target-group tables sends `-Group` straight to Microsoft Entra ID. Old rows do not acquire invented values.
+Two SQLite files, never mixed up: each one records its kind and the tool refuses the other. The snapshot uses **schema 3** and the journal **schema 3** (the journal of schema 3 adds the run and the content digest of the snapshot to each batch, and an index on `batch_item.object_guid`); snapshots of schema 1 and 2 and the journals of schema 1 and 2 remain readable without modification (they are upgraded only when a command that writes opens them), and a snapshot without the target-group tables sends `-Group` straight to Microsoft Entra ID. Old rows do not acquire invented values.
 
 **Snapshots** (`Store.Path`, written by Collect): `snapshot` (one row per Collect: status, dates, server, scope, counters), `mailbox`, `permission`, `group_member` (members of the groups used as trustees), `contact`, `distribution_group`, `dl_member`, `collect_issue`, `target_group` (the groups kept by Collect: name, sAMAccountName, distinguished name, SMTP address, display name, member count) and `target_member` (every member, with its class, its UPN, SMTP address, DN, the group it came through and its depth). Every data row carries its `snapshot_id`; deleting a snapshot deletes its rows. The `.sha256` beside the file is the only integrity record of the snapshot.
 
@@ -819,7 +854,16 @@ The repository tools (not in the package, PowerShell 7.5 and Microsoft Edge):
 | *Certificate … not found in Cert:\CurrentUser\My nor Cert:\LocalMachine\My.* | The certificate of the app is not on this computer, or has no private key. Import it, or use `Cloud.SignIn = 'Interactive'` |
 | *… needs a window where you can sign in, and this PowerShell was started with -NonInteractive* | An interactive sign-in cannot run in a scheduled task or a `-NonInteractive` process. Use the certificate, or open PowerShell 7 normally |
 | *… was changed after its last Collect* | The snapshot does not match its `.sha256`. Restore it from the external backup. `-AcceptUnverifiedSnapshot` only when you know why |
-| *… cannot prove it is the file written by Collect* | No `.sha256` beside the snapshot. A warning: copy the `.sha256` file with the snapshot next time |
+| *… cannot prove it is the file written by Collect* | No `.sha256` beside the snapshot. A Preview and a Check warn; a Convert or a Recover in Apply mode stops: copy the `.sha256` file with the snapshot, or `-AcceptUnverifiedSnapshot` when you know the file is the right one |
+| *Batch … was made from snapshot …, which is not in …* or *… is not the snapshot that batch … was made from* | The snapshot of the batch was deleted by Collect (beyond `Store.KeepSnapshots`) or the database was replaced. Copy the file of that snapshot from `Store.BackupFolder` over `Store.Path`, with its `.sha256`, and run the command again |
+| *Collect found no mailbox …* or *… fewer than the last complete snapshot …* | Collect refused to write a snapshot that lost its mailboxes (`Collect.MaxDropPercent`). Find out why Exchange returned fewer mailboxes, or raise the setting when the drop is expected |
+| *The Entra ID account with this UPN is probably not this person …* (`ENTRA_WRONG_OBJECT`) | The account was found by UPN only and its mailbox GUID is not the one of the snapshot. Nothing was changed on it. Fix the source anchor or the UPN in Entra ID, or leave the object out |
+| *Convert batch … cannot be resumed: Recover batch … already rolled back objects of it* | A Recover already touched this Convert batch. Do not resume it: run a new Convert (Preview first) for the objects that are not converted, with `-Identity`, `-CsvPath` or `-Group` |
+| *Convert batch … gave the Exchange plan of its users with Licensing.Users.Mode = … and the configuration now says …* | `Licensing.Users.Mode` changed between Convert and Recover. Nothing was changed. Put the mode of the batch back in the configuration, then run Recover again |
+| *… not converted: Convert never started this object* (Check `-Batch`) | The batch did not start this object (no free licence unit, a stop). Resume the Convert batch, or, after a Recover, run a new Convert for it |
+| *… object(s) followed are provisioned, but Convert batch … not Complete* | Check `-Batch` does not say "every object is provisioned" for a batch with work left. Resume the batch with `Convert -Mode Apply -Batch <id>`, then check again |
+| A run ended with `RESULT: FAIL` after Ctrl+C or a closed window | The run was interrupted before its end: the batch is *Partial*. Run the command given in the Next steps again; what was done is kept |
+| *The run is refused: the task, the objects or the settings changed since the preview* (console) | A file of the run changed after the preview. Press *Preview* again |
 | *Choose one way to say which objects* | Two of `-Identity`, `-CsvPath`, `-SearchBase`, `-Group` were given |
 | *Group … is not in snapshot … nor in Microsoft Entra.* | Check the name; add the group to `Collect.TargetGroups` and collect again; or give the object ID |
 | *This sign-in cannot read groups in Microsoft Entra ID* | None of the group-read permissions is granted: grant `GroupMember.Read.All`, or capture the group with Collect |
@@ -830,8 +874,8 @@ The repository tools (not in the package, PowerShell 7.5 and Microsoft Edge):
 | *the case hold is not stamped on the shared mailbox: identity NOT deleted* | The hold did not reach the mailbox within `HoldTimeoutMinutes`: run Recover again later. The identity is never deleted without the hold |
 | *back on-premises; case hold not stamped yet* (user *Pending*) | The user is back; the hold is still being applied: run Recover again later to check it |
 | A deleted shared object came back with its old objectId | A synchronisation ran before the permanent deletion (scheduler not paused): the tool pauses it; in `Manual` mode, pause it before confirming |
-| Recreated shared object not found | Entra Connect did not create it yet (or the AD object is missing): run a delta cycle, then Recover again |
-| An object stays *not recreated by Entra Connect yet* after several delta cycles | In the Synchronization Service Manager on the Entra Connect server, check that the metaverse object of the AD object is linked to the Entra connector (the Microsoft Entra ID connector space) |
+| Recreated shared object not found | Entra Connect did not create it yet (or the AD object is missing). The tool synchronises the object on its own after the delta cycle; if that does not bring it back, run a delta cycle, then Recover again |
+| An object stays *Entra Connect did not recreate it … run a full synchronisation on the Entra Connect server* | A delta cycle and a synchronisation of the object alone did not bring the identity back. Run `Start-ADSyncSyncCycle -PolicyType Initial` on the Entra Connect server (the Next steps of the run say so), wait for it to end, then run the Recover command of the Next steps again. If the object is still missing, check in the Synchronization Service Manager that the metaverse object of the AD object is linked to the Entra connector (the Microsoft Entra ID connector space) |
 | *Entra Connect is busy with another synchronization cycle* | The delta cycle could not start after three attempts, one minute apart. Wait for the running cycle to end, then run `Recover -Batch <ID>` again: what is done is never repeated |
 | *Package integrity: …* | A file of the package is unsigned, changed, missing or unexpected (chapter 5). Download the package again; never bypass the check |
 | `-Action Schedule` says that the account is a computer account, a gMSA, SYSTEM or a local account | Exchange remote PowerShell refuses them, so Collect cannot run as one of them. Use a standard domain user account in the role group *View-Only Organization Management* |

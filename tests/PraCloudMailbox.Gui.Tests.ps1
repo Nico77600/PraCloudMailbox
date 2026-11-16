@@ -7,7 +7,7 @@
     observations as one JSON line.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0
+    Version : 2.1.0
 #>
 #Requires -Version 7.5
 
@@ -298,6 +298,17 @@ Describe 'Console: what this computer can do' {
         Get-PcmGuiNetworkWhy (& $wrap (& $socket 10060)) | Should -BeLike 'no answer from the network*'
         Get-PcmGuiNetworkWhy ([InvalidOperationException]::new('boom')) | Should -Be 'boom'
     }
+    It 'reads a hook that the window was not given as no hook, whatever the letter case, without a strict-mode error' {
+        $answer = & $script:Gui {
+            $saved = $script:Gui
+            try {
+                $script:Gui = @{ Hooks = @{ Question = { $true } } }
+                [pscustomobject]@{ Given = [bool](Get-PcmGuiHook 'QUESTION'); Absent = ($null -eq (Get-PcmGuiHook 'NoConsole')) }
+            } finally { $script:Gui = $saved }
+        }
+        $answer.Given | Should -BeTrue
+        $answer.Absent | Should -BeTrue
+    }
     It 'decides Ok, Partial or Fail from the answers, and writes the light' {
         $good = [pscustomobject]@{ Host = 'login.microsoftonline.com'; Ok = $true; Why = '' }
         $bad = [pscustomobject]@{ Host = 'outlook.office365.com'; Ok = $false; Why = 'no answer within 3 seconds' }
@@ -307,6 +318,8 @@ Describe 'Console: what this computer can do' {
         (Get-PcmGuiNetworkLight -State 'Partial' -Answers @($good, $bad)).Detail | Should -BeLike '*outlook.office365.com does not answer*no answer within 3 seconds*'
         (Get-PcmGuiNetworkLight -State 'Ok' -Answers @($good, $good)).Status | Should -Be 'Ok'
         (Get-PcmGuiNetworkLight -State 'Checking').Status | Should -Be 'Info'
+        (Get-PcmGuiNetworkLight -State 'Checking' -Answers $null).Status | Should -Be 'Info'
+        (Get-PcmGuiNetworkLight -State 'Fail' -Answers $null).Status | Should -Be 'Fail'
     }
     It 'tests the two Microsoft 365 hosts with tasks that never block the window (answers, timeouts and failures)' {
         $done = [Threading.Tasks.Task]::FromResult([object]::new())
@@ -446,8 +459,7 @@ Describe 'Console: the snapshot, the journal and the lookups' {
         ($back | Where-Object { $_.BatchId -eq '1a2b3c4d' }).State | Should -Be 'Can be rolled back'
         ($back | Where-Object { $_.BatchId -eq '9c8d7e6f' }).State | Should -Be 'Partly rolled back'
         $interrupted = @(Get-PcmGuiBatchEntry -State $script:State -Kind ContinueRollback)
-        $interrupted.Count | Should -Be 1
-        $interrupted[0].BatchId | Should -Be '9c8d7e6f'
+        $interrupted.Count | Should -Be 0
         @(Get-PcmGuiBatchEntry -State $script:State -Kind Follow).Count | Should -Be 4
     }
     It 'lists for a wave the mailboxes of a batch that are still in the cloud' {
@@ -1290,5 +1302,459 @@ Describe 'Console: the window files' {
             $text | Should -Not -Match 'classic controls|ConnectionMode|Exchange tools|\.Fluent\b' -Because $name
             $text | Should -Not -Match 'WindowsPowerShell\\v1\.0' -Because $name
         }
+    }
+}
+
+Describe 'Console: continuing a rollback stays on the wave that was interrupted' {
+    BeforeAll {
+        function script:New-TestBatch {
+            param([string]$Id, [string]$Action, [string]$Convert, [string]$Status, [int]$Hours = 5)
+            [pscustomobject]@{ id = $Id; action = $Action; convert_batch = $Convert; status = $Status; created_utc = [datetime]::UtcNow.AddHours(-$Hours).ToString('o'); snapshot_id = 7; environment = 'PROD'; account = 'CONTOSO\operator' }
+        }
+        function script:New-TestItem {
+            param([string]$Batch, [int]$Number, [string]$Status, [string]$Step = 'Mailbox')
+            [pscustomobject]@{ batch_id = $Batch; object_guid = ('{0:x8}-0000-0000-0000-{0:x12}' -f $Number); kind = 'User'; identity = ('user{0}@contoso.com' -f $Number); step = $Step; status = $Status; message = '' }
+        }
+        function script:New-TestState {
+            param([object[]]$Batches, [object[]]$Items)
+            [pscustomobject]@{ Batches = $Batches; Items = $Items; Objects = @(); Config = $null; JournalError = '' }
+        }
+        function script:Get-TestConvert { 1..10 | ForEach-Object { New-TestItem 'c0c0c0c0' $_ 'Done' } }
+        function script:Invoke-TestCarry {
+            param($State, $Request, [string]$BatchId, [string]$Root)
+            & $script:Gui { param($s, $r, $b, $folder) $old = $script:Gui; $script:Gui = [pscustomobject]@{ State = $s; Root = $folder }; try { Get-PcmGuiRollbackCarry -Request $r -BatchId $b } finally { $script:Gui = $old } } $State $Request $BatchId $Root
+        }
+    }
+    It 'does not list a wave that finished normally as an interrupted rollback' {
+        $state = New-TestState @((New-TestBatch 'c0c0c0c0' 'Convert' '' 'Complete' 9), (New-TestBatch 'a1a1a1a1' 'Recover' 'c0c0c0c0' 'Partial')) (@(Get-TestConvert) + @(1..3 | ForEach-Object { New-TestItem 'a1a1a1a1' $_ 'Done' 'RecoverUser' }))
+        @(Get-PcmGuiBatchEntry -State $state -Kind ContinueRollback).Count | Should -Be 0
+        $new = @(Get-PcmGuiBatchEntry -State $state -Kind Rollback)
+        $new[0].State | Should -Be 'Partly rolled back'
+        $new[0].Selectable | Should -BeTrue
+    }
+    It 'lists an interrupted wave with the objects it still has to roll back, and only those' {
+        $items = @(Get-TestConvert) + @(1..3 | ForEach-Object { New-TestItem 'a1a1a1a1' $_ 'Done' 'RecoverUser' }) + @(4..5 | ForEach-Object { New-TestItem 'a1a1a1a1' $_ 'Running' 'RecoverUser' })
+        $state = New-TestState @((New-TestBatch 'c0c0c0c0' 'Convert' '' 'Complete' 9), (New-TestBatch 'a1a1a1a1' 'Recover' 'c0c0c0c0' 'Partial')) $items
+        $entry = @(Get-PcmGuiBatchEntry -State $state -Kind ContinueRollback)
+        $entry.Count | Should -Be 1
+        $entry[0].BatchId | Should -Be 'c0c0c0c0'
+        $entry[0].Selectable | Should -BeTrue
+        $entry[0].Sub | Should -BeLike '*2 of the interrupted wave still in the cloud*'
+        @($entry[0].Wave | ForEach-Object { $_.Name }) | Should -Be @('user4@contoso.com', 'user5@contoso.com')
+    }
+    It 'carries no wave when the interrupted rollback was the whole batch' {
+        $items = @(Get-TestConvert) + @(1..4 | ForEach-Object { New-TestItem 'a1a1a1a1' $_ 'Done' 'RecoverUser' }) + @(5..10 | ForEach-Object { New-TestItem 'a1a1a1a1' $_ 'Running' 'RecoverUser' })
+        $state = New-TestState @((New-TestBatch 'c0c0c0c0' 'Convert' '' 'Complete' 9), (New-TestBatch 'a1a1a1a1' 'Recover' 'c0c0c0c0' 'Partial')) $items
+        $entry = @(Get-PcmGuiBatchEntry -State $state -Kind ContinueRollback)
+        $entry.Count | Should -Be 1
+        @($entry[0].Wave).Count | Should -Be 0
+        $entry[0].Sub | Should -BeLike '*6 still in the cloud*'
+    }
+    It 'lists a rollback that did not end or failed, in any letter case of the batch ID' -TestCases @(
+        @{ Status = 'Running' }, @{ Status = 'Failed' }) {
+        param($Status)
+        $state = New-TestState @((New-TestBatch 'c0c0c0c0' 'Convert' '' 'Complete' 9), (New-TestBatch 'a1a1a1a1' 'Recover' 'C0C0C0C0' $Status)) (@(Get-TestConvert) + @(New-TestItem 'A1A1A1A1' 1 'Failed' 'RecoverUser'))
+        $entry = @(Get-PcmGuiBatchEntry -State $state -Kind ContinueRollback)
+        $entry.Count | Should -Be 1
+        $entry[0].Sub | Should -BeLike '*still in the cloud*'
+    }
+    It 'gives the command that continues a wave the CSV file of the objects still to roll back' {
+        $items = @(Get-TestConvert) + @(1..3 | ForEach-Object { New-TestItem 'a1a1a1a1' $_ 'Done' 'RecoverUser' }) + @(4..5 | ForEach-Object { New-TestItem 'a1a1a1a1' $_ 'Running' 'RecoverUser' })
+        $state = New-TestState @((New-TestBatch 'c0c0c0c0' 'Convert' '' 'Complete' 9), (New-TestBatch 'a1a1a1a1' 'Recover' 'c0c0c0c0' 'Partial')) $items
+        $request = New-PcmGuiRequest -Action Recover -Mode Apply -Batch 'c0c0c0c0'
+        $carry = Invoke-TestCarry -State $state -Request $request -BatchId 'c0c0c0c0' -Root (Join-Path $TestDrive 'carry-root')
+        Test-Path -LiteralPath $carry.CsvPath | Should -BeTrue
+        @(Import-Csv -LiteralPath $carry.CsvPath | ForEach-Object { $_.Identity }) | Should -Be @(('{0:x8}-0000-0000-0000-{0:x12}' -f 4), ('{0:x8}-0000-0000-0000-{0:x12}' -f 5))
+        $command = (Get-PcmGuiCommand -Root $script:Root -ConfigPath 'c.psd1' -Request (New-PcmGuiRequest -Action Recover -Mode Preview -Batch 'c0c0c0c0' -CsvPath $carry.CsvPath) -Engine 'pwsh.exe').Display
+        $command | Should -BeLike '*-Action Recover*-Batch c0c0c0c0 -CsvPath*wave-c0c0c0c0-*.csv*'
+    }
+    It 'carries nothing when the whole batch is still to roll back, and the selection of the run when the journal has no object of it' {
+        $whole = New-TestState @((New-TestBatch 'c0c0c0c0' 'Convert' '' 'Complete' 9), (New-TestBatch 'a1a1a1a1' 'Recover' 'c0c0c0c0' 'Partial')) (@(Get-TestConvert) + @(1..10 | ForEach-Object { New-TestItem 'a1a1a1a1' $_ 'Running' 'RecoverUser' }))
+        (Invoke-TestCarry -State $whole -Request (New-PcmGuiRequest -Action Recover -Mode Apply -Batch 'c0c0c0c0') -BatchId 'c0c0c0c0' -Root $TestDrive).Count | Should -Be 0
+        $none = New-TestState @((New-TestBatch 'c0c0c0c0' 'Convert' '' 'Complete' 9)) (Get-TestConvert)
+        $carry = Invoke-TestCarry -State $none -Request (New-PcmGuiRequest -Action Recover -Mode Apply -Batch 'c0c0c0c0' -CsvPath 'D:\waves\wave1.csv' -Scope UsersOnly) -BatchId 'C0C0C0C0' -Root $TestDrive
+        $carry.CsvPath | Should -Be 'D:\waves\wave1.csv'
+        $carry.Scope | Should -Be 'UsersOnly'
+        $carry.ContainsKey('Batch') | Should -BeFalse
+        (Invoke-TestCarry -State $none -Request (New-PcmGuiRequest -Action Recover -Mode Apply -Batch 'c0c0c0c0' -MaxObjects 5) -BatchId 'c0c0c0c0' -Root $TestDrive).Count | Should -Be 0
+    }
+}
+
+Describe 'Console: the real window continues an interrupted wave of a rollback on the same objects' {
+    BeforeAll {
+        $script:Continue = Invoke-GuiChild -Body @'
+$o = [ordered]@{}
+$journal = Open-PcmStore -Path (Join-Path $root 'data\PraCloudMailbox-journal.db') -Root $root -Kind Journal
+try {
+    $null = Invoke-PcmSql $journal 'INSERT INTO batch (id, action, convert_batch, status, created_utc, updated_utc, snapshot_id, environment, computer, account, tool_version) VALUES (@id, @a, @c, @s, @t, @t, @n, @e, @m, @u, @v)' @{ id = 'cd56ef78'; a = 'Recover'; c = '1a2b3c4d'; s = 'Partial'; t = [datetime]::UtcNow.AddHours(-1); n = $fixture.Snapshot; e = 'PROD'; m = 'SRV-PRA01'; u = 'CONTOSO\pra.operator'; v = '2.0.0' }
+    $number = 0
+    foreach ($object in @($fixture.Objects | Select-Object -First 5)) {
+        $number++
+        $null = Invoke-PcmSql $journal 'INSERT INTO batch_item (batch_id, object_guid, kind, identity, step, status, updated_utc) VALUES (@b, @o, @k, @i, @s, @t, @u)' @{ b = 'cd56ef78'; o = $object.guid; k = $object.kind; i = $object.upn; s = 'RecoverUser'; t = $(if ($number -le 3) { 'Done' } else { 'Running' }); u = [datetime]::UtcNow }
+    }
+} finally { Close-PcmStore $journal }
+Mod { Update-PcmGuiState }
+Click 'BtnNext'; Check 'T_Recover'; Check 'Mode_Continue'
+$o.rows = @($g.BatchRows | ForEach-Object { '{0}|{1}|{2}|{3}' -f $_.BatchId, $_.State, $_.Selectable, @($_.Wave).Count })
+$c.BatchList.SelectedItem = @($g.BatchRows | Where-Object { $_.BatchId -eq '1a2b3c4d' })[0]; Pump 50
+$request = Mod { Get-PcmGuiWindowRequest -Mode Preview }
+$o.requestCsv = [string]$request.CsvPath
+$o.waveIds = @(Import-Csv -LiteralPath $request.CsvPath | ForEach-Object { $_.Identity })
+$o.expected = @($fixture.Objects | Select-Object -Skip 3 -First 2 | ForEach-Object { $_.guid })
+$o.preview = [string](Mod { Get-PcmGuiCommandPreview })
+Click 'BtnNext'; Click 'BtnPreview'; WaitRun
+$a = Args_
+$o.engine = @{ Action = $a.Action; Batch = $a.Batch; Csv = [bool]$a.CsvPath }
+$o.engineIds = @(Import-Csv -LiteralPath (Join-Path $root 'wave-copy.csv') | ForEach-Object { $_.Identity })
+Done $o
+'@
+    }
+    It 'lists the interrupted wave with its own objects' {
+        @($script:Continue.rows) | Should -Contain '1a2b3c4d|Can be continued|True|2'
+    }
+    It 'asks the engine for the batch with the CSV file of the wave, never for the whole batch' {
+        $script:Continue.requestCsv | Should -BeLike '*wave-1a2b3c4d-*.csv'
+        @($script:Continue.waveIds) | Should -Be @($script:Continue.expected)
+        $script:Continue.preview | Should -BeLike '*-Action Recover*-Batch 1a2b3c4d -CsvPath*'
+        $script:Continue.engine.Action | Should -Be 'Recover'
+        $script:Continue.engine.Batch | Should -Be '1a2b3c4d'
+        $script:Continue.engine.Csv | Should -BeTrue
+        @($script:Continue.engineIds) | Should -Be @($script:Continue.expected)
+    }
+}
+
+Describe 'Console: a preview is only good for the files it was made on' {
+    BeforeAll {
+        $script:KeyTool = New-DocumentationToolCopy -Repository $script:Repo -Destination (Join-Path $TestDrive 'key-tool')
+        $script:KeyFixture = New-ConsoleFixture -ToolRoot $script:KeyTool
+        $script:KeyState = Read-PcmGuiState -Root $script:KeyTool -ConfigPath $script:KeyFixture.Config
+        function script:Get-TestKey {
+            param($Request, $Config = $null)
+            if (-not $Config) { $Config = [pscustomobject]@{ Path = $script:KeyFixture.Config; Base = ''; Hash = ''; Keys = @() } }
+            & $script:Gui { param($state, $root, $r, $c) $old = $script:Gui; $script:Gui = [pscustomobject]@{ State = $state; Root = $root }; try { Get-PcmGuiRunKey -Request $r -Config $c } finally { $script:Gui = $old } } $script:KeyState $script:KeyTool $Request $Config
+        }
+        function script:Invoke-TestPin {
+            param($Request, $Pending = $null)
+            & $script:Gui { param($state, $root, $r, $p) $old = $script:Gui; $script:Gui = [pscustomobject]@{ State = $state; Root = $root }; try { Set-PcmGuiSnapshotPin -Request $r -Pending $p } finally { $script:Gui = $old } } $script:KeyState $script:KeyTool $Request $Pending
+        }
+        $script:KeyCsv = Join-Path $TestDrive 'targets.csv'
+        [IO.File]::WriteAllText($script:KeyCsv, "Identity`r`nadele.vance@contoso.com`r`n")
+    }
+    It 'gives the same key twice for the same files' {
+        $request = New-PcmGuiRequest -Action Convert -Mode Preview -CsvPath $script:KeyCsv
+        (Get-TestKey $request) | Should -Be (Get-TestKey $request)
+        (Get-TestKey (New-PcmGuiRequest -Action Convert -Mode Apply -CsvPath $script:KeyCsv)) | Should -Be (Get-TestKey $request)
+    }
+    It 'changes the key when the configuration file of the run changes on disk, even with no setting changed in the window' {
+        $request = New-PcmGuiRequest -Action Convert -Mode Preview
+        $before = Get-TestKey $request
+        $original = [IO.File]::ReadAllBytes($script:KeyFixture.Config)
+        try {
+            [IO.File]::AppendAllText($script:KeyFixture.Config, "`r`n# edited`r`n")
+            (Get-TestKey $request) | Should -Not -Be $before
+        } finally { [IO.File]::WriteAllBytes($script:KeyFixture.Config, $original) }
+        (Get-TestKey $request) | Should -Be $before
+    }
+    It 'changes the key when the snapshot file changes on disk, for the actions that read it' -TestCases @(
+        @{ Action = 'Convert' }, @{ Action = 'Check' }) {
+        param($Action)
+        $request = New-PcmGuiRequest -Action $Action -Mode Preview
+        $db = $script:KeyState.Config.Store.Path
+        $before = Get-TestKey $request
+        $original = [IO.File]::ReadAllBytes($db)
+        try {
+            $changed = [byte[]]$original.Clone(); $changed[$changed.Length - 1] = [byte](($changed[$changed.Length - 1] + 1) % 256)
+            [IO.File]::WriteAllBytes($db, $changed)
+            (Get-TestKey $request) | Should -Not -Be $before
+        } finally { [IO.File]::WriteAllBytes($db, $original) }
+    }
+    It 'does not look at the snapshot file for a Collect, which writes it' {
+        $request = New-PcmGuiRequest -Action Collect -Mode Preview
+        $db = $script:KeyState.Config.Store.Path
+        $before = Get-TestKey $request
+        $original = [IO.File]::ReadAllBytes($db)
+        try {
+            $changed = [byte[]]$original.Clone(); $changed[$changed.Length - 1] = [byte](($changed[$changed.Length - 1] + 1) % 256)
+            [IO.File]::WriteAllBytes($db, $changed)
+            (Get-TestKey $request) | Should -Be $before
+        } finally { [IO.File]::WriteAllBytes($db, $original) }
+    }
+    It 'changes the key when the CSV file that lists the objects changes' {
+        $request = New-PcmGuiRequest -Action Convert -Mode Preview -CsvPath $script:KeyCsv
+        $before = Get-TestKey $request
+        [IO.File]::WriteAllText($script:KeyCsv, "Identity`r`nadele.vance@contoso.com`r`nalex.wilber@contoso.com`r`n")
+        (Get-TestKey $request) | Should -Not -Be $before
+    }
+    It 'changes the key when the engine or a module changes (checked on a copy)' {
+        $request = New-PcmGuiRequest -Action Convert -Mode Preview
+        $before = Get-TestKey $request
+        $module = Join-Path $script:KeyTool 'module\PRA.Gui.Detect.ps1'
+        $original = [IO.File]::ReadAllBytes($module)
+        try {
+            [IO.File]::AppendAllText($module, "`r`n# edited`r`n")
+            (Get-TestKey $request) | Should -Not -Be $before
+        } finally { [IO.File]::WriteAllBytes($module, $original) }
+    }
+    It 'gives the previewed snapshot ID to the run, whatever is written after the preview' {
+        $latest = & $script:Gui { param($state, $root) $old = $script:Gui; $script:Gui = [pscustomobject]@{ State = $state; Root = $root }; try { Get-PcmGuiLatestSnapshotId } finally { $script:Gui = $old } } $script:KeyState $script:KeyTool
+        $latest | Should -Be 42
+        $pinned = Invoke-TestPin (New-PcmGuiRequest -Action Convert -Mode Preview)
+        $pinned.Snapshot | Should -Be 42
+        (Get-PcmGuiCommand -Root $script:KeyTool -ConfigPath 'c.psd1' -Request $pinned -Engine 'pwsh.exe').Display | Should -BeLike '*-Action Convert -Mode Preview -Snapshot 42*'
+        $applied = Invoke-TestPin (New-PcmGuiRequest -Action Convert -Mode Apply) @{ Request = $pinned }
+        $applied.Snapshot | Should -Be 42
+    }
+    It 'leaves alone a request that names a snapshot or a batch, and the actions that do not take -Snapshot' {
+        (Invoke-TestPin (New-PcmGuiRequest -Action Convert -Mode Preview -Snapshot 9)).Snapshot | Should -Be 9
+        (Invoke-TestPin (New-PcmGuiRequest -Action Convert -Mode Preview -Batch 'abcd1234')).Snapshot | Should -Be 0
+        (Invoke-TestPin (New-PcmGuiRequest -Action Recover -Mode Preview -Batch 'abcd1234')).Snapshot | Should -Be 0
+        (Invoke-TestPin (New-PcmGuiRequest -Action Collect -Mode Preview)).Snapshot | Should -Be 0
+    }
+}
+
+Describe 'Console: the real window refuses a run whose preview is out of date' {
+    BeforeAll {
+        $script:Stale = Invoke-GuiChild -Body @'
+$o = [ordered]@{}
+Click 'BtnNext'; Check 'T_Convert'; Check 'S_Source_Group'; Enter 'F_Group' 'pra-wave1'
+Click 'BtnNext'; Click 'BtnPreview'; WaitRun
+$o.previewSnapshot = [string](Args_).Snapshot
+$o.logHeader = [string]$c.LogExpander.Header.Text
+$o.previewed = $g.Previewed
+Enter 'ConfirmBox' 'convert'
+Add-Content -LiteralPath $fixture.Config -Value '# edited after the preview'
+$o.refusedConfig = ''; try { Mod { Start-PcmGuiRun -Mode Apply } } catch { $o.refusedConfig = $_.Exception.Message }
+$o.pendingAfterConfig = [bool]$g.Pending
+Click 'BtnPreview'; WaitRun
+Enter 'ConfirmBox' 'convert'
+$db = Join-Path $root 'data\PraCloudMailbox.db'
+$bytes = [IO.File]::ReadAllBytes($db); $original = [byte[]]$bytes.Clone()
+$bytes[$bytes.Length - 1] = [byte](($bytes[$bytes.Length - 1] + 1) % 256); [IO.File]::WriteAllBytes($db, $bytes); $null = Write-PcmHashFile -Path $db
+$o.refusedSnapshot = ''; try { Mod { Start-PcmGuiRun -Mode Apply } } catch { $o.refusedSnapshot = $_.Exception.Message }
+[IO.File]::WriteAllBytes($db, $original); $null = Write-PcmHashFile -Path $db
+Click 'BtnPreview'; WaitRun
+Enter 'ConfirmBox' 'convert'
+$o.runEnabled = $c.BtnNext.IsEnabled
+Click 'BtnNext'; WaitRun
+$a = Args_
+$o.apply = @{ Mode = $a.Mode; Snapshot = [string]$a.Snapshot; Force = $a.Force }
+Done $o
+'@
+    }
+    It 'previews and runs on the snapshot the preview read, by its ID' {
+        $script:Stale.previewSnapshot | Should -Be '42'
+        $script:Stale.apply.Mode | Should -Be 'Apply'
+        $script:Stale.apply.Snapshot | Should -Be '42'
+        $script:Stale.apply.Force | Should -BeTrue
+    }
+    It 'refuses the run after the configuration file changed, and asks for a new preview' {
+        $script:Stale.previewed | Should -BeTrue
+        $script:Stale.refusedConfig | Should -BeLike '*changed since the preview. Preview again*'
+        $script:Stale.pendingAfterConfig | Should -BeFalse
+    }
+    It 'refuses the run after the snapshot file changed' {
+        $script:Stale.refusedSnapshot | Should -BeLike '*changed since the preview. Preview again*'
+        $script:Stale.runEnabled | Should -BeTrue
+    }
+    It 'tells where the complete log is, since the activity log keeps the last 2,000 lines' {
+        $script:Stale.logHeader | Should -BeLike '*the last 2000 lines*complete log is in*'
+    }
+}
+
+Describe 'Console: the CSV report of a run is read as the report writes it' {
+    BeforeAll {
+        $script:ReportFolder = Join-Path $TestDrive 'report'
+        $null = New-Item -ItemType Directory -Path $script:ReportFolder
+        $script:Hostile = @("=HYPERLINK(""http://x"")", '+33 1 23 45', '-1', '@SUM(A1)', "`tTabbed", "`rReturned")
+    }
+    It 'removes the apostrophe the report puts before = + - @ TAB and CR, and nothing else' {
+        foreach ($value in $script:Hostile) {
+            (& $script:Gui { param($v) Remove-PcmGuiCsvGuard $v } ("'" + $value)) | Should -Be $value
+        }
+        foreach ($value in @('plain', "'quoted", '', "it's", '=not guarded', '''x=1')) {
+            (& $script:Gui { param($v) Remove-PcmGuiCsvGuard $v } $value) | Should -Be $value
+        }
+        (& $script:Gui { Remove-PcmGuiCsvGuard $null }) | Should -BeNullOrEmpty
+    }
+    It 'reads a report with the guard and the byte order mark, as the engine writes it' {
+        $path = Join-Path $script:ReportFolder 'guarded.csv'
+        $rows = foreach ($value in $script:Hostile) { [pscustomobject]@{ Identity = 'user@contoso.com'; FinalStatus = 'Success'; Detail = ("'" + $value) } }
+        $rows | Export-Csv -LiteralPath $path -Delimiter ';' -Encoding utf8BOM -NoTypeInformation
+        [IO.File]::ReadAllBytes($path)[0..2] | Should -Be @(239, 187, 191)
+        $read = @(& $script:Gui { param($p) Read-PcmGuiReport $p } $path)
+        $read.Count | Should -Be $script:Hostile.Count
+        @($read | ForEach-Object { $_.Detail }) | Should -Be $script:Hostile
+        $read[0].Identity | Should -Be 'user@contoso.com'
+    }
+    It 'reads a report of the earlier edition, with no guard and no byte order mark, as it is' {
+        $path = Join-Path $script:ReportFolder 'old.csv'
+        $text = "Identity;FinalStatus;Detail`r`nuser@contoso.com;Success;'quoted`r`nuser2@contoso.com;Error;=value`r`n"
+        [IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding($false)))
+        $read = @(& $script:Gui { param($p) Read-PcmGuiReport $p } $path)
+        $read.Count | Should -Be 2
+        $read[0].Detail | Should -Be "'quoted"
+        $read[1].Detail | Should -Be '=value'
+        $read[1].Identity | Should -Be 'user2@contoso.com'
+    }
+}
+
+Describe 'Console: a big preview does not freeze the window (2,500 objects, no window needed)' {
+    BeforeAll {
+        $script:Count = 2500
+        $script:Big = [pscustomobject]@{
+            Objects = @(1..$script:Count | ForEach-Object {
+                    [pscustomobject]@{ object_guid = ('{0:x8}-0000-0000-0000-{0:x12}' -f $_); kind = 'User'; user_principal_name = ('user{0}@contoso.com' -f $_); primary_smtp_address = ('user{0}@contoso.com' -f $_)
+                        sam_account_name = ('user{0}' -f $_); name = ('User {0}' -f $_); display_name = ('User {0}' -f $_)
+                        distinguished_name = ('CN=User {0},OU=Site{1},DC=contoso,DC=com' -f $_, ($_ % 20)); organizational_unit = ('contoso.com/Site{0}' -f ($_ % 20)) }
+                })
+            Items = @(); Batches = @(); Config = $null
+        }
+    }
+    It 'builds the preview rows of 2,500 objects in seconds, with one lookup by object ID each' {
+        $rows = foreach ($object in $script:Big.Objects) { [pscustomobject]@{ FinalStatus = 'Planned'; Warnings = ''; Detail = ''; Kind = 'User'; Identity = $object.user_principal_name; ObjectGuid = $object.object_guid.ToUpperInvariant() } }
+        $time = Measure-Command {
+            $built = & $script:Gui { param($state, $csv) $old = $script:Gui; $script:Gui = [pscustomobject]@{ State = $state }; try { foreach ($row in $csv) { ConvertTo-PcmGuiObjectRow $row } } finally { $script:Gui = $old } } $script:Big $rows
+            $script:Built = @($built)
+        }
+        $script:Built.Count | Should -Be $script:Count
+        $script:Built[1233].Name | Should -Be 'User 1234'
+        $time.TotalSeconds | Should -BeLessThan 20
+    }
+    It 'returns the row itself, with its values, not the pairs of its properties' {
+        $row = & $script:Gui {
+            $model = @{ Objects = @{}; ObjectIndex = @{} }
+            Add-PcmGuiModelObject -Model $model -StepId 's5' -Row (New-PcmGuiRow @{ Name = 'user1@contoso.com'; Result = 'mailbox ready'; Status = 'Ok' })
+            Get-PcmGuiModelObject -Model $model -StepId 's5' -Identity 'USER1@contoso.com'
+        }
+        $row.Result | Should -Be 'mailbox ready'
+        $row.Status | Should -Be 'Ok'
+    }
+    It 'finds the row of an object of a step by its identity without reading the list' {
+        $time = Measure-Command {
+            $found = & $script:Gui {
+                param($count)
+                $model = @{ Objects = @{}; ObjectIndex = @{} }
+                foreach ($i in 1..$count) { Add-PcmGuiModelObject -Model $model -StepId 's5' -Row (New-PcmGuiRow @{ Name = ('user{0}@contoso.com' -f $i); Status = 'Running' }) }
+                $hits = 0
+                foreach ($i in 1..$count) { if (Get-PcmGuiModelObject -Model $model -StepId 's5' -Identity ('USER{0}@Contoso.com' -f $i)) { $hits++ } }
+                [pscustomobject]@{ Hits = $hits; Listed = $model.Objects['s5'].Count; Unknown = [bool](Get-PcmGuiModelObject -Model $model -StepId 's5' -Identity 'nobody@contoso.com'); NoStep = [bool](Get-PcmGuiModelObject -Model $model -StepId 's9' -Identity 'x') }
+            } $script:Count
+        }
+        $found.Hits | Should -Be $script:Count
+        $found.Listed | Should -Be $script:Count
+        $found.Unknown | Should -BeFalse
+        $found.NoStep | Should -BeFalse
+        $time.TotalSeconds | Should -BeLessThan 20
+    }
+    It 'looks up mailboxes and OUs of a big snapshot quickly, letter case ignored' {
+        $time = Measure-Command {
+            foreach ($i in 1..100) {
+                @(Find-PcmGuiMailbox -State $script:Big -Text ('USER{0}@contoso.com' -f ($i * 20))).Count | Should -Be 1
+                @(Get-PcmGuiOuMatch -State $script:Big -Text 'CONTOSO.COM/site3').Count | Should -Be ($script:Count / 20)
+            }
+        }
+        $time.TotalSeconds | Should -BeLessThan 30
+    }
+    It 'sums up the batches and builds the lists of 2,500 objects in seconds' {
+        $batches = @([pscustomobject]@{ id = 'c0c0c0c0'; action = 'Convert'; convert_batch = ''; status = 'Complete'; created_utc = [datetime]::UtcNow.AddHours(-3).ToString('o'); snapshot_id = 7; environment = 'PROD'; account = 'x' })
+        $items = @(1..$script:Count | ForEach-Object { [pscustomobject]@{ batch_id = 'c0c0c0c0'; object_guid = ('{0:x8}-0000-0000-0000-{0:x12}' -f $_); kind = 'User'; identity = ('user{0}@contoso.com' -f $_); step = 'Mailbox'; status = 'Done'; message = '' } })
+        $state = [pscustomobject]@{ Batches = $batches; Items = $items; Objects = $script:Big.Objects; Config = $null }
+        $time = Measure-Command {
+            (@(Get-PcmGuiBatchSummary -State $state))[0].Waiting | Should -Be $script:Count
+            @(Get-PcmGuiBatchEntry -State $state -Kind Follow).Count | Should -Be 1
+            @(Get-PcmGuiWaveRow -State $state -BatchId 'c0c0c0c0').Count | Should -Be $script:Count
+        }
+        $time.TotalSeconds | Should -BeLessThan 20
+    }
+    It 'reads the report of 2,500 objects in seconds' {
+        $path = Join-Path $TestDrive 'big.csv'
+        1..$script:Count | ForEach-Object { [pscustomobject]@{ Identity = ('user{0}@contoso.com' -f $_); FinalStatus = 'Planned'; Detail = ("'=x{0}" -f $_) } } | Export-Csv -LiteralPath $path -Delimiter ';' -Encoding utf8BOM -NoTypeInformation
+        $time = Measure-Command { $script:BigRead = @(& $script:Gui { param($p) Read-PcmGuiReport $p } $path) }
+        $script:BigRead.Count | Should -Be $script:Count
+        $script:BigRead[9].Detail | Should -Be '=x10'
+        $time.TotalSeconds | Should -BeLessThan 20
+    }
+}
+
+Describe 'Console: the snapshot and the scheduled tasks are not read again at every keystroke' {
+    BeforeAll {
+        $script:CacheTool = New-DocumentationToolCopy -Repository $script:Repo -Destination (Join-Path $TestDrive 'cache-tool')
+        $script:CacheFixture = New-ConsoleFixture -ToolRoot $script:CacheTool
+        $script:CacheState = Read-PcmGuiState -Root $script:CacheTool -ConfigPath $script:CacheFixture.Config
+    }
+    It 'hashes the snapshot file once, and again only when its length or its time of last write changes' {
+        $first = Get-PcmGuiSnapshotInfo -State $script:CacheState
+        $first.Integrity | Should -Be 'Verified'
+        $path = $first.Path
+        # Same length, same time of last write: the answer is kept, so the file is not read again.
+        $time = (Get-Item -LiteralPath $path).LastWriteTimeUtc
+        $bytes = [IO.File]::ReadAllBytes($path); $bytes[$bytes.Length - 1] = [byte](($bytes[$bytes.Length - 1] + 1) % 256)
+        [IO.File]::WriteAllBytes($path, $bytes); (Get-Item -LiteralPath $path).LastWriteTimeUtc = $time
+        (Get-PcmGuiSnapshotInfo -State $script:CacheState).Integrity | Should -Be 'Verified'
+        # A new time of last write: the file is hashed again and found changed.
+        (Get-Item -LiteralPath $path).LastWriteTimeUtc = $time.AddSeconds(5)
+        (Get-PcmGuiSnapshotInfo -State $script:CacheState).Integrity | Should -Be 'Changed'
+        # Restored: verified again.
+        $bytes[$bytes.Length - 1] = [byte](($bytes[$bytes.Length - 1] + 255) % 256); [IO.File]::WriteAllBytes($path, $bytes)
+        (Get-PcmGuiSnapshotInfo -State $script:CacheState).Integrity | Should -Be 'Verified'
+    }
+    It 'lists the scheduled tasks once a minute at most, and again when asked to refresh' {
+        $calls = & $script:Gui {
+            $script:GuiTaskCache = $null
+            $counter = @{ N = 0 }
+            function Find-PcmGuiCollectTask { $counter.N++; [pscustomobject]@{ Found = $false; Text = '' } }
+            $null = Get-PcmGuiCollectTask; $null = Get-PcmGuiCollectTask; $null = Get-PcmGuiCollectTask
+            $afterThree = $counter.N
+            $null = Get-PcmGuiCollectTask -Refresh
+            $script:GuiTaskCache = $null
+            Remove-Item Function:\Find-PcmGuiCollectTask
+            [pscustomobject]@{ AfterThree = $afterThree; AfterRefresh = $counter.N }
+        }
+        $calls.AfterThree | Should -Be 1
+        $calls.AfterRefresh | Should -Be 2
+    }
+}
+
+Describe 'Console: the lists of the window virtualize, and the activity log says where the whole log is' {
+    BeforeAll {
+        $script:Xaml = [xml][IO.File]::ReadAllText((Join-Path $script:Root 'module\PRA.Gui.xaml'))
+        $script:XamlText = [IO.File]::ReadAllText((Join-Path $script:Root 'module\PRA.Gui.xaml'))
+    }
+    It 'draws the grid of a wave with a virtualizing panel, not inside a ScrollViewer that disables it' {
+        $manager = New-Object Xml.XmlNamespaceManager $script:Xaml.NameTable
+        $manager.AddNamespace('p', 'http://schemas.microsoft.com/winfx/2006/xaml/presentation')
+        $manager.AddNamespace('x', 'http://schemas.microsoft.com/winfx/2006/xaml')
+        $grid = $script:Xaml.SelectSingleNode("//p:ItemsControl[@x:Name='WaveGrid']", $manager)
+        $grid | Should -Not -BeNullOrEmpty
+        $grid.ParentNode.LocalName | Should -Not -Be 'ScrollViewer'
+        $grid.SelectSingleNode('p:ItemsControl.ItemsPanel/p:ItemsPanelTemplate/p:VirtualizingStackPanel', $manager) | Should -Not -BeNullOrEmpty
+        $grid.GetAttribute('VirtualizingPanel.VirtualizationMode') | Should -Be 'Recycling'
+        $grid.GetAttribute('ScrollViewer.CanContentScroll') | Should -Be 'True'
+    }
+    It 'never turns the content scroll off, and asks the plain lists to recycle their rows' {
+        $script:XamlText | Should -Not -Match 'CanContentScroll\s*=\s*"False"'
+        $script:XamlText | Should -Not -Match 'IsVirtualizing\s*=\s*"False"'
+        $script:XamlText | Should -Match '(?s)<Style x:Key="PlainList".*?VirtualizingPanel\.VirtualizationMode.*?Recycling.*?</Style>'
+    }
+}
+
+Describe 'Console: the folders of a run are created private, and a failure is reported' {
+    It 'creates a missing folder with protected permissions' {
+        $path = Join-Path $TestDrive 'gui-private\logs'
+        & $script:Gui { param($p) Initialize-PcmGuiFolder $p } $path
+        $path | Should -Exist
+        (Get-Acl -LiteralPath $path).AreAccessRulesProtected | Should -BeTrue
+    }
+    It 'leaves an existing folder as it is' {
+        $path = Join-Path $TestDrive 'gui-existing'
+        $null = New-Item -ItemType Directory -Path $path
+        & $script:Gui { param($p) Initialize-PcmGuiFolder $p } $path
+        (Get-Acl -LiteralPath $path).AreAccessRulesProtected | Should -BeFalse
+    }
+    It 'reports a folder that cannot be created instead of going on' {
+        $file = Join-Path $TestDrive 'gui-a-file'
+        Set-Content -LiteralPath $file -Value 'x'
+        { & $script:Gui { param($p) Initialize-PcmGuiFolder $p } $file } | Should -Throw '*a file exists where the folder is expected*'
+        { & $script:Gui { param($p) Initialize-PcmGuiFolder $p } (Join-Path $TestDrive 'gui|bad') } | Should -Throw '*cannot be created*'
     }
 }

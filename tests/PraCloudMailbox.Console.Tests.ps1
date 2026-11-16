@@ -315,6 +315,7 @@ Describe 'Console: a batch end to end' {
         $next.Count | Should -BeGreaterThan 1
         ($next | ForEach-Object { $_.Text }) -join "`n" | Should -Match ('\.\\Invoke-PraCloudMailbox\.ps1 -Action Recover -Batch {0} -ConfigPath' -f $script:Batch)
         ($next | ForEach-Object { $_.Text }) -join "`n" | Should -Match 'Global report of batch'
+        ($next | ForEach-Object { $_.Text }) -join "`n" | Should -Match 'Events of batch'
     }
     It 'follows the batch with a Check: 4 steps for 4 announced, the expected state and the single look in the next steps' {
         $follow = Invoke-Console @{ Action = 'Check'; Batch = $script:Batch; Expect = 'provisioned'; Once = $true }
@@ -623,5 +624,13 @@ Describe 'Console: no stack line in an error' {
         ConvertTo-PcmPlainMessage "Exception calling it`n   at System.Net.Http.Foo.Bar() in x.cs:line 5`n   at <ScriptBlock>, <No file>: line 1`nwhy it failed" | Should -Be "Exception calling it$([Environment]::NewLine)why it failed"
         ConvertTo-PcmPlainMessage 'We arrived at the end' | Should -Be 'We arrived at the end'
         ConvertTo-PcmPlainMessage '' | Should -Be ''
+    }
+    It 'removes the empty parts between the separators of an Exchange Online error, and keeps the other separators' {
+        ConvertTo-PcmPlainMessage "||You can't use it." | Should -Be "You can't use it."
+        ConvertTo-PcmPlainMessage "|System.Management.Automation.RemoteException|You can't use it." | Should -Be "System.Management.Automation.RemoteException|You can't use it."
+        ConvertTo-PcmPlainMessage "Convert stopped: ||You can't use it. | Owned resource booking disabled." | Should -Be "Convert stopped: You can't use it. | Owned resource booking disabled."
+        ConvertTo-PcmPlainMessage "Ex1A2B||You can't use it." | Should -Be "Ex1A2B|You can't use it."
+        ConvertTo-PcmPlainMessage "first | | second |" | Should -Be 'first | second'
+        ConvertTo-PcmPlainMessage 'one | two | three' | Should -Be 'one | two | three'
     }
 }

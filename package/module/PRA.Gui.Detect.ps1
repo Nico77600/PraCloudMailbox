@@ -119,14 +119,24 @@ function Get-PcmGuiPrerequisite {
         else { & $light 'Journal' 'Ok' ('{0} found. {1}.' -f $journal.Path, $(if ([int]$journal.Batches -eq 1) { '1 batch recorded' } else { '{0} batches recorded' -f [int]$journal.Batches })) }
     }
     $task = & $get 'Task' $null
-    if ($null -eq $task) { $task = Get-PcmGuiCollectTask }
+    if ($null -eq $task) { $task = Get-PcmGuiCollectTask -Refresh:$refresh }
     if ($task -and $task.Found) { & $light 'Daily Collect' 'Ok' ([string]$task.Text) }
     else { & $light 'Daily Collect' 'Info' 'No scheduled task of Collect found on this computer. Run Collect often (every day is best): after the disaster nothing on-premises can be read.' }
     return [pscustomobject]@{ Lights = $lights.ToArray(); CanCollect = ($coreOk -and [bool]$exchangeServer); CanCloudEngine = $coreOk; CanCloudBase = $cloudBase; ExchangeServer = $exchangeServer; Net = ''; Role = 'None' }
 }
 
+$script:GuiTaskCache = $null
+
 function Get-PcmGuiCollectTask {
-    <# The scheduled task that runs Collect (best effort): Found and Text. #>
+    <# The scheduled task that runs Collect (best effort): Found and Text. Listing the tasks of the computer takes a while: the answer is kept for a minute, or until -Refresh. #>
+    param([switch]$Refresh)
+    if (-not $Refresh -and $script:GuiTaskCache -and ([datetime]::UtcNow - $script:GuiTaskCache.At).TotalSeconds -lt 60) { return $script:GuiTaskCache.Answer }
+    $answer = Find-PcmGuiCollectTask
+    $script:GuiTaskCache = @{ At = [datetime]::UtcNow; Answer = $answer }
+    return $answer
+}
+
+function Find-PcmGuiCollectTask {
     $none = [pscustomobject]@{ Found = $false; Text = '' }
     if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) { return $none }
     try {
@@ -220,6 +230,7 @@ function ConvertTo-PcmGuiNetworkAnswer {
 function Get-PcmGuiNetworkLight {
     <# The light of the Microsoft 365 test: Status and Detail from its state (Checking, Ok, Partial, Fail) and the answers. #>
     param([string]$State, [object[]]$Answers = @())
+    $Answers = @($Answers | Where-Object { $null -ne $_ })
     $unreached = @($Answers | Where-Object { -not $_.Ok } | ForEach-Object { $_.Host })
     if ([string]::Equals($State, 'Checking', [StringComparison]::OrdinalIgnoreCase)) { return @{ Status = 'Info'; Detail = 'Checking that Microsoft 365 can be reached from this computer (a few seconds)...' } }
     if ([string]::Equals($State, 'Ok', [StringComparison]::OrdinalIgnoreCase)) { return @{ Status = 'Ok'; Detail = ('Reachable from this computer ({0}).' -f ($script:GuiM365Hosts -join ' and ')) } }
@@ -290,8 +301,8 @@ function Get-PcmGuiExchangeLight {
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDiadQJoADxgbTS
-# BFBvc/lMqQGJOWTA/UUUSCeFa9IhdaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAEsKLuIPSxLdyC
+# RegPcjxXxKZMB/1zG05Z5lfoln5F06CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -368,23 +379,23 @@ function Get-PcmGuiExchangeLight {
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAIA2ca2iZ9
-# pax08HYvNY0hFxGI6CYqsoBRS16XV4XKSDANBgkqhkiG9w0BAQEFAASCAgBEUZXE
-# tI7g9f8C2UvWg5pRjnmZLxn2zcVdHOtQAgU/nqZkghrzmN6NomJCMTko7pcIr8r/
-# VWE1Visas7XERj//qIuWZVNZSAFWL6V9DmYXStot3b5/XeUlYN8sBicq0npxVhqJ
-# k5+mSKR0gPRdZ74TDf42linusOTyH+t5ozHcVndQczMoavN4XAvCjnqqV9Ofr8oH
-# xpqarjrq2Tg5fU40wwuq4l1cpc98ChXImicUQDDWQkgGDqVvIFq8D4IiXVKtX1sK
-# 82Bkkvsfr6DWrusN9dJ6gDYKb8gpLHkAvu9UuB40/i60w5HFL3IVT/BlMjxioo/s
-# WKXq5hbND25kzj5W2jURPoixhlmMY8kyu1lwGGbcgLNoe+Lkl+IcB+nP0coztxGV
-# Em5Z4qVIwi42hF8UPdCpJ3wjS1Tc0JMz5xxXfGnufhFfuYEP42qmP55PNJMXIKsZ
-# ThsXWHe8wxBZkuPn8m2Ky75JG3FIuf6tKAHPKeQ1hyiZ37YleQV0pKehYOa6cky2
-# MRvrguIdeuDi9Cm6SmoT1FeNj8cJZZ29s7YeKpc9Dz/klM+KmCzzpJ0S+PO8gyvr
-# 8biO8xequ+gmjpYJOTmY33l/7H33Y7YofiFPQYJa0l8JEfMZu2t7EexpDmVPpsir
-# 7Y8YgfkqKMHvOs+qvhZPr5OR/HZfHZT7eubl6aGCFM4wghTKBgorBgEEAYI3AwMB
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCD+00GWndHe
+# CtqVbKKgdqJnJr2ESOaBjJBZQmKeqIipFzANBgkqhkiG9w0BAQEFAASCAgB8engC
+# veQFB+7NvuVXUTlAuigluoE6OgYweCZnjWxqXmVmlDtAHsdSnY0vaKvzWknkqBu6
+# l8Cp5ZJj9xLiQgHL4UWfhvvBYIHNi1abMUWOEfH5bmjm6xyYmcDKDVWSGu8lzL8w
+# eZJjbzw8gIOapwc8N/5atlcIm+4mQpwXHliB6kQ5NoJGyuQKjwC2VvnemWAz38Ta
+# +S9eNhdfzrHrfQ7aQEsL025qlOtKOIIsxjnGNoSybQIUYBUQSh+CRC9e6EYM+qpy
+# 0jOvoYrv7CB2iT4hlJanJ71nCNH8ihx92PYMBNCkn0MxkC8FJMojvsglwpZbQo3p
+# l+4hF3L48j/w3lewXJMpQsQfIuqMnGhRQDClKVE1ogK+xU77sAHDOAclfhnFp8em
+# l9PpqjoVYWRvTFQZ7Chtk7fuxEKtD6cwtS09Z4HTx5yAnHl9wlh0Q+kngSP6a8JE
+# dUQRIe9TCVGvi8twT5ByY2gUrAyYl6HJOLo9cI3jiVomZ0KC9ryE3WHhDWMLxNPe
+# jkM+L5OWMkJhzPpwN7ERc01XRRKQkPrDOc0DqYO1+sGm6I6QRNMfZNUnpUKXDsTF
+# a2prTrInaAY7IXGiNMx5GpoZEUPZfR5LrpEfdx2vkMSrZ1m+MLt36let2BEzpaZO
+# XuShxhr/m9ZE0fMJINrOiz0RwEEqb3+O+TOAUaGCFM4wghTKBgorBgEEAYI3AwMB
 # MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIO6NE6F+TGLafhgRpQjTWUjzXUEWcJe6cSjqbPs1cbYUAghHcWJXBFjT
-# zRgPMjAyNjExMTQwODE3MjVaMAMCAQECEH2hEH9WPIHJ3ka+AKX6djugghGnMIIE
+# BAIBBQAEIA2Vd80PTpFYeyzgbRWOwf/2RjU/z4NHeJgBsLwqQH2DAghA2pdUcT2P
+# aBgPMjAyNjExMTUyMDA2MzFaMAMCAQECEG/jVIHkzI69+D2WYl9hRx+gghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -483,13 +494,13 @@ function Get-PcmGuiExchangeLight {
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNDA4MTcyNVowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIC3L
-# ABux3qZFxqMggk42LwdeGf4W9W1R4K8ZUjhdg15XMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNTIwMDYzMVowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIGZW
+# VXa3TBiYwpi7Uyzz8+60InHurgItJuPRf4M8NfDLMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiA7L/JETyInszSKEZ1J5KmXqTBFMCwUmUUBjpt4vVcLDgIhAOFk
-# aK3Wl4HxRhS2U0rsEoh75lHy/Md+/hnUJYnOl9rX
+# zj0EAwIERzBFAiEAg1N0yhh6Q8cHfL7540cuIl4l9x/D/NGcRWJFymyvtP8CIBYX
+# WYz/XbmqzyByD8K4TIYvu3TPxfjpzmJ0X6crlgOt
 # SIG # End signature block

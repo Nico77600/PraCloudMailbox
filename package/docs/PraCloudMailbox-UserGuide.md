@@ -1,9 +1,9 @@
 ﻿---
 title: PRA Cloud Mailbox
 subtitle: User guide
-version: 2.0.0
+version: 2.1.0
 author: Nicolas Fabert
-updated: 2026-11-12
+updated: 2026-11-15
 runtime: PowerShell 7.5+ (engine and console)
 safety: Preview first, snapshot backed up off-site
 ---
@@ -39,6 +39,9 @@ Your Active Directory, your Exchange servers **and** Entra Connect are lost. Nob
 Think of a fire in an office building. Everyone moves to a temporary office the same day. When the building is repaired, everyone moves back. The tool is the moving team. It uses a list of every desk, written **before** the fire. This list is the **snapshot**. After the fire nobody can read the old building, so the snapshot is precious.
 
 ![The states of a mailbox: before the disaster, after Convert, after Recover](images/readme-states-light.png)
+
+> [!NOTE]
+> **What the tool moves.** The tool moves mailboxes: users and shared mailboxes. If you turn it on, it also moves cloud rooms and equipment. It does **not** recreate contacts, distribution groups, mail-enabled security groups, dynamic distribution groups or Microsoft 365 groups. Collect can keep contacts and groups in the snapshot, but only to look at them. The members of a group are used for one thing: to choose the mailboxes of a run with `-Group`. Calendar settings are restored only for the cloud rooms and equipment that you turned on. The calendar of a user is not touched.
 
 > [!CAUTION]
 > The old mails are **not copied** by this tool. A user keeps what the cloud already holds, mainly the Teams storage. The mails received in the cloud are **kept** when you go back: they stay under an eDiscovery case hold. A shared mailbox becomes an inactive mailbox under the hold. Nothing is deleted. A cloud room or equipment mailbox is different: see [chapter 6.2 of the administrator guide](PraCloudMailbox-Guide.md#62-unsynchronised-native-resource-lifecycle). Ask before you go back.
@@ -147,12 +150,12 @@ You do this part **one time**. It is best to do it **before** the disaster, as a
 
 **Do:**
 
-1. Download `PraCloudMailbox-2.0.0.zip` and its `.sha256` file from the release page of the project. Take the two files named in the **Assets** list. Do **not** take the "Source code" archives: they are not the tool.
+1. Download `PraCloudMailbox-2.1.0.zip` and its `.sha256` file from the release page of the project. Take the two files named in the **Assets** list. Do **not** take the "Source code" archives: they are not the tool.
 2. Check the checksum. Open **PowerShell 7** (Start button, type `PowerShell 7`). Run these two lines in the folder of the download:
 
 ```powershell
-(Get-FileHash .\PraCloudMailbox-2.0.0.zip -Algorithm SHA256).Hash
-Get-Content .\PraCloudMailbox-2.0.0.zip.sha256
+(Get-FileHash .\PraCloudMailbox-2.1.0.zip -Algorithm SHA256).Hash
+Get-Content .\PraCloudMailbox-2.1.0.zip.sha256
 ```
 
 3. Compare the two values. The text file holds the hash, two spaces, and the file name. The letters can be capital or small. The hash must be the same.
@@ -250,11 +253,13 @@ This is the most important part of the preparation. Read it twice.
 > **After the disaster, the snapshot is the only copy of your directory data.** Active Directory, Exchange and Entra Connect are lost. Nothing else knows the list of the mailboxes, their GUIDs and the permissions of the shared mailboxes. If the snapshot is lost or changed, the tool has nothing to work from.
 
 1. **Back it up every day.** Collect keeps a consistent copy of each run in `data\backup`. Back up that folder, and the `data\PraCloudMailbox.db` file.
-2. **Keep a copy outside your network.** Put the backup somewhere that the lost domain cannot reach: off-site, offline or immutable storage, with credentials that are **not** in your domain. If an attacker has your domain, he has every disk and every share that your domain reaches. Keep **several generations**, not only the last one.
+2. **Keep a copy outside your network.** Put the backup somewhere that the lost domain cannot reach: off-site, offline or immutable storage, with credentials that are **not** in your domain. If attackers hold your domain, they have every disk and every share that your domain reaches. Keep **several generations**, not only the last one.
 3. **Protect who can read it.** The snapshot holds names, e-mail addresses, GUIDs and permissions. Give the folder and the backups a **restricted access list**: the administrators of the tool and the backup account only. Never share the folder with **Domain Users**.
 4. **Copy the `.sha256` file with it.** Collect writes `PraCloudMailbox.db.sha256` beside the snapshot, and one beside each backup. The tool checks the snapshot against this file **before** it reads it, in Check, Convert and Recover.
-5. **If the check says the file changed, restore it from the external backup.** The message says *Nothing was changed.* and *Restore the file from your external backup*. Use `-AcceptUnverifiedSnapshot` **only** when you know why the file changed and you accept it as it is. A snapshot with **no** `.sha256` file only gives a warning: old snapshots have none.
-6. **Back up the journal too.** The journal is `data\PraCloudMailbox-journal.db`. It is written by Convert and Recover themselves, so the checksum does **not** cover it. It is the record of every change and the only input of the rollback. Copy it off-site **during** the operations, not only after.
+5. **If the check says the file changed, restore it from the external backup.** The message says *Nothing was changed.* and *Restore the file from your external backup*. Use `-AcceptUnverifiedSnapshot` **only** when you know why the file changed and you accept it as it is. A snapshot with **no** `.sha256` file gives a warning in a Preview and in a Check. A **Convert or a Recover in Apply mode stops** and changes nothing: copy the `.sha256` file with the snapshot, or add `-AcceptUnverifiedSnapshot` when you know the file is the right one.
+6. **A Collect that lost its mailboxes is refused.** Collect refuses to write a snapshot that has no mailbox. It also refuses one that has far fewer than the last good snapshot (`Collect.MaxDropPercent`, 50 by default). It writes nothing and ends with `RESULT: FAIL`. The last good snapshot stays. Find out why Exchange returned fewer mailboxes. Raise the setting only if the drop is expected.
+7. **A batch keeps its snapshot.** Convert remembers which snapshot it was made from. Recover and the follow-up of a batch use **that** snapshot, and stop, changing nothing, if it is missing or not the same. Collect never deletes the snapshot of a batch that is not rolled back yet. If the tool says the snapshot of a batch is missing, copy that file from `data\backup` over `data\PraCloudMailbox.db`, with its `.sha256` file.
+8. **Back up the journal too.** The journal is `data\PraCloudMailbox-journal.db`. It is written by Convert and Recover themselves, so the checksum does **not** cover it. It is the record of every change and the only input of the rollback. Copy it off-site **during** the operations, not only after.
 
 The cloud admin server needs the snapshot. If Collect does not run on it, copy `data\PraCloudMailbox.db` **and** `data\PraCloudMailbox.db.sha256` there after each Collect. A second scheduled task can do it.
 
@@ -383,6 +388,10 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Convert -Identity adele.vance@co
 
 **If not:** a red number such as **1 blocking** means the tool refuses this object. Click the line and read the reason. Do not go on. Stop and ask.
 
+A preview is only good for the files it was made on. Change the settings file, the list of objects, the tool or the snapshot after the preview, and the console refuses the next step. It says *The run is refused: the task, the objects or the settings changed since the preview. Preview again.* Press **Preview** again.
+
+One reason in red deserves a stop: **ENTRA_WRONG_OBJECT**. The tool found an account in Microsoft Entra ID by the sign-in name only, and its mailbox is not the one of the snapshot. It is probably another person's account. The tool changes nothing on it and does not convert the object. Do not force it. Ask your administrator to fix the account or the sign-in name in Entra ID, or leave the object out.
+
 ### 4 · Confirm
 
 **In the console.** Read the title one more time. Is it the right number of people? Type the word **CONVERT** in the box. Small or capital letters both work. Then press the red button **Convert the mailboxes**. Any change of task, of objects or of settings cancels the preview: do it again.
@@ -503,6 +512,8 @@ Choose **Everything in the snapshot**, or leave out every source option. The too
 - **`Licensing.Shared.Parallel`** is the largest wave (100 by default).
 - **`Licensing.Shared.KeepFree`** is the number of units of that licence that Convert **never uses**. Use it to keep a few units for something else. **0** keeps none.
 
+A shared mailbox that needs **no** new unit is never refused for a missing unit. This is a mailbox that is already shared, or already holds the temporary licence. If a wave finds no free unit, the tool waits **once**, up to 5 minutes, for the units that the previous wave gave back. If none comes, the shared mailboxes that need a unit are marked as failed (*not started: no free unit … nothing was changed on this object*), the others go on, and the batch is **partial**. Free a unit, then continue the batch.
+
 In the console, both numbers are in **Settings for this run only**.
 
 #### Resume a batch
@@ -520,6 +531,11 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply -Batch 1a2b3
 ```
 
 The source options (`-Identity`, `-CsvPath`, `-SearchBase`, `-Group`, `-Scope`, `-MaxObjects`) **narrow** the objects that are resumed. An object that is not in the batch is refused.
+
+**If you press Ctrl+C or close the window,** the run ends with `RESULT: FAIL`, never `PASS`. The Next steps give the command that continues it. The batch becomes **partial**. What was finished is kept.
+
+> [!WARNING]
+> **A batch that a rollback has touched is not continued.** If a Recover already rolled back objects of a batch, `Convert -Batch` stops: *Convert batch … cannot be resumed: Recover batch … already rolled back objects of it … Nothing was changed.* An object converted now could never be rolled back. Start a **new** Convert for the objects that are not converted: preview first, then choose them with `-Identity`, `-CsvPath` or `-Group`. The Next steps say the same.
 
 > [!TIP]
 > The **Next steps** always give the exact command, with your options. Copy it with **Copy command**.
@@ -561,6 +577,8 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Recover -Mode Apply -Batch 1a2b3
 
 The question is *Roll back … object(s) of Convert batch …?*
 
+The rollback uses the **licence mode of the batch**. If `Licensing.Users.Mode` in the settings file is not the one Convert used, the run stops before any change: *Convert batch … gave the Exchange plan of its users with Licensing.Users.Mode = … and the configuration now says …* Put the old value back in the settings file. Keep the same `GroupId` or `SkuPartNumber`. Then run again.
+
 ### 3 · Wait
 
 The tool works in waves. It checks each step before the next. It waits for Entra Connect and for the case hold. This can take a long time. **Do not close the window.** If you stop it, the next run continues.
@@ -588,7 +606,7 @@ A member of the group that is **not in this batch** is skipped, and the run says
 
 ### Stop, then continue
 
-Press **Stop after the current object** to end a run cleanly. No new object starts. The run finishes its journal and its report. Run the same command later: it continues where it stopped. In the console, click the card **Roll back a conversion**, then **Continue an interrupted rollback**, and pick the batch.
+Press **Stop after the current object** to end a run cleanly. No new object starts. The run finishes its journal and its report. Run the same command later: it continues where it stopped. In the console, click the card **Roll back a conversion**, then **Continue an interrupted rollback**, and pick the batch. If you rolled back a **wave**, the console continues **that wave only**: the objects that were not yet rolled back, never the whole batch. A wave that ended normally is not listed as interrupted.
 
 ### After the rollback
 
@@ -645,6 +663,8 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Check -Batch 1a2b3c4d -Expect Re
 
 Without `-Once`, the check **waits**, with the waiting times of the settings, until every object is as expected or the time is over. With `-Once`, it looks one time. If an object is not as expected, the exit code is 1 and the next steps say what to do.
 
+The check follows **every object of the batch**. This includes the ones that Convert never started, for example for lack of a free licence unit. They are listed as *not converted: Convert never started this object, nothing was changed on it*. The tool never says that every object is provisioned while the batch is **not complete**: it ends with exit code 1 and tells you to continue the batch first.
+
 ![The console of a follow-up: every object of the batch is provisioned](images/cli-follow-light.png)
 
 ### The reports
@@ -656,6 +676,8 @@ Every run writes a log, a transcript, a CSV and an HTML **report**. The report i
 | `reports\PRA_<date>_<run>.html` | the report: result, numbers, next step, one row per object |
 | `reports\PRA_<date>_<run>.csv` | the same rows, for Excel |
 | `reports\PraCloudMailbox_<environment>_batch<id>_global.html` | the **global report** of a batch |
+| `reports\PraCloudMailbox_<environment>_batch<id>_global.csv` | the same objects, one line each, for Excel |
+| `reports\PraCloudMailbox_<environment>_batch<id>_global_events.csv` | every step of every object, one line each, for Excel |
 | `logs\PRA_<date>_<run>.log` | every step with its time. The last line is `RESULT: PASS`, `RESULT: PENDING` (exit code 2), `RESULT: FAIL` or `RESULT: CANCELLED` (you answered no to the confirmation: nothing was written). |
 | `logs\PRA_<date>_<run>.transcript.txt` | the PowerShell transcript |
 
@@ -676,7 +698,9 @@ A **warning** is an orange word. It means "done, but read this".
 
 #### The global report
 
-A batch has **one global report**. It follows the batch from end to end: every Convert run, every resume, every follow-up, every Recover wave. Each object has its **journey**. The tool writes it at the end of every Convert, Recover and `Check -Batch`, and puts its path in the **Next steps**. The **Open global report** button opens it.
+A batch has **one global report**. It follows the batch from end to end: every Convert run, every resume, every follow-up, every Recover wave. Each object has its **journey**: every step, in time order. The tool writes it at the end of every Convert, Recover and `Check -Batch`, and puts its path in the **Next steps**. The **Open global report** button opens it.
+
+The global report has **no limit**. Every object and every step is in it, however many there are. The top of the page is plain text: the totals, the batches and the runs. You can read it even when scripts are blocked. The list of objects below it needs Edge or Chrome. Click an object to read its whole journey. The journey comes in pages of 100 steps. The two CSV files hold the same data for Excel: one line per object, and one line per step.
 
 ![The global report of a batch: the runs, then every object end to end](images/report-global-light.png)
 
@@ -713,7 +737,14 @@ Find what you **see** in the left column. The middle column says what it **means
 | *Tenant prerequisites not met (see above): nothing was changed.* | A permission, a licence group or a free unit is missing. | Run **Check**. Read the lines in red. Ask your administrator. |
 | *No complete snapshot in …: run Collect -Mode Apply* | The snapshot file is not on this computer. | Copy `PraCloudMailbox.db` and its `.sha256` file here. |
 | *… was changed after its last Collect* … *Nothing was changed.* | The snapshot file does not match its `.sha256` file. | **Restore the file from your external backup.** Use `-AcceptUnverifiedSnapshot` only if you know why and accept it. |
-| *… so the tool cannot prove it is the file written by Collect* | The snapshot has no `.sha256` file. It is a **warning**, not a stop. | Copy the `.sha256` file with the snapshot next time. Run a Collect. |
+| *… so the tool cannot prove it is the file written by Collect* | The snapshot has no `.sha256` file. A Preview and a Check only warn. A **Convert or a Recover in Apply mode stops**, and nothing is changed. | Copy the `.sha256` file with the snapshot. If you know the file is the right one, add `-AcceptUnverifiedSnapshot`. |
+| *Batch … was made from snapshot …, which is not in …* or *… is not the snapshot that batch … was made from* | The snapshot of the batch was deleted or replaced. **Nothing was changed.** | Copy the file of that snapshot from `data\backup` over `data\PraCloudMailbox.db`, with its `.sha256` file. Run the command again. |
+| *Collect found no mailbox …* or *… fewer than the last complete snapshot …* | Collect refused to replace the good snapshot with one that lost its mailboxes. | Find out why Exchange returned fewer mailboxes. Ask your administrator before you raise `Collect.MaxDropPercent`. |
+| *The Entra ID account with this UPN is probably not this person …* (**ENTRA_WRONG_OBJECT**) | The account was found by sign-in name only, and its mailbox is not the one of the snapshot. **Nothing was changed on it.** | Ask your administrator to fix the account or the sign-in name in Entra ID, or leave the object out. |
+| *Convert batch … cannot be resumed: Recover batch … already rolled back objects of it* | A rollback already touched this batch. | Do not continue it. Start a new Convert for the objects that are not converted. |
+| *Convert batch … gave the Exchange plan of its users with Licensing.Users.Mode = …* | The licence mode in the settings file is not the one of the batch. **Nothing was changed.** | Put the mode of the batch back in the settings file. Run Recover again. |
+| *The run is refused: the task, the objects or the settings changed since the preview* (console) | A file of the run changed after the preview. | Press **Preview** again. |
+| `RESULT: FAIL` after Ctrl+C or a closed window | The run was interrupted before its end. The batch is **partial**. | Run the command given in the Next steps. What was finished is kept. |
 | *Choose one way to say which objects:* | You gave two of `-Identity`, `-CsvPath`, `-SearchBase`, `-Group`. | Give one. |
 | *… is not in …. Nothing was changed.* | An object you named is not in the snapshot or the batch. | Check the name. Letter case does not matter. |
 | *… is already converted by Convert batch …: nothing was changed.* | You asked for an object that an earlier batch converted. | Do not convert it twice. Continue that batch with the command in the Next steps. |
@@ -732,6 +763,7 @@ Find what you **see** in the left column. The middle column says what it **means
 | **Part of the rollback remains** or *Some objects are not back yet. Fix what is named above, then resume them (nothing is rolled back twice):* | Some objects are not back yet. | Run the command given after the message. |
 | *no cloud mailbox yet after …: run Convert -Batch … again later* | Exchange Online is still creating the mailbox. | Wait a few minutes. Run the same command with `-Batch`. |
 | *not synchronised from AD yet: run Entra Connect, then Recover -Batch again* | Entra Connect has not yet sent the object back. | Run a synchronisation on Entra Connect. Then run again. |
+| *Entra Connect did not recreate it … run a full synchronisation on the Entra Connect server* | The tool tried a synchronisation of the object alone and it did not come back. | Run the command of the Next steps on the Entra Connect server and wait for it to end. Then run the Recover command of the Next steps again. |
 | *back on-premises; case hold not stamped yet* | The user is back. The hold is still being applied. | Run Recover again later to check it. The hold is never removed from an object that is back. |
 | *other hold(s) on the cloud mailbox block the rollback* | Another hold on the user's cloud mailbox stops the switch back. | Remove that hold. Run Recover again. |
 

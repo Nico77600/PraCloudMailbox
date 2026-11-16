@@ -132,38 +132,70 @@ Describe 'Global report of a batch' {
         @(($model.Objects | Where-Object Identity -eq 'alice@contoso.com').Events | ForEach-Object { $_.Step }) | Should -Be @('GuidCleared', 'MailboxReady', 'Hold')
         @($model.BatchEvents).Count | Should -Be 1
     }
-    It 'writes one HTML page with no script, every value encoded, the runs, the settings of each run, and a CSV with a formula guard' {
+    It 'writes one self-contained HTML page, every value encoded, the runs, the settings of each run, a CSV of the objects with a formula guard and a CSV of the events' {
         $folder = Join-Path $TestDrive 'global'
-        $context = @{ ReportFolder = $folder; Version = '2.0.0'; Config = @{ Environment = 'TEST' }; Warnings = 0; LogFile = '' }
+        $context = @{ ReportFolder = $folder; Version = '2.0.0'; Config = @{ Environment = 'TEST' }; Warnings = 0; LogFile = ''; Root = $script:Root }
         $result = Write-PcmGlobalReport -Context $context -History (New-History) -ConvertBatchId 'c0nvert1' -FollowUp @([pscustomobject]@{ Identity = 'alice@contoso.com'; Expect = 'Deprovisioned'; Met = $true; Detail = 'MailUser' })
         $result.Html | Should -Match 'PraCloudMailbox_TEST_batchc0nvert1_global\.html$'
+        $result.EventsCsv | Should -Match 'PraCloudMailbox_TEST_batchc0nvert1_global_events\.csv$'
         $html = [IO.File]::ReadAllText($result.Html)
-        $html | Should -Not -Match '<script'
+        $html | Should -Not -Match 'https?://'
         $html | Should -Match 'Batch c0nvert1 from end to end'
-        $html | Should -Match 'UserMailbox &lt;b&gt;x&lt;/b&gt;'
         $html | Should -Not -Match 'UserMailbox <b>'
         $html | Should -Match 'Polling.IntervalSeconds: 20 -&gt; 5'
         $html | Should -Match 'group PRA-Wave1 \(captured by Collect, snapshot 4\)'
         $html | Should -Match 'Follow-up check of this run'
+        $data = Read-PcmGlobalReportData -Html $html
+        @($data.Events | Where-Object Detail -eq 'UserMailbox <b>x</b>').Count | Should -Be 1
+        @($data.FollowUp).Count | Should -Be 1
+        $data.FollowUp[0].Result | Should -Be 'Met'
         $rows = @(Import-Csv -LiteralPath $result.Csv -Delimiter ';')
         $rows.Count | Should -Be 3
         ($rows | Where-Object Verdict -eq 'Converted').Identity | Should -Be "'=cmd@contoso.com"
-        ($rows | Where-Object Identity -eq 'alice@contoso.com').Journey | Should -Match 'Hold: case hold stamped'
-        # The same two files are replaced by the next run.
+        ($rows | Where-Object Identity -eq 'alice@contoso.com').EventCount | Should -Be 3
+        $events = @(Import-Csv -LiteralPath $result.EventsCsv -Delimiter ';')
+        @($events | Where-Object Identity -eq 'alice@contoso.com' | ForEach-Object { '{0}: {1}' -f $_.Step, $_.Detail }) | Should -Contain 'Hold: case hold stamped'
+        # The same three files are replaced by the next run.
         $again = Write-PcmGlobalReport -Context $context -History (New-History) -ConvertBatchId 'c0nvert1'
         $again.Html | Should -Be $result.Html
     }
-    It 'writes the journey only for the objects that are not simply done when there are more than 500 objects' {
+    It 'keeps the journey of every object, whatever their number, and every event of one object' {
         $history = New-History
-        $many = foreach ($number in 1..501) { [pscustomobject]@{ batch_id = 'c0nvert1'; object_guid = ('x{0}' -f $number); identity = ('u{0:000}@contoso.com' -f $number); kind = 'User'; status = 'Done'; step = 'MailboxReady'; message = '' } }
+        $many = foreach ($number in 1..1200) { [pscustomobject]@{ batch_id = 'c0nvert1'; object_guid = ('x{0}' -f $number); identity = ('u{0:0000}@contoso.com' -f $number); kind = 'User'; status = 'Done'; step = 'MailboxReady'; message = '' } }
         $history.Items = @($history.Items) + @($many)
-        $history.Events = @($history.Events) + @([pscustomobject]@{ batch_id = 'c0nvert1'; object_guid = 'x7'; time_utc = '2026-11-01T08:00:00.0000000Z'; step = 'MailboxReady'; outcome = 'Ok'; detail = 'simple object' })
-        $context = @{ ReportFolder = (Join-Path $TestDrive 'global2'); Version = '2.0.0'; Config = @{ Environment = 'TEST' }; Warnings = 0; LogFile = '' }
+        $busy = foreach ($number in 1..250) { [pscustomobject]@{ batch_id = 'c0nvert1'; object_guid = 'x7'; time_utc = ('2026-11-02T10:{0:00}:{1:00}.0000000Z' -f [math]::Floor($number / 60), ($number % 60)); step = ('Step{0}' -f $number); outcome = 'Ok'; detail = ('event {0}' -f $number) } }
+        $one = foreach ($number in 1..1200) { [pscustomobject]@{ batch_id = 'c0nvert1'; object_guid = ('x{0}' -f $number); time_utc = '2026-11-01T08:00:00.0000000Z'; step = 'MailboxReady'; outcome = 'Ok'; detail = ('simple object {0}' -f $number) } }
+        $history.Events = @($history.Events) + @($one) + @($busy)
+        $context = @{ ReportFolder = (Join-Path $TestDrive 'global2'); Version = '2.0.0'; Config = @{ Environment = 'TEST' }; Warnings = 0; LogFile = ''; Root = $script:Root }
         $result = Write-PcmGlobalReport -Context $context -History $history -ConvertBatchId 'c0nvert1'
         $html = [IO.File]::ReadAllText($result.Html)
-        $html | Should -Match 'More than 500 objects'
-        $html | Should -Not -Match 'Journey of u007@contoso.com'
-        $html | Should -Match 'Journey of bob@contoso.com'
+        $html | Should -Not -MatchExactly 'More than'
+        $data = Read-PcmGlobalReportData -Html $html
+        @($data.Objects).Count | Should -Be 1203
+        $total = 5 + 1200 + 250
+        @($data.Events).Count | Should -Be $total
+        $data.Header.events.count | Should -Be $total
+        $position = @{}
+        for ($i = 0; $i -lt $data.Objects.Count; $i++) { $position[[string]$data.Objects[$i].ObjectGuid] = $i }
+        $perObject = @{}
+        foreach ($row in $data.Events) { if ($null -ne $row.Object) { $perObject[[int]$row.Object] = 1 + [int]$perObject[[int]$row.Object] } }
+        foreach ($object in $data.Objects) { [int]$perObject[$position[[string]$object.ObjectGuid]] | Should -Be ([int]$object.Events) }
+        $simple = $data.Objects | Where-Object Identity -eq 'u1100@contoso.com'
+        $simple.Verdict | Should -Be 'Converted'
+        @($data.Events | Where-Object { $_.Object -eq $position['x1100'] }).Count | Should -Be 1
+        $journey = @($data.Events | Where-Object { $_.Object -eq $position['x7'] })
+        $journey.Count | Should -Be 251
+        @($journey | Where-Object Step -like 'Step*').Count | Should -Be 250
+        $journey[-1].Step | Should -Be 'Step250'
+        $journey[-1].Detail | Should -Be 'event 250'
+        $csv = @(Import-Csv -LiteralPath $result.Csv -Delimiter ';')
+        $csv.Count | Should -Be 1203
+        $csv[0].PSObject.Properties.Name | Should -Not -Contain 'Journey'
+        ($csv | Where-Object Identity -eq 'u0007@contoso.com').EventCount | Should -Be 251
+        $eventLines = @(Import-Csv -LiteralPath $result.EventsCsv -Delimiter ';')
+        $eventLines.Count | Should -Be $total
+        @($eventLines | Where-Object Identity -eq 'u0007@contoso.com').Count | Should -Be 251
+        @($eventLines | Where-Object { $_.Step -eq 'Step250' -and $_.Identity -eq 'u0007@contoso.com' }).Count | Should -Be 1
     }
     It 'keeps the runs of a batch in the journal, and reads an older journal without the table' {
         $path = Join-Path $TestDrive 'journal.db'

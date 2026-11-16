@@ -16,7 +16,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0
+    Version : 2.1.0
 #>
 #Requires -Version 7.5
 Set-StrictMode -Version Latest
@@ -444,7 +444,7 @@ function Add-PcmGuiProbeLight {
     $items = [Collections.Generic.List[object]]::new()
     foreach ($item in @($d.Lights)) { $items.Add($item) }
     if ($g.NetProbe) {
-        $answers = if ($g.NetResult) { @($g.NetResult.Answers) } else { @() }
+        $answers = @(if ($g.NetResult) { $g.NetResult.Answers })
         if ($d.CanCloudBase) { $shown = Get-PcmGuiNetworkLight -State $state -Answers $answers; $status = $shown.Status; $detail = $shown.Detail }
         else { $status = 'NA'; $detail = 'Not tested: the lights above must be green first.' }
         $items.Insert([Math]::Min(2, $items.Count), [ordered]@{ Name = $script:GuiNetLight; Status = $status; Detail = $detail })
@@ -623,6 +623,17 @@ function Get-PcmGuiWindowRequest {
             }
             $values.CsvPath = $g.WaveFile
         }
+        elseif ($action -eq 'Recover' -and @($g.SelectedBatch.Wave).Count) {
+            $remaining = @($g.SelectedBatch.Wave)
+            $selectionKey = Get-PcmGuiSelectionKey -Prefix ('continue-' + $values.Batch) -Guids @($remaining | ForEach-Object { $_.Guid })
+            if (-not $g.WaveFile -or -not $g.WaveKey -or $g.WaveKey -ne $selectionKey) {
+                $folder = Join-Path (Join-Path $g.Root 'logs') 'gui'
+                Initialize-PcmGuiFolder (Join-Path $g.Root 'logs'); Initialize-PcmGuiFolder $folder
+                $g.WaveFile = Write-PcmGuiWave -Folder $folder -Name $values.Batch -Rows $remaining
+                $g.WaveKey = $selectionKey
+            }
+            $values.CsvPath = $g.WaveFile
+        }
         if ($action -eq 'Check') {
             $values.Expect = Get-PcmGuiField 'Expect'
             $values.Once = [bool](Get-PcmGuiField 'Once')
@@ -796,11 +807,20 @@ function Open-PcmGuiPath {
     catch { if (Test-PcmGuiOrdinal $extension '.psd1') { $null = [Diagnostics.Process]::Start('notepad.exe', ('"{0}"' -f $Path)) } else { throw } }
 }
 
+function Get-PcmGuiHook {
+    <# The hook of this name that the window was given (the tests and the pictures give some), or $null: a hashtable without the key is an error under strict mode. #>
+    param([Parameter(Mandatory)][string]$Name)
+    $hooks = $script:Gui.Hooks
+    if ($hooks -and $hooks.ContainsKey($Name)) { return $hooks[$Name] }
+    return $null
+}
+
 function Select-PcmGuiOu {
     <# The dialog that lists the OUs of the snapshot. Returns the name picked, or ''. #>
     param([object[]]$Units)
     $g = $script:Gui
-    if ($g.Hooks.PickOu) { return [string](& $g.Hooks.PickOu $Units) }
+    $pick = Get-PcmGuiHook 'PickOu'
+    if ($pick) { return [string](& $pick $Units) }
     $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
  Title="Pick an OU" Width="720" Height="500" WindowStartupLocation="CenterOwner" FontFamily="Segoe UI" Background="{DynamicResource ApplicationBackgroundBrush}">
@@ -836,7 +856,8 @@ function Show-PcmGuiQuestion {
     <# A yes/no question of the engine (No by default). #>
     param([Parameter(Mandatory)][string]$Title, [Parameter(Mandatory)][string]$Text)
     $g = $script:Gui
-    if ($g.Hooks.Question) { return [bool](& $g.Hooks.Question $Title $Text) }
+    $ask = Get-PcmGuiHook 'Question'
+    if ($ask) { return [bool](& $ask $Title $Text) }
     $buttons = [Windows.MessageBoxButton]::YesNo; $image = [Windows.MessageBoxImage]::Question; $default = [Windows.MessageBoxResult]::No
     $answer = if ($g.Form.IsVisible) { [Windows.MessageBox]::Show($g.Form, $Text, $Title, $buttons, $image, $default) } else { [Windows.MessageBox]::Show($Text, $Title, $buttons, $image, $default) }
     return $answer -eq [Windows.MessageBoxResult]::Yes
@@ -845,7 +866,8 @@ function Show-PcmGuiQuestion {
 function Show-PcmGuiNotice {
     param([Parameter(Mandatory)][string]$Text)
     $g = $script:Gui
-    if ($g.Hooks.Notice) { [void](& $g.Hooks.Notice $Text); return }
+    $notice = Get-PcmGuiHook 'Notice'
+    if ($notice) { [void](& $notice $Text); return }
     $buttons = [Windows.MessageBoxButton]::OK; $image = [Windows.MessageBoxImage]::Information
     if ($g.Form.IsVisible) { [void][Windows.MessageBox]::Show($g.Form, $Text, 'PRA Cloud Mailbox', $buttons, $image) } else { [void][Windows.MessageBox]::Show($Text, 'PRA Cloud Mailbox', $buttons, $image) }
 }
@@ -1100,8 +1122,8 @@ Export-ModuleMember -Function Show-PcmGui, New-PcmGuiWindow, New-PcmGuiRequest, 
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAeYxEE/cgnBXpU
-# uOBN0vDVluK4wDXpBGZD3shMKOQNsaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDi8dWVSCrXQATM
+# IYn8YlJ4yP/mfKMGrIw0715LEOmVDqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -1178,23 +1200,23 @@ Export-ModuleMember -Function Show-PcmGui, New-PcmGuiWindow, New-PcmGuiRequest, 
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDWGFOjEOO3
-# cJFYnnkzDUgkU99I7A048Nw8898EjSftiDANBgkqhkiG9w0BAQEFAASCAgA3lKMl
-# 9uGQ6B+t90zrDlAoC4Gzw3RFn4rTHitxWG8ywHNOeqwFBtyAvR97H4jwAdvRwUmq
-# ByT4sIgJxEu8CjMMCaz64dESzthzBss3WyDqofC/mPpMGkducw/VapW/OgMNMNhx
-# m+12o2yESrYUq2bHO/w4V5oCnsBUrJtrJJUC8x3MXg2vrvVEi7B/nyjo+FNrghuV
-# wpNkyRcF7d5XhiaRukaaNORMOWhnOh2FJyE9W7pG4YBFakMVoh5GIO7TTtU9p9yU
-# H9aKtY47oYYXx/JHK2lCW9fGixLeOMmbqrofRpnyh25XQCjPf5mxUDRH62WyWRSF
-# qhhJouK5NDXs5O6jaoBa88baJ/JzJnJ1xm4g8L7j9kIDT4+BVf785T1W1j8shLC3
-# GKPDPAtQUfHVm0K2Y7GlMpZkl+a+5IgKkdjdu5RrVNTFDkVxI2xJU+HNTn0uSHiR
-# nEbjDYXpxBzu8d7Mn/6GfbC7rL+nIVSBRy5tVZz4/dYhD0uwxRtFMaJqGV6fuwBF
-# 9lqiYIyVVmsEZkRb8kQn0lqRt2XxoWESRcJe02rt/uuJ6FlyIJdTHhhR8oTkRzQl
-# +Loy/IADQL1SB/x+p3eRaU9w4W2wko4rLDgwOxGrhVYthWfs9oCU+mMOdhkv6Gp1
-# GF0axlA5badJuWQc5CZjD0DLsrf5QSqUBsX+g6GCFM4wghTKBgorBgEEAYI3AwMB
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDjTDpe4tPr
+# FmeUMN2EfBmhgBue/IIs6sjffMRVf22OCzANBgkqhkiG9w0BAQEFAASCAgCIoLkv
+# zP2dkPeGUpduGtlaVf/UUDCIHUWQTB5XA82RIhrm3zN1YXJvxbkgAEbiN3ErL45s
+# Cc6x2XLPVGolx/P8FluUZjjzq/ImXFoo1IyCZEstf+5nffl070VZhl5cL+dRdjrZ
+# bTS/ZIwjkHgsP/ORLQWxWZLipO9o4yIHICqQe0PakSzesRisRbxz80CHOw2kmZBN
+# cTPvB5VjUxhpJ80wCfLFJFxpOoeCirD/uy3KrANeIZOSFbUPgRPxJoE3LBfFDDGx
+# BEuVN+yK4s0fc/ZG83QYHznJEbJvrOwss5fmWSVHfBjj6a0RhhuuiikfjkBhaHYl
+# M36wHE/g/062isigKOs0mWARNN5S9K0blTIgrZuAvUf/TZEuIh463VENzwEvPw/n
+# eZXfy9ycNYZHokm8W+QcAdX+mXdwAa9QpXPiPm56vTirz54gf8HMLUtBnD4krNdH
+# PlBKuqmFna5aHNjaEqF1WZORdgGeBh6AfRsT25RgkJhNZ6MZtsMjxbMxm6pHoBev
+# qE7ri4FxullMhI7XIc/YCX/nQAHz/Y+v2hbShmHG1ZEDNiZAk+uD0IlHpytWFvHA
+# EXi9J9b0w6JDWmPjnG2r4MRRaNSqgXR4c9hVAmYiHTPqzFSn6HG+CBAX4a/+Eqs/
+# vJIMAcjDkUE9effKjWUMi53xKIIbn7U7q2vwGaGCFM4wghTKBgorBgEEAYI3AwMB
 # MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIFOzSUjOPK6Vw9VgOkqVxiYtuK4Mt7/FbTor3+nVu97PAggGrQZYPck0
-# VBgPMjAyNjExMTQwODE3MDlaMAMCAQECEC0BXq9lI3pULS/86k3YMEqgghGnMIIE
+# BAIBBQAEILxlksRU5b2WMKbu/lD3s/z1xv5S8Z9pRqbH4yYehOywAggA+rhDaTIU
+# eBgPMjAyNjExMTUyMDA2NDBaMAMCAQECEDFlmFLG5c+OcGXAUOzvrPSgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -1293,13 +1315,13 @@ Export-ModuleMember -Function Show-PcmGui, New-PcmGuiWindow, New-PcmGuiRequest, 
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNDA4MTcwOVowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEICk+
-# P7nYO/o/9tJoR79J3chscE262zPI1GyJJe0GBq3GMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNTIwMDY0MFowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIGGT
+# x0HhWV+nqM5C9eK1mbvsHIKOAu8DjLPSVB+8aPDgMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiEAvS7j4I1Q7QNqlMamk+IBaOJw0S0hlaRp3+FWFX6N/BUCIE/P
-# 1aggaxJxI4Vk79wKJqkG/dy4fTdLSKy8qHPvBxj+
+# zj0EAwIERzBFAiEAoJKFhxZyCeTo8WN8Zsfy+kQ4vdWCgcmy7zP1iWpy8+wCIEZa
+# PCiUkK/DcS5Ojb+f/rYg6Cb9T2LpE8sgrIx3/XUd
 # SIG # End signature block

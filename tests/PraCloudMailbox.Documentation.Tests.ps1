@@ -13,7 +13,7 @@
       - the guides keep short sentences and common words (a simple readability measure).
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0
+    Version : 2.1.0
 #>
 #Requires -Version 7.5
 
@@ -440,13 +440,13 @@ Describe 'Readability of the user guide' {
 }
 
 Describe 'Troubleshooting: Entra Connect' {
-    It 'tells what to check when an object stays not recreated after several delta cycles, and never proposes an Initial cycle' {
-        $row = @($script:Guide -split "`n" | Where-Object { $_ -like '| An object stays *not recreated by Entra Connect yet*' })
+    It 'tells what to check when an object stays not recreated after several delta cycles, and names the full synchronisation only as a command of the Next steps that the tool never runs itself' {
+        $row = @($script:Guide -split "`n" | Where-Object { $_ -like '| An object stays *Entra Connect did not recreate it*' })
         $row.Count | Should -Be 1
         $row[0] | Should -Match 'Synchronization Service Manager'
         $row[0] | Should -Match 'metaverse object'
         $row[0] | Should -Match 'Entra connector'
-        $script:Guide | Should -Not -Match '(?i)-PolicyType\s+Initial|initial (sync|synchronisation|synchronization|cycle)'
+        $script:Guide | Should -Match 'Start-ADSyncSyncCycle -PolicyType Initial`; the tool never starts it by itself'
         $script:Cloud | Should -Not -Match '(?i)PolicyType Initial'
     }
     It 'tells what to do when the connector is busy, with the message of the tool' {

@@ -9,11 +9,13 @@
     wait function so that every poll advances the tenant by one tick.
     Faults: LicenceAssign400 (number of refused assignments), NeverMailbox (user IDs never provisioned),
     NoHoldStamp (the case hold is never stamped), DeleteFails (DELETE /users refused), NoRecreate (Entra Connect
-    does not recreate deleted objects), SendAsFails (Add-RecipientPermission refused),
+    does not recreate deleted objects), ObjectSyncFails (the targeted synchronisation of an object is refused), ObjectSyncNoEndpoint (it is refused because the ADSyncManagement endpoint cannot be reached remotely), ObjectSyncNoEffect (it answers Success and recreates nothing), SendAsFails (Add-RecipientPermission refused),
     CaseHoldDeployError (Set-CaseHoldPolicy records the change but reports 'failed to be deployed'),
     CaseHoldFails (Set-CaseHoldPolicy refuses every change),
     StopAfter (@{ Pattern; Path }: the stop file of the window is created after the first call that matches),
-    BatchThrottle (number of requests of a Graph batch answered 429 before the next ones succeed), ExoFilterFails (the
+    BatchThrottle (number of requests of a Graph batch answered 429 before the next ones succeed), BatchThrottleRetryAfter (seconds given in the Retry-After header of those answers),
+    SoaFails (user IDs whose source of authority cannot be moved to the cloud), NeverBack (user IDs that Exchange Online never switches back to a MailUser), RecycleReadFails (the
+    recycle bin cannot be read), ReleaseLagReads (a licence unit given back keeps showing as used for that many reads of the licences), ExoFilterFails (the
     filtered Exchange Online reads fail: the tool reads one object at a time). PageSize: users per page of /users.
     Microsoft Entra groups (Add-PraFakeEntraGroup): /groups by display name, e-mail address or mail nickname (the letter case ignored, as Graph does), /groups/{id}
     and /groups/{id}/transitiveMembers with paging (GroupPageSize members per page); the fault GroupReadDenied refuses them.
@@ -61,8 +63,8 @@ function global:New-PraFakeTenant {
         CasePolicy = $null
         CaseRules = [System.Collections.Generic.List[string]]::new()
         Scheduler = $true
-        Faults = @{ LicenceAssign400 = 0; NeverMailbox = @(); NoHoldStamp = $false; DeleteFails = $false; DeleteRejectedStatus = 0; DeleteAmbiguousStatus = 0; NoRecreate = $false; SendAsFails = $false; CaseHoldDeployError = $false; CaseHoldFails = $false; StopAfter = $null; BatchThrottle = 0; ExoFilterFails = $false
-            NewMailboxFails = $false; CrashAfterNewMailbox = $false; CrashAfterDelete = $false; CrashAfterContact = $false; NoEnterprise = $false
+        Faults = @{ LicenceAssign400 = 0; NeverMailbox = @(); NoHoldStamp = $false; DeleteFails = $false; DeleteRejectedStatus = 0; DeleteAmbiguousStatus = 0; NoRecreate = $false; ObjectSyncFails = $false; ObjectSyncNoEndpoint = $false; ObjectSyncNoEffect = $false; SendAsFails = $false; CaseHoldDeployError = $false; CaseHoldFails = $false; StopAfter = $null; BatchThrottle = 0; ExoFilterFails = $false
+            NewMailboxFails = $false; NewMailboxMessage = ''; CrashAfterNewMailbox = $false; CrashAfterDelete = $false; CrashAfterContact = $false; NoEnterprise = $false
             RecipientReadFails = $false; RecipientQueryFailsAt = 0; RecipientIdentityError = $null; RecipientIdentityEmpty = $false; RejectUnfilteredRecipientInventory = $false; GraphReadFails = $false
             RejectUnfilteredGraphInventory = $false; GraphQueryFailsAt = 0; GraphQueryUnsupported = $false; GraphAdvancedStatus = 0; GraphAdvancedFailsAt = 0; SignInDisableFails = $false; ContactFails = $false; ContactSoftDeletedAliasBlocks = $false; ContactSoftDeletedProxyBlocks = $false; NoInactive = $false; WrongInactiveHold = $false; WorkDaysAliasRead = $false; WorkTimeZoneObjectRead = $false
             DirectoryWriteFails = $false; DirectoryReadMismatch = $false; DirectoryNotesReadMismatch = $false; DirectoryNotesReadMissing = $false
@@ -83,6 +85,9 @@ function global:New-PraFakeTenant {
     }
     $global:PraFake.CasePolicy = @{ Name = 'PRA-HOLD'; Guid = '22222222-2222-2222-2222-222222222222'; CaseId = 'case-pra'; Locations = [System.Collections.Generic.List[string]]::new() }
     $global:PraFake.CasePolicies.Add($global:PraFake.CasePolicy)
+    $global:PraFake.Releasing = [System.Collections.Generic.List[hashtable]]::new()
+    $global:PraFake.Faults.BatchThrottleRetryAfter = 0; $global:PraFake.Faults.SoaFails = @(); $global:PraFake.Faults.NeverBack = @()
+    $global:PraFake.Faults.RecycleReadFails = $false; $global:PraFake.Faults.ReleaseLagReads = 0
 }
 
 function global:Get-PraFakeHoldTag {
@@ -175,6 +180,8 @@ function global:Step-PraFake {
             # The Teams storage (ComponentShared) becomes the primary mailbox when there is one.
             $user.Type = 'UserMailbox'; $user.ExchangeGuid = $(if ($user.Component) { $user.Component } else { [guid]::NewGuid().ToString() }); $user.Component = $null
             Write-PraFakeCall "Mailbox $($user.Upn) $($user.ExchangeGuid)"
+        } elseif ($user.Type -eq 'UserMailbox' -and -not $plan -and $user.DirSynced -and $fake.Faults.NeverBack -contains $user.Id) {
+            # Exchange Online does not switch this mailbox back.
         } elseif ($user.Type -eq 'UserMailbox' -and -not $plan -and $user.DirSynced -and $user.Holds.Count) {
             # Exchange cannot disable a mailbox on hold: the switch back is blocked.
             if (-not $user.ContainsKey('Blocked')) { $user['Blocked'] = $true; Write-PraFakeCall "BlockedByHold $($user.Upn)" }
@@ -239,6 +246,27 @@ function global:Invoke-PraFakeEntraConnect {
         }
     }
     return "fake $Operation"
+}
+
+function global:Invoke-PraFakeEntraConnectObject {
+    <# The targeted synchronisation of single objects (by distinguished name): the object comes back from AD unless a fault says otherwise. One answer per object (Dn, Ok, Detail). #>
+    param([Parameter(Mandatory)][string[]]$ObjectDn)
+    $fake = $global:PraFake
+    foreach ($dn in $ObjectDn) {
+        Write-PraFakeCall "EntraConnect SyncObject $dn"
+        if ($fake.Faults.ObjectSyncFails) { [pscustomobject]@{ Dn = $dn; Ok = $false; Detail = 'Filtered Object' }; continue }
+        if ($fake.Faults.ObjectSyncNoEndpoint) { [pscustomobject]@{ Dn = $dn; Ok = $false; Detail = 'There was no endpoint listening at net.pipe://localhost/ADSyncManagement that could accept the message' }; continue }
+        if (-not $fake.Faults.ObjectSyncNoEffect) {
+            $local = [regex]::Match($dn, '^CN=([^,]+)').Groups[1].Value
+            $ad = @($fake.Ad | Where-Object { ([string]$_.Upn -split '@')[0] -ieq $local }) | Select-Object -First 1
+            if ($ad -and -not @($fake.Users.Values | Where-Object { $_.ImmutableId -eq $ad.ImmutableId }).Count) {
+                $new = Add-PraFakeUser -Upn $ad.Upn -Kind $ad.Kind -OnPremGuid $ad.OnPremGuid -ImmutableId $ad.ImmutableId -UsageLocation ''
+                $fake.Ad.RemoveAt($fake.Ad.Count - 1)
+                Write-PraFakeCall "Recreated $($ad.Upn) $($new.Id)"
+            }
+        }
+        [pscustomobject]@{ Dn = $dn; Ok = $true; Detail = 'Create by Invoke-ADSyncSingleObjectSync' }
+    }
 }
 
 function global:Invoke-PraFakeWait {
@@ -427,9 +455,11 @@ function global:Invoke-MgGraphRequest {
             $skus = foreach ($id in $fake.Skus.Keys) {
                 $sku = $fake.Skus[$id]
                 $used = @($fake.Users.Values | Where-Object { $user = $_; @($user.Direct | Where-Object { $_.skuId -eq $id }).Count -or ($fake.Group.Members.Contains($user.Id) -and @($fake.Group.Licences | Where-Object { $_.skuId -eq $id }).Count) }).Count
+                $used += @($fake.Releasing | Where-Object { $_.SkuId -eq $id }).Count
                 [pscustomobject]@{ skuId = $id; skuPartNumber = $sku.Part; consumedUnits = $used; prepaidUnits = [pscustomobject]@{ enabled = $sku.Enabled }
                     servicePlans = @($sku.Plans | ForEach-Object { [pscustomobject]@{ servicePlanName = $_.Name; servicePlanId = $_.Id; appliesTo = $_.AppliesTo } }) }
             }
+            foreach ($releasing in @($fake.Releasing)) { $releasing.Reads--; if ($releasing.Reads -le 0) { [void]$fake.Releasing.Remove($releasing) } }
             return [pscustomobject]@{ value = @($skus) }
         }
         '^organization$' { return [pscustomobject]@{ value = @([pscustomobject]@{ id = 'org'; displayName = 'Contoso'; onPremisesSyncEnabled = $true; onPremisesLastSyncDateTime = '2026-10-07T08:00:00Z' }) } }
@@ -505,7 +535,11 @@ function global:Invoke-MgGraphRequest {
         }
         '^\$batch$' {
             $responses = foreach ($request in @($data.requests)) {
-                if ($fake.Faults.BatchThrottle -gt 0) { $fake.Faults.BatchThrottle--; [pscustomobject]@{ id = $request.id; status = 429; body = $null }; continue }
+                if ($fake.Faults.BatchThrottle -gt 0) {
+                    $fake.Faults.BatchThrottle--
+                    [pscustomobject]@{ id = $request.id; status = 429; body = $null; headers = $(if ($fake.Faults.BatchThrottleRetryAfter -gt 0) { @{ 'Retry-After' = [string]$fake.Faults.BatchThrottleRetryAfter } } else { $null }) }
+                    continue
+                }
                 $call = @{ Method = $request.method; Uri = ('v1.0' + $request.url) }
                 if ($request.ContainsKey('body') -and $null -ne $request.body) { $call.Body = ($request.body | ConvertTo-Json -Depth 8 -Compress) }
                 try { [pscustomobject]@{ id = $request.id; status = 200; body = (Invoke-MgGraphRequest @call) } }
@@ -563,7 +597,10 @@ function global:Invoke-MgGraphRequest {
         '^users/[^/]+/onPremisesSyncBehavior$' {
             $user = Resolve-PraFakeUser $parts[1]
             if (-not $user) { Stop-PraFakeGraph 404 'Request_ResourceNotFound' 'User not found.' }
-            if ($Method -eq 'PATCH') { $user.CloudManaged = [bool]$data.isCloudManaged; return $null }
+            if ($Method -eq 'PATCH') {
+                if ($data.isCloudManaged -and $fake.Faults.SoaFails -contains $user.Id) { Stop-PraFakeGraph 403 'Authorization_RequestDenied' 'The source of authority of this object cannot be changed.' }
+                $user.CloudManaged = [bool]$data.isCloudManaged; return $null
+            }
             return [pscustomobject]@{ isCloudManaged = $user.CloudManaged }
         }
         '^users/[^/]+/checkMemberGroups$' {
@@ -579,11 +616,16 @@ function global:Invoke-MgGraphRequest {
                     $user.Direct.Add(@{ skuId = [string]$licence.skuId; disabledPlans = @($licence.disabledPlans) })
                 }
             }
-            foreach ($skuId in @($data.removeLicenses)) { @($user.Direct | Where-Object { $_.skuId -eq $skuId }) | ForEach-Object { [void]$user.Direct.Remove($_) } }
+            foreach ($skuId in @($data.removeLicenses)) {
+                $held = @($user.Direct | Where-Object { $_.skuId -eq $skuId })
+                $held | ForEach-Object { [void]$user.Direct.Remove($_) }
+                if ($held.Count -and $fake.Faults.ReleaseLagReads -gt 0) { $fake.Releasing.Add(@{ SkuId = [string]$skuId; Reads = [int]$fake.Faults.ReleaseLagReads }) }
+            }
             return $null
         }
         '^directory/deletedItems/[^/]+$' {
             if ($parts[2] -eq 'microsoft.graph.user') { return Get-PraFakeGraphPage -Path $path -Query ([string]$query) -Headers $Headers }
+            if ($Method -eq 'GET' -and $fake.Faults.RecycleReadFails) { Stop-PraFakeGraph 403 'Authorization_RequestDenied' 'The recycle bin cannot be read.' }
             if (-not $fake.Recycle.Contains($parts[2])) { Stop-PraFakeGraph 404 'Request_ResourceNotFound' 'Deleted item not found.' }
             if ($Method -eq 'DELETE') { $fake.Recycle.Remove($parts[2]); return $null }
             return ConvertTo-PraFakeGraphUser $fake.Recycle[$parts[2]]
@@ -907,7 +949,7 @@ function global:Set-Mailbox {
 
 function global:New-Mailbox {
     [CmdletBinding()] param([string]$Name, [string]$Alias, [string]$DisplayName, [string]$PrimarySmtpAddress, [switch]$Room, [switch]$Equipment)
-    if ($global:PraFake.Faults.NewMailboxFails) { throw 'New-Mailbox refused.' }
+    if ($global:PraFake.Faults.NewMailboxFails) { throw $(if ($global:PraFake.Faults.NewMailboxMessage) { $global:PraFake.Faults.NewMailboxMessage } else { 'New-Mailbox refused.' }) }
     if (Resolve-PraFakeUser $PrimarySmtpAddress) { throw 'Address already assigned.' }
     $kind = if ($Room) { 'Room' } else { 'Equipment' }
     $user = Add-PraFakeUser -Upn $PrimarySmtpAddress -Kind $kind -UsageLocation ''
@@ -1098,6 +1140,6 @@ $global:PraFakeCommands = @('Add-PraFakeEntraGroup', 'Get-MgContext', 'Get-MgReq
     'Get-MailboxPermission', 'Add-MailboxPermission', 'Get-RecipientPermission', 'Add-RecipientPermission', 'Get-CaseHoldPolicy', 'Set-CaseHoldPolicy', 'New-CaseHoldPolicy', 'New-CaseHoldRule',
     'New-PraFakeTenant', 'Get-PraFakeHoldTag', 'Add-PraFakeUser', 'Write-PraFakeCall', 'Resolve-PraFakeUser', 'Test-PraFakeExchangePlan', 'Step-PraFake',
     'New-PraFakeResourceSettings',
-    'Invoke-PraFakeEntraConnect', 'Invoke-PraFakeWait', 'Stop-PraFakeGraph', 'ConvertTo-PraFakeGraphUser', 'Get-PraFakeUserOrError',
+    'Invoke-PraFakeEntraConnect', 'Invoke-PraFakeEntraConnectObject', 'Invoke-PraFakeWait', 'Stop-PraFakeGraph', 'ConvertTo-PraFakeGraphUser', 'Get-PraFakeUserOrError',
     'ConvertFrom-PraFakeGraphFilter', 'Test-PraFakeGraphFilter', 'Get-PraFakeGraphPage',
     'Get-PraFakeFiltered', 'ConvertTo-PraFakeRecipient', 'Get-PraFakeLocationText', 'Get-EXORecipient', 'Get-EXOMailbox')

@@ -8,6 +8,7 @@
       ReadHang     Get-OrganizationConfig never answers, and reacts to a stop (an HTTP call that is waiting)
       ReadStuck    Get-OrganizationConfig never answers and does not react to a stop (a call blocked in a native wait)
       WriteHang    Set-MailUser never answers, and reacts to a stop
+      Interrupt    the run is stopped from outside during Set-MailUser, as Ctrl+C stops it (no call is late)
       WriteDone    the write goes through (the run that continues the batch)
     Whatever the scenario, the file guard-after.txt of the work folder says how many guard aliases and proxy commands the session holds at its end.
 .NOTES
@@ -83,6 +84,7 @@ function global:Get-OrganizationConfig {
 function global:Set-MailUser {
     [CmdletBinding()] param([Parameter(Position = 0)][string]$Identity, [object]$ExchangeGuid)
     if ($env:PCM_TEST_SCENARIO -eq 'WriteHang') { Microsoft.PowerShell.Utility\Start-Sleep -Seconds 3600 }
+    if ($env:PCM_TEST_SCENARIO -eq 'Interrupt') { $null = (Get-PcmRunningPipeline).StopAsync(); Microsoft.PowerShell.Utility\Start-Sleep -Seconds 60 }
     & $global:PraChildRealSetMailUser @PSBoundParameters
 }
 

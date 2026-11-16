@@ -105,6 +105,8 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
             param([ValidateSet('Check', 'Convert', 'Recover')][string]$Action, [string]$Mode = 'Apply', [string]$Batch = '', [string]$Identity = '', [string]$Scope = 'All', [Alias('IdentityPath')][string]$CsvPath = '',
                 [string]$SearchBase = '', [string]$Group = '', [int]$MaxObjects = 0, [string]$Expect = '', [switch]$Once, [switch]$ResolveOnly)
             Close-E2E
+            # The snapshot file is the one that a Collect left, with its hash file (a Convert or a Recover in Apply mode stops on a snapshot that has none).
+            if (Test-Path -LiteralPath $global:PraE2E.Db -PathType Leaf) { $null = Write-PcmHashFile -Path $global:PraE2E.Db }
             $config = Import-PcmConfiguration -Path $global:PraE2E.Config -Root $global:PraE2E.Root
             $run = @{ Root = $global:PraE2E.Root; Version = 'test'; RunId = [guid]::NewGuid().ToString('N'); StartTime = Get-Date; Action = $Action; Mode = $Mode; Phase = ''
                 CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; StepTotal = 7; Warnings = 0
@@ -165,6 +167,12 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
             param([string]$BatchId)
             $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal -ReadOnly
             try { return [pscustomobject]@{ Batch = (Get-PcmBatch $journal -Id $BatchId); Items = @(Get-PcmBatchItem $journal $BatchId); Changes = @(Get-PcmTenantChange $journal $BatchId) } }
+            finally { Close-PcmStore $journal }
+        }
+        function Get-E2EEvent {
+            param([string]$BatchId)
+            $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal -ReadOnly
+            try { return @(Invoke-PcmSql $journal 'SELECT step, outcome, detail FROM batch_event WHERE batch_id = @b' @{ b = $BatchId } -As Rows) }
             finally { Close-PcmStore $journal }
         }
         function Close-E2E {
@@ -231,6 +239,7 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         Mock Connect-PcmCompliance { }
         Mock Get-PcmGraphRole { @('User.ReadWrite.All', 'User-OnPremisesSyncBehavior.ReadWrite.All', 'LicenseAssignment.ReadWrite.All', 'Organization.Read.All', 'GroupMember.ReadWrite.All', 'Group-OnPremisesSyncBehavior.ReadWrite.All') }
         Mock Invoke-PcmEntraConnect { Invoke-PraFakeEntraConnect -Operation $Operation }
+        Mock Invoke-PcmEntraConnectObject { Invoke-PraFakeEntraConnectObject -ObjectDn $ObjectDn }
         Mock Wait-PcmCondition { Invoke-PraFakeWait -Test $Test -TimeoutSeconds $TimeoutSeconds -IntervalSeconds $IntervalSeconds }
         Mock Wait-PcmCondition -ModuleName PRA.Cloud { Invoke-PraFakeWait -Test $Test -TimeoutSeconds $TimeoutSeconds -IntervalSeconds $IntervalSeconds }
         Mock Start-Sleep { Step-PraFake }
@@ -1959,6 +1968,22 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         @($global:PraFake.Calls | Where-Object { $_ -match 'DELETE' }) | Should -BeNullOrEmpty
     }
 
+    It 'shows the error of Exchange Online without the empty parts between its separators (<Text>)' -TestCases @(
+        @{ Text = '||You can''t use the domain contoso.local because it''s not an accepted domain for your organization.' },
+        @{ Text = ' | |You can''t use the domain contoso.local because it''s not an accepted domain for your organization.' },
+        @{ Text = '|| You can''t use the domain contoso.local because it''s not an accepted domain for your organization.' }) {
+        param($Text)
+        $null = Add-E2ENativeResource -Only
+        $global:PraFake.Faults.NewMailboxFails = $true
+        $global:PraFake.Faults.NewMailboxMessage = $Text
+        Start-E2E -Action Convert
+        Invoke-PcmConvert
+        $row = Get-E2ERow 'room@contoso.com'
+        $row.FinalStatus | Should -Be Error
+        $row.Detail | Should -Match '^Convert stopped: You can''t use the domain contoso\.local because it''s not an accepted domain for your organization\.'
+        $row.Detail | Should -Not -Match '\|\s*\|'
+    }
+
     It 'keeps native creation intent when configuration changes after the creation response was lost' {
         $null = Add-E2ENativeResource -Only
         $global:PraFake.Faults.CrashAfterNewMailbox = $true
@@ -2653,11 +2678,13 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         $convert = $context.BatchId
         Close-E2E
         $global:PraFake.Faults.NoRecreate = $true
+        $global:PraFake.Faults.ObjectSyncFails = $true
         Start-E2E -Action Recover -Batch $convert
         Invoke-PcmRecover
         (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Pending'
         Close-E2E
         $global:PraFake.Faults.NoRecreate = $false
+        $global:PraFake.Faults.ObjectSyncFails = $false
         $global:PraFake.Calls.Clear()
         Start-E2E -Action Recover -Batch $convert
         Invoke-PcmRecover
@@ -2665,6 +2692,118 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         @($global:PraFake.Calls | Where-Object { $_ -match 'Graph DELETE|CaseHold' }) | Should -BeNullOrEmpty
         (Get-E2ECallIndex 'Recreated compta@') | Should -BeGreaterThan -1
         (Get-E2EJournal $context.BatchId).Batch.status | Should -Be 'Complete'
+    }
+
+    It 'synchronises on its own a shared identity that a delta cycle did not recreate, and records the step in the journal' {
+        Start-E2E -Action Convert -Scope SharedOnly
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        Close-E2E
+        $global:PraFake.Faults.NoRecreate = $true
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Success'
+        $sync = Get-E2ECallIndex 'EntraConnect SyncObject CN=compta,'
+        $sync | Should -BeGreaterThan (Get-E2ECallIndex 'EntraConnect Delta')
+        (Get-E2ECallIndex 'Recreated compta@') | Should -BeGreaterThan $sync
+        @($global:PraFake.Calls | Where-Object { $_ -match 'Initial' }) | Should -BeNullOrEmpty
+        $events = Get-E2EEvent $context.BatchId
+        @($events | Where-Object { $_.step -eq 'TargetedSync' -and $_.outcome -eq 'Ok' }).Count | Should -Be 1
+        (Get-E2EJournal $context.BatchId).Batch.status | Should -Be 'Complete'
+    }
+    It 'stops with PENDING and the exact full-synchronisation command when the targeted synchronisation fails, and never runs a full one itself' {
+        Start-E2E -Action Convert -Scope SharedOnly
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        Close-E2E
+        $global:PraFake.Faults.NoRecreate = $true
+        $global:PraFake.Faults.ObjectSyncFails = $true
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        $row = Get-E2ERow 'compta@contoso.com'
+        $row.FinalStatus | Should -Be 'Pending'
+        $row.Detail | Should -Match 'did not recreate it \(targeted synchronisation of the object: Filtered Object\): run a full synchronisation on the Entra Connect server, then run Recover -Batch'
+        $next = @($context.NextSteps)
+        $initial = [Array]::IndexOf($next, 'Start-ADSyncSyncCycle -PolicyType Initial')
+        $initial | Should -BeGreaterThan 0
+        $next[0] | Should -Match 'Run a full synchronisation on aadc'
+        ($next[($initial + 2)]) | Should -Match 'Recover -Mode Apply -Batch'
+        @($global:PraFake.Calls | Where-Object { $_ -match 'Initial' }) | Should -BeNullOrEmpty
+        @(Get-E2EEvent $context.BatchId | Where-Object { $_.step -eq 'TargetedSync' -and $_.outcome -eq 'Fail' }).Count | Should -Be 1
+        Close-E2E
+        $global:PraFake.Faults.NoRecreate = $false
+        $global:PraFake.Faults.ObjectSyncFails = $false
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Success'
+        (Get-E2EJournal $context.BatchId).Batch.status | Should -Be 'Complete'
+    }
+    It 'says in plain words that the full synchronisation works only in a session on the Entra Connect server when the object synchronisation could not reach its endpoint remotely' {
+        Start-E2E -Action Convert -Scope SharedOnly
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        Close-E2E
+        $global:PraFake.Faults.NoRecreate = $true
+        $global:PraFake.Faults.ObjectSyncNoEndpoint = $true
+        foreach ($connectMode in @('REMOTING', 'script')) {
+            Start-E2E -Action Recover -Batch $convert
+            $context.Config.EntraConnect.Mode = $connectMode
+            Invoke-PcmRecover
+            (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Pending'
+            $next = @($context.NextSteps)
+            $initial = [Array]::IndexOf($next, 'Start-ADSyncSyncCycle -PolicyType Initial')
+            $initial | Should -BeGreaterThan 0
+            $next[0] | Should -Match 'works only in a session opened ON the Entra Connect server \(aadc\) itself'
+            $next[0] | Should -Match 'not through remoting or a script run remotely'
+            ($next[($initial + 2)]) | Should -Match 'Recover -Mode Apply -Batch'
+            Close-E2E
+        }
+        $global:PraFake.Faults.NoRecreate = $false
+        $global:PraFake.Faults.ObjectSyncNoEndpoint = $false
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Success'
+    }
+    It 'keeps the usual full-synchronisation text with the Manual mode, or when the refusal was not about the endpoint' {
+        Start-E2E -Action Convert -Scope SharedOnly
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        Close-E2E
+        $global:PraFake.Faults.NoRecreate = $true
+        $global:PraFake.Faults.ObjectSyncNoEndpoint = $true
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        @($context.NextSteps)[0] | Should -Match 'even after it synchronised each object on its own'
+        @($context.NextSteps)[0] | Should -Not -Match 'works only in a session'
+        Close-E2E
+        $global:PraFake.Faults.ObjectSyncNoEndpoint = $false
+        $global:PraFake.Faults.ObjectSyncFails = $true
+        Start-E2E -Action Recover -Batch $convert
+        $context.Config.EntraConnect.Mode = 'Remoting'
+        Invoke-PcmRecover
+        @($context.NextSteps)[0] | Should -Match 'even after it synchronised each object on its own'
+        @($context.NextSteps)[0] | Should -Not -Match 'works only in a session'
+    }
+    It 'does not repeat a targeted synchronisation that was done: a resumed Recover goes to the PENDING message at once' {
+        Start-E2E -Action Convert -Scope SharedOnly
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        Close-E2E
+        $global:PraFake.Faults.NoRecreate = $true
+        $global:PraFake.Faults.ObjectSyncNoEffect = $true
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Pending'
+        @($global:PraFake.Calls | Where-Object { $_ -match 'EntraConnect SyncObject' }).Count | Should -Be 1
+        Close-E2E
+        $global:PraFake.Calls.Clear()
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        $row = Get-E2ERow 'compta@contoso.com'
+        $row.FinalStatus | Should -Be 'Pending'
+        $row.Detail | Should -Match 'targeted synchronisation of the object: done by an earlier run'
+        @($global:PraFake.Calls | Where-Object { $_ -match 'EntraConnect SyncObject' }) | Should -BeNullOrEmpty
+        @($context.NextSteps) | Should -Contain 'Start-ADSyncSyncCycle -PolicyType Initial'
     }
 
     It 'rolls back like a user a shared mailbox whose Convert stopped half-way, without deleting it (review 4)' {
@@ -3080,6 +3219,37 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         { Invoke-PcmRecover } | Should -Throw '*Every object asked for is already done (already rolled back by this Recover batch)*Nothing was changed*'
         $context.NoChangeMade | Should -BeTrue
         Close-E2E
+    }
+    It 'resumes a Convert wave given again by -CsvPath: the objects already finished are skipped with their reason, not refused' {
+        $wave = Join-Path $global:PraE2E.Dir 'wave-convert-resume.csv'
+        Set-Content -LiteralPath $wave -Encoding UTF8 -Value 'IDENTITY', 'alice@contoso.com', 'COMPTA@contoso.com'
+        $original = [IO.File]::ReadAllText($global:PraE2E.Config)
+        [IO.File]::WriteAllText($global:PraE2E.Config, $original.Replace("Shared = @{ SkuPartNumber = 'E5' }", "Shared = @{ SkuPartNumber = 'E5'; KeepFree = 1 }"), [Text.UTF8Encoding]::new($true))
+        $global:PraFake.Skus['sku-e5'].Enabled = 2
+        Start-E2E -Action Convert -CsvPath $wave
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        (Get-E2ERow 'alice@contoso.com').FinalStatus | Should -Be 'Success'
+        (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Error'
+        (Get-E2EJournal $convert).Batch.status | Should -Be 'Partial'
+        Close-E2E
+        [IO.File]::WriteAllText($global:PraE2E.Config, $original, [Text.UTF8Encoding]::new($true))
+        Start-E2E -Action Convert -Batch $convert -CsvPath $wave
+        Invoke-PcmConvert
+        (Get-E2ERow 'compta@contoso.com').FinalStatus | Should -Be 'Success'
+        @($context.SkippedMembers) | Should -Be @("alice@contoso.com (already finished in Convert batch $convert)")
+        (Get-E2EJournal $convert).Batch.status | Should -Be 'Complete'
+    }
+    It 'refuses in plain words a Convert resume whose list holds only finished objects, and changes nothing' {
+        $wave = Join-Path $global:PraE2E.Dir 'wave-convert-done.csv'
+        Set-Content -LiteralPath $wave -Encoding UTF8 -Value 'Identity', 'alice@contoso.com'
+        Start-E2E -Action Convert -CsvPath $wave
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        Close-E2E
+        Start-E2E -Action Convert -Batch $convert -CsvPath $wave
+        { Invoke-PcmConvert } | Should -Throw '*Every object asked for is already done (already finished in Convert batch*Nothing was changed*'
+        $context.NoChangeMade | Should -BeTrue
     }
     It 'stops Convert before the next object when the window asks, then the batch resumes' {
         $stop = Join-Path $global:PraE2E.Dir 'run.stop'
@@ -3634,14 +3804,17 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         $html = [IO.File]::ReadAllText($result.Html)
         $html | Should -Match 'Batch [0-9a-f]{8} from end to end'
         $html | Should -Match 'Polling.IntervalSeconds: 20 -&gt; 5'
-        $html | Should -Match 'Journey of alice@contoso.com'
         $html | Should -Match 'Follow-up check of this run'
-        $html | Should -Not -Match '<script'
+        $html | Should -Not -Match 'https?://'
+        $data = Read-PcmGlobalReportData -Html $html
+        $alice = [array]::IndexOf(@($data.Objects | ForEach-Object { $_.Identity }), 'alice@contoso.com')
+        $alice | Should -BeGreaterOrEqual 0
+        @($data.Events | Where-Object { $_.Object -eq $alice -and $_.Step -eq 'MailboxReady' }).Count | Should -BeGreaterThan 0
         $rows = @(Import-Csv -LiteralPath $result.Csv -Delimiter ';')
         $rows.Count | Should -Be 2
         ($rows | Where-Object Identity -eq 'alice@contoso.com').Verdict | Should -Be 'Rolled back'
         ($rows | Where-Object Identity -eq 'bob@contoso.com').Verdict | Should -Be 'Converted'
-        ($rows | Where-Object Identity -eq 'alice@contoso.com').Journey | Should -Match 'MailboxReady'
+        @(Import-Csv -LiteralPath $result.EventsCsv -Delimiter ';' | Where-Object { $_.Identity -eq 'alice@contoso.com' -and $_.Step -eq 'MailboxReady' }).Count | Should -BeGreaterThan 0
         $result.Html | Should -Match "_batch$convert`_global\.html$"
     }
     It 'records the run in the journal at the end of an Apply, and adds the global report path to the next steps' -Tag 'FollowUp' {
@@ -3652,8 +3825,11 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         Write-PcmBatchRecord
         $context.GlobalReportPath | Should -Match "_batch$convert`_global\.html$" -Because (@(Get-Content -LiteralPath $context.LogFile | Where-Object { $_ -match 'WARN|ERROR' }) -join ' | ')
         $context.GlobalReportPath | Should -Exist
-        @($context.NextSteps)[-2] | Should -Match "^Global report of batch $convert"
-        @($context.NextSteps)[-1] | Should -Be $context.GlobalReportPath
+        @($context.NextSteps)[-4] | Should -Match "^Global report of batch $convert"
+        @($context.NextSteps)[-3] | Should -Be $context.GlobalReportPath
+        @($context.NextSteps)[-2] | Should -Match "^Events of batch $convert"
+        @($context.NextSteps)[-1] | Should -Match "_batch$convert`_global_events\.csv$"
+        @($context.NextSteps)[-1] | Should -Exist
         Close-E2E
         $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal -ReadOnly
         try {

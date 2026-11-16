@@ -19,7 +19,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0
+    Version : 2.1.0
     History : see CHANGELOG.md
 #>
 #Requires -Version 7.5
@@ -434,14 +434,18 @@ function ConvertTo-PcmPlainMessage {
     <#
     .SYNOPSIS
         The text of an error without its stack: the lines "at Namespace.Type.Method(...)", "at <ScriptBlock>, file: line N" and "--- End of ... stack trace ---" are removed.
-        The card, the console and the report show this text; the log keeps the whole detail.
+        The card, the console and the report show this text; the log keeps the whole detail. The empty parts that Exchange Online puts between its separators ("||You can't use...")
+        are removed too, so that no stray pipe is shown.
     #>
     [CmdletBinding()]
     param([AllowNull()][AllowEmptyString()][string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return '' }
     $frame = '^\s*(at\s+(<[^>\r\n]+>|[^\s(,]+\([^\r\n]*|[^\s,]+,\s+[^\r\n]*?\bline\s+\d+[^\r\n]*)|---\s*End of [^\r\n]*---)\s*$'
     $kept = @([regex]::Split($Text, '\r?\n') | Where-Object { $_ -notmatch $frame })
-    return (($kept -join [Environment]::NewLine).TrimEnd())
+    $plain = ($kept -join [Environment]::NewLine).TrimEnd()
+    $plain = [regex]::Replace($plain, '\|(?:[ \t]*\|)+', '|')
+    $plain = [regex]::Replace($plain, '(?m)^[ \t]*\|[ \t]*|(?<=:[ \t]+)\|[ \t]*', '')
+    return ([regex]::Replace($plain, '(?m)[ \t]*\|[ \t]*(?=\r?$)', ''))
 }
 
 function Add-PcmWarning {
@@ -889,7 +893,7 @@ function Get-PcmDefaultConfiguration {
         Collect = @{
             SharedPermissions=$true; ExpandGroupTrustees=$true; ExcludeTrustees=@(); MailboxStatistics=$false
             Contacts=$false; ContactsSearchBase=''; DistributionGroups=$false; DistributionGroupsSearchBase=''; DynamicDistributionGroups=$false
-            TargetGroups=@()
+            TargetGroups=@(); MaxDropPercent=50
             Schedule=@{ TaskName='PraCloudMailbox Collect'; At='02:00' }
         }
         Store = @{ Path='.\data\PraCloudMailbox.db'; KeepSnapshots=10; BackupFolder='.\data\backup'; MaxSnapshotAgeDays=7; JournalPath='.\data\PraCloudMailbox-journal.db' }
@@ -903,7 +907,7 @@ function Get-PcmDefaultConfiguration {
         Recover = @{ WaveSize=0 }
         Retention = @{ TagAttribute='CustomAttribute1'; TagValue='Converted'; HoldPolicy=''; HoldPolicyLimit=1000 }
         Resources = @{ LicensingGroupId=''; OnPremisesRoutingDomain=''; OnPremisesReady=$false; AllowUnprotectedDeletion=$false; Parallel=100 }
-        EntraConnect = @{ Mode='Remoting'; Server=''; ScriptPath=''; MinVersion='2.5.76.0' }
+        EntraConnect = @{ Mode='Remoting'; Server=''; ScriptPath=''; CredentialPath=''; MinVersion='2.5.76.0' }
         Logging = @{ Folder='.\logs' }
         Report = @{ Enabled=$true; Folder='.\reports' }
     }
@@ -994,7 +998,7 @@ function Assert-PcmOutputFolder {
         Refuses an output folder inside the authenticated package other than its own canonical folder.
     .DESCRIPTION
         The package integrity check treats every file of the package as stable except the generated root
-        folders data, logs and reports (exact case). A backup, log or report folder anywhere else inside
+        folders data, logs and reports (the letter case of their name does not matter). A backup, log or report folder anywhere else inside
         the package would make the next start fail, so it is refused here, before any file is created. The
         test uses the physical location of the package and of the folder (Get-PcmPhysicalPath), so a \\?\ prefix,
         an 8.3 name, a junction, SUBST or a legacy alias such as 'Documents and Settings' cannot hide the package;
@@ -1010,7 +1014,7 @@ function Assert-PcmOutputFolder {
     if ($lexical) {
         $relative = $full.Substring($rootFull.Length).TrimStart('\')
         $first = if ($relative) { $relative.Split('\')[0] } else { '' }
-        if (-not [string]::Equals($first, $Canonical, [StringComparison]::Ordinal)) {
+        if (-not [string]::Equals($first, $Canonical, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Configuration: $Name ($full) is inside the signed package and is not the $Canonical folder. Use '.\$Canonical' (a sub-folder of it is accepted) or a folder outside the package; any other folder inside the package would break package integrity."
         }
         $current = $rootFull
@@ -1034,6 +1038,13 @@ function Assert-PcmOutputFolder {
     }
     $relative = $physical.Substring($physicalRoot.Length).TrimStart('\')
     $first = if ($relative) { $relative.Split('\')[0] } else { '' }
+    # A folder that does not exist yet is created with the canonical spelling, whatever case the configuration wrote.
+    if ($first -and [string]::Equals($first, $Canonical, [StringComparison]::OrdinalIgnoreCase) -and -not [string]::Equals($first, $Canonical, [StringComparison]::Ordinal) -and
+        -not (Test-Path -LiteralPath ($physicalRoot + '\' + $first))) {
+        $physical = $physicalRoot + '\' + $Canonical + $relative.Substring($first.Length)
+        $relative = $physical.Substring($physicalRoot.Length).TrimStart('\')
+        $first = $Canonical
+    }
     if (-not [string]::Equals($first, $Canonical, [StringComparison]::Ordinal)) {
         throw "Configuration: $Name ($full) resolves to $physical, inside the signed package, and is not the $Canonical folder. Use '.\$Canonical' (a sub-folder of it is accepted) or a folder outside the package; any other folder inside the package would break package integrity."
     }
@@ -1074,10 +1085,10 @@ function Import-PcmConfiguration {
     }
     Merge-PcmConfiguration $config (Get-PcmDefaultConfiguration)
 
-    if ($config.Environment -notmatch '^[A-Za-z0-9_.-]{1,64}$') { throw 'Configuration: Environment must be 1 to 64 letters, digits, dot, dash or underscore (it is used in file names).' }
+    if ($config.Environment -notmatch '^[A-Za-z0-9_.-]{1,64}\z') { throw 'Configuration: Environment must be 1 to 64 letters, digits, dot, dash or underscore (it is used in file names).' }
     $exchange = $config.Exchange
     foreach ($name in @('Server','DomainController')) {
-        if ($exchange[$name] -and $exchange[$name] -notmatch '^[A-Za-z0-9.-]+$') { throw "Configuration: Exchange.$name must be a host name." }
+        if ($exchange[$name] -and $exchange[$name] -notmatch '^[A-Za-z0-9.-]+\z') { throw "Configuration: Exchange.$name must be a host name." }
     }
     $scope = $config.Scope
     $official = Resolve-PcmOfficialValue ([string]$scope.Mode) @('Auto','OU','Group','Csv')
@@ -1094,12 +1105,13 @@ function Import-PcmConfiguration {
     $groupId = [guid]::Empty
     if ($resources.LicensingGroupId -and -not [guid]::TryParse($resources.LicensingGroupId, [ref]$groupId)) { throw 'Configuration: Resources.LicensingGroupId must be the object ID (GUID) of the cloud licence group.' }
     if ($resources.LicensingGroupId) { $resources.LicensingGroupId = $groupId.ToString() }
-    if ($resources.OnPremisesRoutingDomain -and ($resources.OnPremisesRoutingDomain.Length -gt 253 -or $resources.OnPremisesRoutingDomain -notmatch '^(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$')) { throw 'Configuration: Resources.OnPremisesRoutingDomain must be a DNS domain (not an email address or URL).' }
+    if ($resources.OnPremisesRoutingDomain -and ($resources.OnPremisesRoutingDomain.Length -gt 253 -or $resources.OnPremisesRoutingDomain -notmatch '^(?=.{1,253}\z)([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}\z')) { throw 'Configuration: Resources.OnPremisesRoutingDomain must be a DNS domain (not an email address or URL).' }
     if ($resources.Parallel -isnot [int] -or $resources.Parallel -lt 1 -or $resources.Parallel -gt 1000) { throw 'Configuration: Resources.Parallel must be a whole number between 1 and 1000.' }
     $store = $config.Store
     if ($store.KeepSnapshots -lt 1 -or $store.KeepSnapshots -gt 1000) { throw 'Configuration: Store.KeepSnapshots must be between 1 and 1000.' }
     if ($store.MaxSnapshotAgeDays -lt 1 -or $store.MaxSnapshotAgeDays -gt 365) { throw 'Configuration: Store.MaxSnapshotAgeDays must be between 1 and 365.' }
     if (-not $store.Path) { throw 'Configuration: Store.Path is empty (SQLite database file).' }
+    if ($config.Collect.MaxDropPercent -lt 0 -or $config.Collect.MaxDropPercent -gt 100) { throw 'Configuration: Collect.MaxDropPercent must be a whole number between 0 and 100 (a Collect that finds more than this percentage fewer mailboxes than the last complete snapshot, or none, is refused; 100 accepts any size).' }
     $targetGroups = [System.Collections.Generic.List[string]]::new()
     foreach ($entry in @($config.Collect.TargetGroups)) {
         $text = ([string]$entry).Trim()
@@ -1119,17 +1131,17 @@ function Import-PcmConfiguration {
     if (-not $official) { throw 'Configuration: Cloud.SignIn must be Certificate (the app registration signs in with its certificate) or Interactive (an administrator signs in with a Microsoft 365 account).' }
     $cloud.SignIn = $official
     $cloud.UserPrincipalName = ([string]$cloud.UserPrincipalName).Trim()
-    if ($cloud.UserPrincipalName -and $cloud.UserPrincipalName -notmatch '^[^@\s]+@[^@\s]+$') { throw 'Configuration: Cloud.UserPrincipalName must be the sign-in name of the administrator (admin@contoso.com).' }
+    if ($cloud.UserPrincipalName -and $cloud.UserPrincipalName -notmatch '^[^@\s]+@[^@\s]+\z') { throw 'Configuration: Cloud.UserPrincipalName must be the sign-in name of the administrator (admin@contoso.com).' }
     if ($cloud.SignIn -eq 'Interactive' -and -not $cloud.TenantId) { throw 'Configuration: Cloud.SignIn = Interactive requires Cloud.TenantId (the sign-in must go to the right tenant).' }
     if ($cloud.SignIn -eq 'Certificate' -and [bool]$cloud.AppId -ne [bool]$cloud.CertificateThumbprint) { throw 'Configuration: Cloud.AppId and Cloud.CertificateThumbprint go together (certificate sign-in of the app registration).' }
-    if ($cloud.TenantId -and $cloud.TenantId -notmatch '^[0-9a-fA-F-]{36}$') { throw 'Configuration: Cloud.TenantId must be the tenant GUID.' }
-    if ($cloud.Organization -and $cloud.Organization -notmatch '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$') { throw 'Configuration: Cloud.Organization must be the initial domain (tenant.onmicrosoft.com).' }
+    if ($cloud.TenantId -and $cloud.TenantId -notmatch '^[0-9a-fA-F-]{36}\z') { throw 'Configuration: Cloud.TenantId must be the tenant GUID.' }
+    if ($cloud.Organization -and $cloud.Organization -notmatch '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}\z') { throw 'Configuration: Cloud.Organization must be the initial domain (tenant.onmicrosoft.com).' }
     if ($cloud.TenantId) { $cloud.TenantId = ([string]$cloud.TenantId).ToLowerInvariant() }
     $users = $config.Licensing.Users
     $official = Resolve-PcmOfficialValue ([string]$users.Mode) @('Group','Kiosk','Direct')
     if (-not $official) { throw 'Configuration: Licensing.Users.Mode must be Group, Kiosk or Direct.' }
     $users.Mode = $official
-    if ($users.Mode -eq 'Group' -and $users.GroupId -and $users.GroupId -notmatch '^[0-9a-fA-F-]{36}$') { throw 'Configuration: Licensing.Users.GroupId must be the object ID (GUID) of the licence group.' }
+    if ($users.Mode -eq 'Group' -and $users.GroupId -and $users.GroupId -notmatch '^[0-9a-fA-F-]{36}\z') { throw 'Configuration: Licensing.Users.GroupId must be the object ID (GUID) of the licence group.' }
     if ($users.GroupId) { $users.GroupId = ([string]$users.GroupId).ToLowerInvariant() }
     if ($users.Mode -eq 'Direct' -and -not $users.SkuPartNumber) { throw 'Configuration: Licensing.Users.Mode = Direct requires Licensing.Users.SkuPartNumber.' }
     $parallel = $config.Licensing.Shared.Parallel
@@ -1139,19 +1151,19 @@ function Import-PcmConfiguration {
     $waveSize = $config.Recover.WaveSize
     if ($waveSize -isnot [int] -or $waveSize -lt 0 -or $waveSize -gt 1000) { throw 'Configuration: Recover.WaveSize must be a whole number between 1 and 1000 (shared mailboxes rolled back together), or 0 to use Licensing.Shared.Parallel.' }
     $retention = $config.Retention
-    if ($retention.TagAttribute -notmatch '^CustomAttribute([1-9]|1[0-5])$') { throw 'Configuration: Retention.TagAttribute must be CustomAttribute1 to CustomAttribute15.' }
+    if ($retention.TagAttribute -notmatch '^CustomAttribute([1-9]|1[0-5])\z') { throw 'Configuration: Retention.TagAttribute must be CustomAttribute1 to CustomAttribute15.' }
     $retention.TagAttribute = 'CustomAttribute' + $Matches[1]
     if (-not $retention.TagValue) { throw 'Configuration: Retention.TagValue is empty.' }
     $limit = $retention.HoldPolicyLimit
     if ($limit -isnot [int] -or $limit -lt 1 -or $limit -gt 1000) { throw 'Configuration: Retention.HoldPolicyLimit must be a whole number between 1 and 1000 (mailboxes per case hold policy; 1000 is the Microsoft Purview limit).' }
     try { $null = [version]$config.EntraConnect.MinVersion } catch { throw 'Configuration: EntraConnect.MinVersion must be a version number (2.5.76.0).' }
-    if ($config.EntraConnect.Server -and $config.EntraConnect.Server -notmatch '^[A-Za-z0-9.-]+$') { throw 'Configuration: EntraConnect.Server must be a host name.' }
+    if ($config.EntraConnect.Server -and $config.EntraConnect.Server -notmatch '^[A-Za-z0-9.-]+\z') { throw 'Configuration: EntraConnect.Server must be a host name.' }
     $official = Resolve-PcmOfficialValue ([string]$config.EntraConnect.Mode) @('Remoting','Script','Manual')
     if (-not $official) { throw 'Configuration: EntraConnect.Mode must be Remoting, Script or Manual.' }
     $config.EntraConnect.Mode = $official
     if ($config.EntraConnect.Mode -eq 'Remoting' -and -not $config.EntraConnect.Server) { throw 'Configuration: EntraConnect.Mode = Remoting requires EntraConnect.Server.' }
     if ($config.EntraConnect.Mode -eq 'Script' -and -not $config.EntraConnect.ScriptPath) { throw 'Configuration: EntraConnect.Mode = Script requires EntraConnect.ScriptPath.' }
-    if ($config.Cloud.DefaultUsageLocation -and $config.Cloud.DefaultUsageLocation -notmatch '^[A-Za-z]{2}$') { throw 'Configuration: Cloud.DefaultUsageLocation must be a two-letter country code (FR).' }
+    if ($config.Cloud.DefaultUsageLocation -and $config.Cloud.DefaultUsageLocation -notmatch '^[A-Za-z]{2}\z') { throw 'Configuration: Cloud.DefaultUsageLocation must be a two-letter country code (FR).' }
     if ($config.Cloud.DefaultUsageLocation) { $config.Cloud.DefaultUsageLocation = ([string]$config.Cloud.DefaultUsageLocation).ToUpperInvariant() }
     try { $null = [version]$config.Exo.MinModuleVersion } catch { throw 'Configuration: Exo.MinModuleVersion must be a version number (3.10.1).' }
     $polling = $config.Polling
@@ -1163,6 +1175,7 @@ function Import-PcmConfiguration {
     $config.Store.BackupFolder = Resolve-PcmPath $config.Store.BackupFolder 'Store.BackupFolder' $Root
     $config.Store.JournalPath = Resolve-PcmPath $config.Store.JournalPath 'Store.JournalPath' $Root
     if ($config.EntraConnect.ScriptPath) { $config.EntraConnect.ScriptPath = Resolve-PcmPath $config.EntraConnect.ScriptPath 'EntraConnect.ScriptPath' $Root }
+    if ($config.EntraConnect.CredentialPath) { $config.EntraConnect.CredentialPath = Resolve-PcmPath $config.EntraConnect.CredentialPath 'EntraConnect.CredentialPath' $Root }
     $config.Logging.Folder = Resolve-PcmPath $config.Logging.Folder 'Logging.Folder' $Root
     $config.Report.Folder = Resolve-PcmPath $config.Report.Folder 'Report.Folder' $Root
     $config.Store.Path = Assert-PcmOutputFolder $config.Store.Path 'Store.Path' 'data' $Root
@@ -1209,24 +1222,56 @@ function Wait-PcmTranscriptFile {
     throw "The transcript file is missing or empty after ${TimeoutMilliseconds} ms: $LiteralPath. No audit, no processing."
 }
 
-function Initialize-PcmFolder {
+function Get-PcmPrivateDirectorySecurity {
     <#
     .SYNOPSIS
-        Makes sure a log or report folder exists. One failure, one message: the folder and the reason.
+        ACL of every folder that can hold directory data or run evidence: full control for the current account, SYSTEM and
+        Administrators only, no inherited permission. Shared by the data, logs and reports folders.
+    #>
+    [CmdletBinding()]
+    [OutputType([Security.AccessControl.DirectorySecurity])]
+    param()
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.SetOwner($identity)
+    $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($sid in @($identity.Value, 'S-1-5-18', 'S-1-5-32-544')) {
+        if (-not $seen.Add($sid)) { continue }
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier($sid)),
+            [Security.AccessControl.FileSystemRights]::FullControl,
+            ([Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'),
+            [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+        [void]$acl.AddAccessRule($rule)
+    }
+    return $acl
+}
+
+function Initialize-PcmPrivateFolder {
+    <#
+    .SYNOPSIS
+        Makes sure a data, log or report folder exists. A missing folder is created WITH the private ACL (no window where its
+        files inherit broader rights); an existing folder is left exactly as the administrator set it.
     .DESCRIPTION
-        Not subject to -WhatIf / -Confirm: the audit trail of a Preview must be written too.
+        Not subject to -WhatIf / -Confirm: the audit trail of a Preview must be written too. One failure, one message: the folder
+        and the reason. A folder that was created but could not be made private is an error, never a silent success.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
-    if (Test-Path -LiteralPath $Path -PathType Container) { return }
+    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    if (Test-Path -LiteralPath $full -PathType Container) { return }
+    if (Test-Path -LiteralPath $full) { throw ('The folder {0} cannot be created: a file exists where the folder is expected.' -f $Path) }
+    # Missing parent folders are created with normal inheritance (the administrator's choice); only the folder itself gets the private ACL, in one step.
+    $info = $null
     try {
-        if (Test-Path -LiteralPath $Path) { throw 'A file exists where the folder is expected.' }
-        [void][IO.Directory]::CreateDirectory($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path))
+        $parent = [IO.Path]::GetDirectoryName($full)
+        if ($parent) { [void][IO.Directory]::CreateDirectory($parent) }
+        $info = New-Object IO.DirectoryInfo $full
+        [IO.FileSystemAclExtensions]::Create($info, (Get-PcmPrivateDirectorySecurity))
     }
-    catch {
-        $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-        throw ('The folder {0} cannot be created: {1}' -f $Path, $reason)
-    }
+    catch { throw ('The folder {0} cannot be created: {1}' -f $Path, $(if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message })) }
+    if (-not ([IO.FileSystemAclExtensions]::GetAccessControl($info)).AreAccessRulesProtected) { throw ('The folder {0} was created but could not be made private (its permissions are still inherited).' -f $Path) }
 }
 
 function Initialize-PcmAudit {
@@ -1247,7 +1292,7 @@ function Initialize-PcmAudit {
         $stem = Get-PcmArtifactStem $Context
         $Context['_PraArtifactStem'] = $stem
         $Context.CurrentOperation = 'Create-Log'
-        Initialize-PcmFolder -Path $Context.LogFolder
+        Initialize-PcmPrivateFolder -Path $Context.LogFolder
         $logPath = Join-Path $Context.LogFolder ($stem + '.log')
         $null = New-Item -ItemType File -Path $logPath -WhatIf:$false -Confirm:$false -ErrorAction Stop
         $Context.LogFile = $logPath
@@ -1265,7 +1310,7 @@ function Initialize-PcmAudit {
         $Context['_PraTranscriptCreated'] = $true
         $Context.CurrentOperation = 'Check-ReportFolder'
         if (-not $Context.NoReport) {
-            Initialize-PcmFolder -Path $Context.ReportFolder
+            Initialize-PcmPrivateFolder -Path $Context.ReportFolder
             $probe = Join-Path $Context.ReportFolder ($stem + '.probe'); $created = $false
             try {
                 $null = New-Item -ItemType File -Path $probe -WhatIf:$false -Confirm:$false -ErrorAction Stop; $created = $true
@@ -1296,11 +1341,17 @@ function Get-PcmOutcome {
     $errorIdentities = @{}
     # Errors of the run itself (a stop, a failed read), apart from the objects found in error or not in the expected state.
     $runErrors = 0
+    # In a Convert or Recover that has started to change things (its batch exists), an object still Planned when the run ends was not done: it is Pending, never counted as a success.
+    $appliesChanges = (Get-PcmValue $Context 'Mode' '') -eq 'Apply' -and (Get-PcmValue $Context 'Action' '') -in @('Convert', 'Recover') -and [string](Get-PcmValue $Context 'BatchId' '') -ne ''
     foreach ($row in $Context.Rows.ToArray()) {
         $copy = [ordered]@{}
         foreach ($field in $script:RowFields) { $copy[$field] = Get-PcmValue $row $field }
         if ($copy.FinalStatus -notin $script:FinalStatuses) {
             $copy.Detail = 'Final status missing or invalid: {0}. {1}' -f $copy.FinalStatus, $copy.Detail; $copy.FinalStatus = 'Error'
+        }
+        elseif ($appliesChanges -and $copy.FinalStatus -eq 'Planned') {
+            $copy.FinalStatus = 'Pending'
+            if (-not $copy.Detail) { $copy.Detail = 'not finished: the run ended before this object was done; run the command of the next steps to go on' }
         }
         if ($copy.FinalStatus -eq 'Error') {
             foreach ($field in @('ObjectGuid','Identity','PrimarySmtpAddress')) { if ($copy[$field]) { $errorIdentities[[string]$copy[$field]] = $true } }
@@ -1562,14 +1613,19 @@ function Get-PcmReportHtml {
     try { Write-PcmReportHtml -Context $Context -Outcome $Outcome -Writer $writer; return $writer.ToString() } finally { $writer.Dispose() }
 }
 
-function Read-PcmReportData {
-    <# Reads the rows, run errors and warnings stored in an HTML report, as the page script does (tests, support). Returns Rows, Issues and Warnings as lists of objects. #>
+function Read-PcmReportChunk {
+    <#
+    .SYNOPSIS
+        Reads every dataset stored in an HTML report (the rows, issues and warnings of a run report; the objects, events and follow-up rows of a global report), as the page script does.
+        Returns Header and one list of objects per dataset, under its kind.
+    #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Html)
     $meta = [regex]::Match($Html, '<script type="application/json" id="pra-meta">(.*?)</script>', [Text.RegularExpressions.RegexOptions]::Singleline)
     if (-not $meta.Success) { throw 'The report holds no data header.' }
     $header = $meta.Groups[1].Value | ConvertFrom-Json
-    $result = @{ rows = [System.Collections.Generic.List[object]]::new(); issues = [System.Collections.Generic.List[object]]::new(); warnings = [System.Collections.Generic.List[object]]::new() }
+    $result = @{}
+    foreach ($kind in @($header.chunks.PSObject.Properties.Name)) { $result[$kind] = [System.Collections.Generic.List[object]]::new() }
     $dictionaries = @{}
     foreach ($chunk in [regex]::Matches($Html, '<script type="application/x-pra-chunk" data-kind="(\w+)" data-seq="(\d+)">([^<]*)</script>')) {
         $kind = $chunk.Groups[1].Value
@@ -1585,7 +1641,74 @@ function Read-PcmReportData {
             $result[$kind].Add([pscustomobject]$row)
         }
     }
-    return [pscustomobject]@{ Rows = $result.rows.ToArray(); Issues = $result.issues.ToArray(); Warnings = $result.warnings.ToArray(); Header = $header }
+    $result['Header'] = $header
+    return $result
+}
+
+function Read-PcmReportData {
+    <# Reads the rows, run errors and warnings stored in an HTML report, as the page script does (tests, support). Returns Rows, Issues and Warnings as lists of objects. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Html)
+    $data = Read-PcmReportChunk -Html $Html
+    return [pscustomobject]@{ Rows = $data.rows.ToArray(); Issues = $data.issues.ToArray(); Warnings = $data.warnings.ToArray(); Header = $data.Header }
+}
+
+function Read-PcmGlobalReportData {
+    <#
+    .SYNOPSIS
+        Reads the objects, events and follow-up rows stored in a global report, as the page script does (tests, support). Returns Objects, Events, FollowUp and Header.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Html)
+    $data = Read-PcmReportChunk -Html $Html
+    return [pscustomobject]@{ Objects = $data.objects.ToArray(); Events = $data.events.ToArray(); FollowUp = $data.followup.ToArray(); Header = $data.Header }
+}
+
+function ConvertTo-PcmCsvCell {
+    <#
+    .SYNOPSIS
+        Neutralises a spreadsheet formula in one text cell: a value that starts with = + - @ TAB or CR gets a leading
+        apostrophe (the rule of the CSV export of the HTML report). Values that do not start so are unchanged.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+    if ($null -ne $Value -and $Value -match '^[=+\-@\t\r]') { return "'" + $Value }
+    return $Value
+}
+
+function ConvertTo-PcmCsvRow {
+    <#
+    .SYNOPSIS
+        Copy of a result row whose text values are safe to open in a spreadsheet (booleans and numbers are kept as they are).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Row)
+    $copy = [ordered]@{}
+    foreach ($property in $Row.PSObject.Properties) {
+        $copy[$property.Name] = if ($property.Value -is [string]) { ConvertTo-PcmCsvCell $property.Value } else { $property.Value }
+    }
+    return [pscustomobject]$copy
+}
+
+function Read-PcmCsvText {
+    <#
+    .SYNOPSIS
+        Text of a CSV file written by a person: a byte order mark (UTF-8, UTF-16) is honoured, a BOM-less file is read as strict
+        UTF-8, and a file that is not valid UTF-8 (Excel "CSV", Notepad "ANSI") is read with the system ANSI code page.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { return [Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3) }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { return [Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2) }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) { return [Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $bytes.Length - 2) }
+    try { return (New-Object Text.UTF8Encoding($false, $true)).GetString($bytes) }
+    catch [Text.DecoderFallbackException] {
+        try { $ansi = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage) }
+        catch { $ansi = [Text.Encoding]::GetEncoding(1252) }
+        return $ansi.GetString($bytes)
+    }
 }
 
 function Write-PcmReport {
@@ -1603,8 +1726,8 @@ function Write-PcmReport {
             try {
                 $outcome = Get-PcmOutcome $Context
                 if ($format -eq 'Csv') {
-                    if ($outcome.Rows.Count) { $outcome.Rows | Export-Csv -LiteralPath $Reports.Csv -NoTypeInformation -Delimiter ';' -Encoding UTF8 -WhatIf:$false -Confirm:$false -ErrorAction Stop }
-                    else { Set-Content -LiteralPath $Reports.Csv -Value ('"' + ($script:RowFields -join '";"') + '"') -Encoding UTF8 -WhatIf:$false -Confirm:$false -ErrorAction Stop }
+                    if ($outcome.Rows.Count) { $outcome.Rows | ForEach-Object { ConvertTo-PcmCsvRow $_ } | Export-Csv -LiteralPath $Reports.Csv -NoTypeInformation -Delimiter ';' -Encoding utf8BOM -WhatIf:$false -Confirm:$false -ErrorAction Stop }
+                    else { Set-Content -LiteralPath $Reports.Csv -Value ('"' + ($script:RowFields -join '";"') + '"') -Encoding utf8BOM -WhatIf:$false -Confirm:$false -ErrorAction Stop }
                 } else {
                     $stream = [IO.File]::Open($Reports.Html, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
                     $writer = New-Object IO.StreamWriter($stream, (New-Object Text.UTF8Encoding($true)), 65536)
@@ -1663,7 +1786,7 @@ function Complete-PcmRun {
     }
     if (-not $Context.NoReport) {
         try {
-            Initialize-PcmFolder -Path $Context.ReportFolder
+            Initialize-PcmPrivateFolder -Path $Context.ReportFolder
             $stem = [string](Get-PcmValue $Context '_PraArtifactStem' '')
             if (-not $stem) { $stem = Get-PcmArtifactStem $Context }
             foreach ($format in @('Csv','Html')) {
@@ -1810,24 +1933,7 @@ function Complete-PcmRun {
 #region 6. Global report of a batch ---------------------------------------------------------------
 
 # One page per Convert batch, written at the end of every run that touches it (Convert, a resume of Convert, a Recover wave, Check -Batch): the batch end to end,
-# every run, every object with its journey. More objects than this and the journey is written only for the objects that are not simply done (the CSV lists every object).
-$script:GlobalDetailedObjects = 500
-$script:GlobalEventsPerObject = 200
-
-$script:PraGlobalCss = @'
-:root{color-scheme:light dark;--bg:#f7f4ef;--surface:#fff;--soft:#f5f5f5;--border:#dedede;--text:#242424;--muted:#5c5c5c;--accent:#b11f4b;--accent-2:#9a1a41;--accent-fg:#fff;--ok:#16a34a;--warn:#b45309;--fail:#dc2626;--info:#0078d4}
-@media (prefers-color-scheme:dark){:root{--bg:#3d3b3a;--surface:#292929;--soft:#2e2e2e;--border:#474747;--text:#dedede;--muted:#a0a0a0;--accent:#fd8ea1;--accent-2:#fb7b91;--accent-fg:#1a1a1a;--ok:#4ade80;--warn:#fbbf24;--fail:#f87171;--info:#4da6ff}}
-*{box-sizing:border-box}body{margin:0;padding:28px 32px;background:var(--bg);color:var(--text);font:14px "Segoe UI",Aptos,Calibri,sans-serif}
-header{border:1px solid var(--border);border-top:4px solid var(--accent);border-radius:16px;padding:24px;margin-bottom:20px;background:var(--surface)}
-.origin{color:var(--accent);font-size:11px;letter-spacing:.1em;text-transform:uppercase;font-weight:700}h1{font-size:28px;font-weight:650;margin:8px 0 6px}h2{font-size:16px;font-weight:600;margin:0 0 12px}.subtitle{color:var(--muted);margin:0}
-.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px;margin:0 0 20px}.tile{padding:14px 16px;border:1px solid var(--border);border-radius:16px;background:var(--surface)}
-.tile-label{font-size:12px;font-weight:600;color:var(--muted)}.tile-value{font-size:26px;font-weight:650;margin-top:6px}.tile.ok .tile-value{color:var(--ok)}.tile.warn .tile-value{color:var(--warn)}.tile.fail .tile-value{color:var(--fail)}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:20px;overflow-x:auto}.card.warn{border-left:4px solid var(--warn)}.card.fail{border-left:4px solid var(--fail)}
-table{border-collapse:collapse;width:100%;font-size:13px}th{text-align:left;font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--accent);padding:6px 10px;border-bottom:1px solid var(--border)}td{padding:6px 10px;border-bottom:1px solid var(--border);vertical-align:top;word-break:break-word}
-.pill{display:inline-block;padding:1px 10px;border-radius:999px;font-weight:600;font-size:12px;background:var(--soft)}.pill.ok{color:var(--ok)}.pill.warn{color:var(--warn)}.pill.fail{color:var(--fail)}.pill.muted{color:var(--muted)}
-details{border-top:1px solid var(--border);padding:8px 0}summary{cursor:pointer;font-weight:600}.muted{color:var(--muted)}.mono{font-family:Consolas,"Cascadia Mono",monospace;font-size:12px}ul.plain{margin:6px 0 0;padding-left:18px}
-@media (max-width:700px){body{padding:14px 12px}}
-'@
+# every run, every object with its complete journey. Nothing is cut: the page holds every object and every event of the journal, and two CSV files hold the same data.
 
 function Get-PcmStatusClass {
     <# Style class of a status or verdict text (display only). #>
@@ -1903,28 +2009,68 @@ function Get-PcmGlobalModel {
         Objects = $ordered; Counts = [pscustomobject]$counts; FollowUp = @($FollowUp) }
 }
 
-function Write-PcmGlobalReportHtml {
-    <# The global report: one page, no script, no external resource. Every value is HTML-encoded. #>
+function Get-PcmGlobalStageText {
+    <# The stages of an object, one text per batch it went through ('Convert c0nvert1: Done (MailboxReady)'), joined with the separator. #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)]$Model, [Parameter(Mandatory)][IO.TextWriter]$Writer)
+    param([Parameter(Mandatory)]$Entry, [string]$Separator = ' | ')
+    return (@($Entry.Stages | ForEach-Object { '{0} {1}: {2}{3}' -f $_.Action, $_.BatchId, $_.Status, $(if ($_.Step) { ' (' + $_.Step + ')' } else { '' }) }) -join $Separator)
+}
+
+function Get-PcmGlobalBatchText {
+    <# The IDs of the batches an object went through, in order of appearance, without repeat. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Entry)
+    $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $ids = foreach ($stage in $Entry.Stages) { if ($seen.Add([string]$stage.BatchId)) { [string]$stage.BatchId } }
+    return (@($ids) -join ', ')
+}
+
+function Write-PcmGlobalReportHtml {
+    <#
+    .SYNOPSIS
+        The global report: one self-contained page (templates\GlobalReport.template.html), no external resource. The summary (tiles, batches, runs, settings) is HTML-encoded
+        markup that is readable without script. The objects (one row each), their events (one row per event, the journey of an object) and the follow-up rows are written by
+        Write-PcmReportChunks and read by the script of the page: no object and no event is left out, whatever their number.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Model, [Parameter(Mandatory)][IO.TextWriter]$Writer, [string]$TemplateFolder = '', [string]$ObjectsCsvName = '', [string]$EventsCsvName = '',
+        [int]$ChunkRows = $script:ReportChunkRows, [int]$ChunkChars = $script:ReportChunkChars)
     $h = { param($Value) ConvertTo-PcmHtmlText $Value }
     $dot = [char]0x00B7
     $counts = $Model.Counts
-    $total = @($Model.Objects).Count
+    $objects = @($Model.Objects)
+    $total = $objects.Count
     $convertBatch = @($Model.Batches | Where-Object { Test-PcmSameText $_.action 'Convert' } | Select-Object -First 1)
     $batchId = if ($convertBatch.Count) { [string]$convertBatch[0].id } else { '' }
-    $sb = New-Object Text.StringBuilder
-    [void]$sb.Append('<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>').Append((& $h ('PRA Cloud Mailbox - batch ' + $batchId + ' - global report'))).Append('</title><style>').Append($script:PraGlobalCss).Append('</style></head><body>')
-    [void]$sb.Append('<header><div class="origin">PRA Cloud Mailbox ').Append($dot).Append(' global report</div><h1>').Append((& $h ('Batch {0} from end to end' -f $batchId))).Append('</h1><p class="subtitle">')
-    [void]$sb.Append((& $h ('Environment {0} {1} tool v{2} {1} one page for the whole life of the batch: Convert, its resumes, Recover and the follow-up checks' -f $Model.Environment, $dot, $Model.Version))).Append('</p></header>')
-    [void]$sb.Append('<div class="tiles">')
-    foreach ($tile in @(@('Objects', $total, ''), @('Converted', $counts.Converted, 'ok'), @('Rolled back', $counts.RolledBack, 'ok'), @('In progress', $counts.InProgress, $(if ($counts.InProgress) { 'warn' } else { '' })),
-            @('Failed', $counts.Failed, $(if ($counts.Failed) { 'fail' } else { '' })), @('Skipped', $counts.Skipped, ''))) {
-        [void]$sb.Append('<div class="tile ').Append($tile[2]).Append('"><div class="tile-label">').Append((& $h $tile[0])).Append('</div><div class="tile-value">').Append((& $h $tile[1])).Append('</div></div>')
+
+    # Events: one row per event, grouped by object (the index of the object in the objects list), then the events that belong to no object.
+    $eventItems = [System.Collections.Generic.List[object]]::new()
+    for ($index = 0; $index -lt $total; $index++) {
+        foreach ($step in $objects[$index].Events) {
+            $eventItems.Add([pscustomobject]@{ Object = $index; Time = (Format-PcmUtcText $step.Time); Batch = $step.BatchId; Action = $step.Action; Step = $step.Step; Outcome = $step.Outcome; Detail = $step.Detail })
+        }
     }
-    [void]$sb.Append('</div>')
+    foreach ($step in @($Model.BatchEvents)) {
+        $eventItems.Add([pscustomobject]@{ Object = $null; Time = (Format-PcmUtcText $step.Time); Batch = $step.BatchId; Action = $step.Action; Step = $step.Step; Outcome = $step.Outcome; Detail = $step.Detail })
+    }
+    $objectItems = for ($index = 0; $index -lt $total; $index++) {
+        $entry = $objects[$index]
+        [pscustomobject]@{ Identity = $entry.Identity; ObjectGuid = $entry.ObjectGuid; Kind = $entry.Kind; Verdict = $entry.Verdict; Batches = (Get-PcmGlobalBatchText $entry); Stages = (Get-PcmGlobalStageText $entry)
+            Note = $entry.Note; Events = $entry.Events.Count }
+    }
+    $followItems = foreach ($row in @($Model.FollowUp)) { [pscustomobject]@{ Identity = [string]$row.Identity; Expect = [string]$row.Expect; Result = $(if ($row.Met) { 'Met' } else { 'Not yet' }); Detail = [string]$row.Detail } }
+    $objectFields = @('Identity', 'ObjectGuid', 'Kind', 'Verdict', 'Batches', 'Stages', 'Note', 'Events')
+    $eventFields = @('Object', 'Time', 'Batch', 'Action', 'Step', 'Outcome', 'Detail')
+    $followFields = @('Identity', 'Expect', 'Result', 'Detail')
+
+    $tiles = New-Object Text.StringBuilder
+    foreach ($tile in @(@('Objects', $total, ''), @('Converted', $counts.Converted, 'ok'), @('Rolled back', $counts.RolledBack, 'ok'), @('In progress', $counts.InProgress, $(if ($counts.InProgress) { 'warn' } else { '' })),
+            @('Failed', $counts.Failed, $(if ($counts.Failed) { 'fail' } else { '' })), @('Skipped', $counts.Skipped, ''), @('Events', $eventItems.Count, ''), @('Runs', @($Model.Runs).Count, ''))) {
+        [void]$tiles.Append('<div class="tile ').Append($tile[2]).Append('"><div class="tile-label">').Append((& $h $tile[0])).Append('</div><div class="tile-value">').Append((& $h $tile[1])).Append('</div></div>')
+    }
+    $sb = New-Object Text.StringBuilder
     # Batches.
-    [void]$sb.Append('<section class="card"><h2>Batches</h2><table><thead><tr><th>Batch</th><th>Action</th><th>Status</th><th>Created</th><th>Updated</th><th>Snapshot</th><th>Operator</th><th>Computer</th><th>Tool</th></tr></thead><tbody>')
+    [void]$sb.Append('<section class="card"><h2>Batches</h2><div class="scroll"><table class="summary-table"><thead><tr><th>Batch</th><th>Action</th><th>Status</th><th>Created</th><th>Updated</th><th>Snapshot</th><th>Operator</th><th>Computer</th><th>Tool</th></tr></thead><tbody>')
     foreach ($batch in @($Model.Batches)) {
         $status = [string]$batch.status
         $pill = switch ($status) { 'Complete' { 'ok' } 'Failed' { 'fail' } default { 'warn' } }
@@ -1932,12 +2078,13 @@ function Write-PcmGlobalReportHtml {
         [void]$sb.Append((& $h (Format-PcmUtcText $batch.created_utc))).Append('</td><td>').Append((& $h (Format-PcmUtcText $batch.updated_utc))).Append('</td><td>').Append((& $h $batch.snapshot_id)).Append('</td><td>').Append((& $h $batch.account)).Append('</td><td>')
         [void]$sb.Append((& $h $batch.computer)).Append('</td><td>').Append((& $h $batch.tool_version)).Append('</td></tr>')
     }
-    [void]$sb.Append('</tbody></table></section>')
+    [void]$sb.Append('</tbody></table></div></section>')
+    $batchesHtml = $sb.ToString(); [void]$sb.Clear()
     # Runs.
     [void]$sb.Append('<section class="card"><h2>Runs</h2>')
     if (-not @($Model.Runs).Count) { [void]$sb.Append('<p class="muted">No run was recorded: the batch was written by an earlier version of the tool.</p>') }
     else {
-        [void]$sb.Append('<table><thead><tr><th>Run</th><th>Batch</th><th>Action</th><th>Started</th><th>Ended</th><th>Result</th><th>Done</th><th>Pending</th><th>Errors</th><th>Objects chosen by</th></tr></thead><tbody>')
+        [void]$sb.Append('<div class="scroll"><table class="summary-table"><thead><tr><th>Run</th><th>Batch</th><th>Action</th><th>Started</th><th>Ended</th><th>Result</th><th>Done</th><th>Pending</th><th>Errors</th><th>Objects chosen by</th></tr></thead><tbody>')
         $number = 0
         foreach ($run in @($Model.Runs)) {
             $number++
@@ -1946,9 +2093,10 @@ function Write-PcmGlobalReportHtml {
             [void]$sb.Append((& $h (Format-PcmUtcText $run.ended_utc))).Append('</td><td><span class="pill ').Append($pill).Append('">').Append((& $h $run.status)).Append('</span></td><td>').Append((& $h $run.done_count)).Append('</td><td>').Append((& $h $run.pending_count)).Append('</td><td>')
             [void]$sb.Append((& $h $run.error_count)).Append('</td><td>').Append((& $h $run.source_text)).Append('</td></tr>')
         }
-        [void]$sb.Append('</tbody></table>')
+        [void]$sb.Append('</tbody></table></div>')
     }
     [void]$sb.Append('</section>')
+    $runsHtml = $sb.ToString(); [void]$sb.Clear()
     # Settings that differed from the configuration file.
     [void]$sb.Append('<section class="card"><h2>Run settings changed from the configuration file</h2>')
     $any = $false
@@ -1962,79 +2110,99 @@ function Write-PcmGlobalReportHtml {
     }
     if (-not $any) { [void]$sb.Append('<p class="muted">None: every run used the settings of the configuration file.</p>') }
     [void]$sb.Append('</section>')
-    # Follow-up.
-    if (@($Model.FollowUp).Count) {
-        [void]$sb.Append('<section class="card"><h2>Follow-up check of this run</h2><table><thead><tr><th>Object</th><th>Expected</th><th>Result</th><th>Detail</th></tr></thead><tbody>')
-        foreach ($row in @($Model.FollowUp)) {
-            [void]$sb.Append('<tr><td>').Append((& $h $row.Identity)).Append('</td><td>').Append((& $h $row.Expect)).Append('</td><td><span class="pill ').Append($(if ($row.Met) { 'ok' } else { 'warn' })).Append('">').Append($(if ($row.Met) { 'Met' } else { 'Not yet' })).Append('</span></td><td>').Append((& $h $row.Detail)).Append('</td></tr>')
-        }
-        [void]$sb.Append('</tbody></table></section>')
+    $settingsHtml = $sb.ToString()
+
+    $notice = '{0} object(s), {1} event(s) and {2} follow-up row(s) are stored in this file.' -f $total, $eventItems.Count, @($followItems).Count
+    if ($ObjectsCsvName -and $EventsCsvName) { $notice += ' The files {0} and {1} hold every object and every event.' -f $ObjectsCsvName, $EventsCsvName }
+    if (-not $TemplateFolder) { $TemplateFolder = Join-Path ([IO.Path]::GetDirectoryName($PSScriptRoot)) 'templates' }
+    $templatePath = Join-Path $TemplateFolder 'GlobalReport.template.html'
+    $template = if (Test-Path -LiteralPath $templatePath -PathType Leaf) { [IO.File]::ReadAllText($templatePath, [Text.Encoding]::UTF8) }
+        else { '<!doctype html><html><head><meta charset="utf-8"><title>{{TITLE}}</title></head><body><h1>{{HEADING}}</h1><p>{{SUBTITLE}}</p>{{TILES}}{{BATCHES}}{{RUNS}}{{SETTINGS}}<p>{{DATA_NOTICE}} Template missing: only the CSV files hold the objects and the events.</p></body></html>' }
+    $values = @{
+        '{{TITLE}}' = (& $h ('PRA Cloud Mailbox - batch {0} - global report' -f $batchId))
+        '{{SUBTITLE}}' = (& $h ('Environment {0} {1} tool v{2} {1} one page for the whole life of the batch: Convert, its resumes, Recover and the follow-up checks' -f $Model.Environment, $dot, $Model.Version))
+        '{{HEADING}}' = (& $h ('Batch {0} from end to end' -f $batchId))
+        '{{VERSION}}' = (& $h $Model.Version)
+        '{{TILES}}' = $tiles.ToString(); '{{BATCHES}}' = $batchesHtml; '{{RUNS}}' = $runsHtml; '{{SETTINGS}}' = $settingsHtml
+        '{{DATA_NOTICE}}' = (& $h $notice)
     }
-    # Objects.
-    [void]$sb.Append('<section class="card"><h2>Objects, end to end</h2>')
-    $detailed = $total -le $script:GlobalDetailedObjects
-    if (-not $detailed) { [void]$sb.Append('<p class="muted">').Append((& $h ('More than {0} objects: the journey is written for the objects that are not simply converted or rolled back; the CSV file lists every object.' -f $script:GlobalDetailedObjects))).Append('</p>') }
-    [void]$sb.Append('<table><thead><tr><th>Object</th><th>Type</th><th>Verdict</th><th>Stages</th></tr></thead><tbody>')
-    foreach ($entry in @($Model.Objects)) {
-        $stages = (@($entry.Stages | ForEach-Object { '{0} {1}: {2}{3}' -f $_.Action, $_.BatchId, $_.Status, $(if ($_.Step) { ' (' + $_.Step + ')' } else { '' }) }) -join '; ')
-        [void]$sb.Append('<tr><td>').Append((& $h $(if ($entry.Identity) { $entry.Identity } else { $entry.ObjectGuid }))).Append('</td><td>').Append((& $h $entry.Kind)).Append('</td><td><span class="pill ').Append((Get-PcmStatusClass $entry.Verdict)).Append('">').Append((& $h $entry.Verdict)).Append('</span></td><td>').Append((& $h $stages)).Append('</td></tr>')
-        $simple = @('Converted', 'Rolled back') -contains $entry.Verdict
-        if (($detailed -or -not $simple) -and ($entry.Events.Count -or $entry.Note)) {
-            [void]$sb.Append('<tr><td colspan="4"><details><summary>Journey of ').Append((& $h $(if ($entry.Identity) { $entry.Identity } else { $entry.ObjectGuid }))).Append('</summary>')
-            if ($entry.Note) { [void]$sb.Append('<p class="muted">').Append((& $h $entry.Note)).Append('</p>') }
-            [void]$sb.Append('<table><thead><tr><th>Time</th><th>Batch</th><th>Step</th><th>Outcome</th><th>Detail</th></tr></thead><tbody>')
-            $shown = @($entry.Events | Select-Object -First $script:GlobalEventsPerObject)
-            foreach ($step in $shown) {
-                [void]$sb.Append('<tr><td>').Append((& $h (Format-PcmUtcText $step.Time))).Append('</td><td>').Append((& $h ('{0} {1}' -f $step.Action, $step.BatchId))).Append('</td><td>').Append((& $h $step.Step)).Append('</td><td><span class="pill ').Append((Get-PcmStatusClass $step.Outcome)).Append('">').Append((& $h $step.Outcome)).Append('</span></td><td>').Append((& $h $step.Detail)).Append('</td></tr>')
-            }
-            if ($entry.Events.Count -gt $shown.Count) { [void]$sb.Append('<tr><td colspan="5" class="muted">').Append((& $h ('... and {0} more event(s): the journal holds them all.' -f ($entry.Events.Count - $shown.Count)))).Append('</td></tr>') }
-            [void]$sb.Append('</tbody></table></details></td></tr>')
-        }
-    }
-    if (-not $total) { [void]$sb.Append('<tr><td colspan="4" class="muted">No object.</td></tr>') }
-    [void]$sb.Append('</tbody></table></section>')
-    [void]$sb.Append('<p class="muted">Generated by PRA Cloud Mailbox v').Append((& $h $Model.Version)).Append('. This report holds names, statuses and steps only: no secret, no token.</p></body></html>')
-    $Writer.Write($sb.ToString())
+    foreach ($key in $values.Keys) { $template = $template.Replace($key, $values[$key]) }
+    $marker = '{{DATA}}'
+    $at = $template.LastIndexOf($marker, [StringComparison]::OrdinalIgnoreCase)
+    if ($at -lt 0) { $Writer.Write($template); return }
+    $Writer.Write($template.Substring(0, $at))
+    $objectChunks = Write-PcmReportChunks -Writer $Writer -Kind 'objects' -Items ([object[]]@($objectItems)) -Fields $objectFields -SizeFields @('Stages', 'Note') -ChunkRows $ChunkRows -ChunkChars $ChunkChars
+    $eventChunks = Write-PcmReportChunks -Writer $Writer -Kind 'events' -Items $eventItems.ToArray() -Fields $eventFields -SizeFields @('Detail') -ChunkRows $ChunkRows -ChunkChars $ChunkChars
+    $followChunks = Write-PcmReportChunks -Writer $Writer -Kind 'followup' -Items ([object[]]@($followItems)) -Fields $followFields -SizeFields @('Detail') -ChunkRows $ChunkRows -ChunkChars $ChunkChars
+    $fieldsJson = { param($fields) ($fields | ForEach-Object { ConvertTo-PcmJsonString $_ }) -join ',' }
+    $json = '{{"format":1,"objects":{{"count":{0},"fields":[{1}]}},"events":{{"count":{2},"fields":[{3}]}},"followup":{{"count":{4},"fields":[{5}]}},"chunks":{{"objects":{6},"events":{7},"followup":{8}}}}}' -f
+        $total, (& $fieldsJson $objectFields), $eventItems.Count, (& $fieldsJson $eventFields), @($followItems).Count, (& $fieldsJson $followFields), $objectChunks, $eventChunks, $followChunks
+    $Writer.Write('<script type="application/json" id="pra-meta">' + $json + "</script>`r`n")
+    $Writer.Write($template.Substring($at + $marker.Length))
 }
 
 function Write-PcmGlobalReportCsv {
-    <# One line per object: verdict, the stages and the journey as text (a text that starts like a formula gets an apostrophe). Semicolon, UTF-8 with BOM. #>
+    <# One line per object: verdict, batches, the stages and the number of events (a text that starts like a formula gets an apostrophe). The journey of each object is in the events file (Write-PcmGlobalEventsCsv). Semicolon, UTF-8 with BOM. #>
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Model, [Parameter(Mandatory)][string]$Path)
-    $guard = { param($text) $value = [string]$text; if ($value -match '^[=+\-@\t\r]') { "'" + $value } else { $value } }
+    $fields = @('ObjectGuid', 'Identity', 'Kind', 'Verdict', 'Batches', 'Stages', 'Note', 'EventCount')
     $rows = foreach ($entry in @($Model.Objects)) {
-        [pscustomobject][ordered]@{
-            ObjectGuid = (& $guard $entry.ObjectGuid); Identity = (& $guard $entry.Identity); Kind = (& $guard $entry.Kind); Verdict = $entry.Verdict
-            Stages = (& $guard (@($entry.Stages | ForEach-Object { '{0} {1}: {2}{3}' -f $_.Action, $_.BatchId, $_.Status, $(if ($_.Step) { ' (' + $_.Step + ')' } else { '' }) }) -join ' | '))
-            Note = (& $guard $entry.Note)
-            Journey = (& $guard (@($entry.Events | Select-Object -First $script:GlobalEventsPerObject | ForEach-Object { '{0} {1}/{2} {3}: {4}' -f (Format-PcmUtcText $_.Time), $_.Action, $_.BatchId, $_.Step, $_.Detail }) -join ' | '))
-        }
+        ConvertTo-PcmCsvRow ([pscustomobject][ordered]@{
+                ObjectGuid = [string]$entry.ObjectGuid; Identity = [string]$entry.Identity; Kind = [string]$entry.Kind; Verdict = [string]$entry.Verdict; Batches = (Get-PcmGlobalBatchText $entry)
+                Stages = (Get-PcmGlobalStageText $entry); Note = [string]$entry.Note; EventCount = $entry.Events.Count })
     }
-    $fields = @('ObjectGuid', 'Identity', 'Kind', 'Verdict', 'Stages', 'Note', 'Journey')
-    if (@($rows).Count) { $rows | Export-Csv -LiteralPath $Path -NoTypeInformation -Delimiter ';' -Encoding UTF8 -WhatIf:$false -Confirm:$false -ErrorAction Stop }
-    else { Set-Content -LiteralPath $Path -Value ('"' + ($fields -join '";"') + '"') -Encoding UTF8 -WhatIf:$false -Confirm:$false -ErrorAction Stop }
+    if (@($rows).Count) { @($rows) | Export-Csv -LiteralPath $Path -NoTypeInformation -Delimiter ';' -Encoding utf8BOM -WhatIf:$false -Confirm:$false -ErrorAction Stop }
+    else { Set-Content -LiteralPath $Path -Value ('"' + ($fields -join '";"') + '"') -Encoding utf8BOM -WhatIf:$false -Confirm:$false -ErrorAction Stop }
+}
+
+function Write-PcmGlobalEventsCsv {
+    <#
+    .SYNOPSIS
+        One line per event of the journal, none left out: the journey of every object, then the events of the batch itself (ObjectGuid and Identity empty). Same rules as the objects file.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Model, [Parameter(Mandatory)][string]$Path)
+    $fields = @('ObjectGuid', 'Identity', 'Kind', 'Time', 'Batch', 'Action', 'Step', 'Outcome', 'Detail')
+    $count = @($Model.BatchEvents).Count
+    foreach ($entry in @($Model.Objects)) { $count += $entry.Events.Count }
+    if (-not $count) { Set-Content -LiteralPath $Path -Value ('"' + ($fields -join '";"') + '"') -Encoding utf8BOM -WhatIf:$false -Confirm:$false -ErrorAction Stop; return }
+    $line = {
+        param($Entry, $Step)
+        ConvertTo-PcmCsvRow ([pscustomobject][ordered]@{
+                ObjectGuid = $(if ($Entry) { [string]$Entry.ObjectGuid } else { '' }); Identity = $(if ($Entry) { [string]$Entry.Identity } else { '' }); Kind = $(if ($Entry) { [string]$Entry.Kind } else { '' })
+                Time = (Format-PcmUtcText $Step.Time); Batch = [string]$Step.BatchId; Action = [string]$Step.Action; Step = [string]$Step.Step; Outcome = [string]$Step.Outcome; Detail = [string]$Step.Detail })
+    }
+    & {
+        foreach ($entry in @($Model.Objects)) { foreach ($step in $entry.Events) { & $line $entry $step } }
+        foreach ($step in @($Model.BatchEvents)) { & $line $null $step }
+    } | Export-Csv -LiteralPath $Path -NoTypeInformation -Delimiter ';' -Encoding utf8BOM -WhatIf:$false -Confirm:$false -ErrorAction Stop
 }
 
 function Write-PcmGlobalReport {
     <#
     .SYNOPSIS
-        Writes the global HTML and CSV report of a batch into the report folder (the same two files are replaced at each run). Returns Html and Csv (empty when a file could
-        not be written: a warning says why; the run itself is never stopped by it).
+        Writes the global report of a batch into the report folder: the HTML page, the CSV file of the objects and the CSV file of the events (the same three files are
+        replaced at each run). Returns Html, Csv and EventsCsv (empty when a file could not be written: a warning says why; the run itself is never stopped by it).
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][object]$History, [string]$ConvertBatchId, [AllowEmptyCollection()][object[]]$FollowUp = @())
-    $result = @{ Html = ''; Csv = '' }
+    $result = @{ Html = ''; Csv = ''; EventsCsv = '' }
     try {
         $model = Get-PcmGlobalModel -History $History -FollowUp $FollowUp -Version ([string]$Context.Version) -Environment ([string](Get-PcmValue $Context.Config 'Environment' ''))
-        $null = New-Item -ItemType Directory -Path $Context.ReportFolder -Force -WhatIf:$false -Confirm:$false -ErrorAction Stop
+        Initialize-PcmPrivateFolder -Path $Context.ReportFolder
         $stem = 'PraCloudMailbox_{0}_batch{1}_global' -f [string](Get-PcmValue $Context.Config 'Environment' 'PROD'), $ConvertBatchId
-        $html = Join-Path $Context.ReportFolder ($stem + '.html'); $csv = Join-Path $Context.ReportFolder ($stem + '.csv')
+        $html = Join-Path $Context.ReportFolder ($stem + '.html'); $csv = Join-Path $Context.ReportFolder ($stem + '.csv'); $eventsCsv = Join-Path $Context.ReportFolder ($stem + '_events.csv')
+        $templates = ''
+        $root = [string](Get-PcmValue $Context 'Root' '')
+        if ($root -and (Test-Path -LiteralPath (Join-Path $root 'templates\GlobalReport.template.html') -PathType Leaf)) { $templates = Join-Path $root 'templates' }
         $stream = [IO.File]::Open($html, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
         $writer = New-Object IO.StreamWriter($stream, (New-Object Text.UTF8Encoding($true)), 65536)
-        try { Write-PcmGlobalReportHtml -Model $model -Writer $writer } finally { $writer.Dispose() }
+        try { Write-PcmGlobalReportHtml -Model $model -Writer $writer -TemplateFolder $templates -ObjectsCsvName ([IO.Path]::GetFileName($csv)) -EventsCsvName ([IO.Path]::GetFileName($eventsCsv)) } finally { $writer.Dispose() }
         $result.Html = $html
         Write-PcmGlobalReportCsv -Model $model -Path $csv
         $result.Csv = $csv
+        Write-PcmGlobalEventsCsv -Model $model -Path $eventsCsv
+        $result.EventsCsv = $eventsCsv
         $Context['GlobalModel'] = $model
     }
     catch { Write-PcmLog -Context $Context -Message ('The global report could not be written: {0}' -f $_.Exception.Message) -Level Warning }
@@ -2073,15 +2241,16 @@ function Get-PcmConfigurationDifference {
 Export-ModuleMember -Function Get-PcmValue, Format-PcmDuration, Add-PcmIssue, Write-PcmLog, Write-PcmItem, Write-PcmProgress, Get-PcmDurationEstimate, Get-PcmRecoverWaveSize,
     Write-PcmBanner, Write-PcmStep, Write-PcmPlan, Write-PcmStepState, Write-PcmStepCount, Write-PcmSummary, Write-PcmHost, Resolve-PcmPath, Import-PcmConfiguration, Initialize-PcmAudit, Get-PcmOutcome, Complete-PcmRun,
     Write-PcmEvent, Test-PcmStopRequest, Request-PcmOperator, Get-PcmToolVersion, Test-PcmSameText, Get-PcmDistinctText, Resolve-PcmOfficialValue, Get-PcmCloudModuleReport,
-    Get-PcmReportHtml, Write-PcmReportHtml, Read-PcmReportData, ConvertTo-PcmHtmlText, Get-PcmGlobalModel, Write-PcmGlobalReport, Write-PcmGlobalReportHtml, Write-PcmGlobalReportCsv, Format-PcmUtcText,
+    Get-PcmReportHtml, Write-PcmReportHtml, Read-PcmReportData, Read-PcmGlobalReportData, ConvertTo-PcmHtmlText, Get-PcmGlobalModel, Write-PcmGlobalReport, Write-PcmGlobalReportHtml, Write-PcmGlobalReportCsv, Write-PcmGlobalEventsCsv, Format-PcmUtcText,
+    Initialize-PcmPrivateFolder, ConvertTo-PcmCsvCell, ConvertTo-PcmCsvRow, Read-PcmCsvText,
     Get-PcmConfigurationDifference, Get-PcmConfigurationFlat, ConvertTo-PcmScheduleTime, ConvertTo-PcmPlainMessage,
     Test-PcmSystemMailboxName, ConvertTo-PcmDnKey, ConvertFrom-PcmDnToCanonical, Test-PcmInSearchBase, ConvertTo-PcmGuidKey, New-PcmRecordIndex, Find-PcmRecord
 
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBVudO+QVXokAV2
-# BWdUEkN5VmmfRbPT8xo2g/xP7MHa+qCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBlSJgmCj/luCtI
+# c2WFS2JOqhc77vI2TmQfsYn53jC3XaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -2158,23 +2327,23 @@ Export-ModuleMember -Function Get-PcmValue, Format-PcmDuration, Add-PcmIssue, Wr
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBWo1xO/vPj
-# 1m24JxFCkWpW47+lEIqPJ3SPkwDMDv0GEDANBgkqhkiG9w0BAQEFAASCAgBgmmYL
-# 2bZOqKtVMoavVvRMgdT5PnifzhFtLFIHxgT0gVnuzKPc87Dei1lm09U2zV4xkQF0
-# rXa8RNg8kCts5O0oP/UpP9EKMd0CDq5kGFR4LVd4w9cZnH/rLBJz+/JUE6JBsR6O
-# yB7Po35lWd7lY0Lnf4DGqncstTqMVqbx9fVkRnL/1XoZDEq0KNr6vhUQl61ddnj4
-# kIiAt2m+2VtsoQCqo5lBdoTUH1A+NbRmT7GtnRBMOdEivVYBQvBTHM8UeSJhAsnl
-# c5nDyzwe7f4AFqN6N2WEraUtlUcxdSYxRqGVLw0j486OPwolkv9SgrCDviw9LtAM
-# H3kF5p9a+D8OAgk0kwNPZV4gX4J2Gzo5riPCguuJqA44ZzoV7OYNRo16vMKm3ZPk
-# V5Zyre+sEMTCWDQVXJtwjV18D7MxUQMJnD39T5DbNfE4QMEK6x7qU167jojhq+3B
-# FJt8d22YYzaB4w+7eSbrKa9/fDD9leNNHzUFsEbejT8EW721lNO81Fbx2P8qqKiQ
-# bLe5y7HA5jJauyrc+k4cAjRctvdoSDQP+8aQ3K28QUASKCpAcFhXmNWJcheoLymt
-# Ktp7oozP9xbXVbGC/+YxCqePK+XNqbr7S2nYQfrV3DC8+tHJj7j6MyNWYM0qxzcm
-# oaIw+rATZ8Pc1sAwXtpLfnz3a1DfOsGXSnsriqGCFM4wghTKBgorBgEEAYI3AwMB
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDmCa+98Zxa
+# WIehm+0I9m1xbDOiR4IsDzmQcwxyuajwAzANBgkqhkiG9w0BAQEFAASCAgBkrTWt
+# 0um2KywEQSeSYR72s5TM0vMpphUE9csKR6WCnGjz1Aa34ybGyD2kQVRjUgrHVOXS
+# sQtxoU0D7Sn5rfRVSLSDzWGI9oMO7/ApBcjpLHsSqoW5zM80r2N/xELYIMLpkpjJ
+# R8JBpNbApNeHUO6M3InlKSmJJL5cQASmTQzZtjjrRrhjPtvSBtqb1ke1QNHGcPwM
+# 4XeR9p5QDZZqVYwnkaaGkb0qwT+/evoRolEc0NQMX8aQBtgdVZwUeonoaF03L/E0
+# c/qEwASb1tjeVM1amfeiA9YD8TqIrEUWbWh7iSsr3D2WNlfc5yS7hjV2/bfGHBUz
+# Giz2Bh8GDEBGaJlb1kZn/cWiyPE8f13gwTUxa+3hui9jsLM7H5O2QUwC8weIsmV8
+# PkE0erljsuaVpl8dUksrs9c4HfX3Dp3+1fw3BlpoU5mlkzna99BxGrOz4iN9+xKi
+# ME8VHgRABId+AHNaXsI3HaFKkI2MjHaSRcTVhQhmCphGGN4tVgRLY5vpB8ojSIaL
+# SmCrgcfaxYP67Vp0WE+Yu1Ni5KNx/nedGxUtikoz6vuEsohvpWV6o/vu/LQsIpqF
+# 8TlOqxuvbkiS6hJG46HAUW8dkGn8hdP1Mug3LEZtgRc9sBeKJjUaOEYP2gYuLHHz
+# 49CXPbGxYVlgZE/Ch8zOwhFjZCuBWDJ6KrrawqGCFM4wghTKBgorBgEEAYI3AwMB
 # MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEILsqcWEHpZF4XHGx9OarYt5vC82xh/DAH+2zgKibU6DzAgh23FXquilG
-# uRgPMjAyNjExMTQwODE2MzhaMAMCAQECEC82YpK5W985lsGu9gQUtyegghGnMIIE
+# BAIBBQAEIMT5fsHCLutdscaPFYseNFAfI9IOmqTHA52QjPyLAB32AggKyXcEe7+4
+# 2xgPMjAyNjExMTUyMDA2MjVaMAMCAQECEG8lET9HYfnkMS+OO4PjvtugghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -2273,13 +2442,13 @@ Export-ModuleMember -Function Get-PcmValue, Format-PcmDuration, Add-PcmIssue, Wr
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNDA4MTYzOFowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEILEW
-# 4Rlle3Y2V+offF+5KRQ12c5tqZWjNFZjSG27zIivMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNTIwMDYyNVowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIJQ5
+# xKe9jnYi7NboTjutQCTK4px0rKGd6uKJOEqCsPSyMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiBH5QOFQStLUvnXUrxzrLo0r8AS+jQwV3gXii6Ct8EK0gIhAL2X
-# H0I3KEKn/ICqlaLLsIRTboXH8DPwEG9fX9823lrF
+# zj0EAwIERzBFAiEA+lHft7RH3nsvIjQphFORETnVaTPMHuoQ+S4UWxY5BMECIHM6
+# Bo2KfY8jy11CV8fKgFieZH2mpMTKU8+GCpXJN4Jm
 # SIG # End signature block

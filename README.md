@@ -33,7 +33,7 @@ In a hybrid organisation, a mailbox hosted on-premises is only a *mail user* for
 
 Done by hand, giving each user a cloud mailbox means changing the source of authority of every identity, licensing it in the right order, recreating the shared mailboxes with their permissions — which can no longer be read on-premises — and, months later, undoing all of it **without deleting the mails received in the cloud**. This tool collects what it needs before the disaster, then does the conversion and the rollback in the order proven against a real tenant, verified at each step and journaled.
 
-**Author:** Nicolas Fabert · **Version:** 2.0.0 ([changelog](CHANGELOG.md)).
+**Author:** Nicolas Fabert · **Version:** 2.1.0 ([changelog](CHANGELOG.md)).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-principles-dark.png">
@@ -47,12 +47,13 @@ Done by hand, giving each user a cloud mailbox means changing the source of auth
   <img alt="One configuration and one entry script: Exchange snapshot, cloud operations, journal and reports; four actions: Collect, Check, Convert, Recover" src="package/docs/images/readme-how-it-works-light.png">
 </picture>
 
-- **Collected before.** `Collect` runs every day (PowerShell 7.5, from any domain-joined server that reaches an Exchange server) and stores the mailboxes, their GUIDs and X500 addresses, the **permissions of the shared mailboxes** (FullAccess with AutoMapping, SendAs, SendOnBehalf, groups expanded) and the **groups you name** with all their members, in one SQLite file, with a `.sha256` file that later runs verify.
+- **Collected before.** `Collect` runs every day (PowerShell 7.5, from any domain-joined server that reaches an Exchange server) and stores the mailboxes, their GUIDs and X500 addresses, the **permissions of the shared mailboxes** (FullAccess with AutoMapping, SendAs, SendOnBehalf, groups expanded) and the **groups you name** with all their members (used only to choose the objects of a run with `-Group`), in one SQLite file, with a `.sha256` file that later runs verify.
 - **Same identity, Teams storage promoted.** `Convert` (PowerShell 7.5, certificate of an app registration or an administrator who signs in) moves the source of authority of each identity to the cloud and gives it an Exchange plan: the **Teams storage of the user becomes their mailbox**, with their chats. Shared mailboxes are converted in waves, one temporary licence unit each (`Licensing.Shared.Parallel`, 100 by default, never using the `Licensing.Shared.KeepFree` units), given back after each wave.
 - **Which objects, at run time.** Everything, or one mailbox (`-Identity`), a list (`-CsvPath`), an OU (`-SearchBase`) or a group (`-Group`, read from the snapshot first, then from Microsoft Entra ID), narrowed by `-Scope` and `-MaxObjects`. A member that is not a mailbox is skipped, and the run says why.
 - **Preview by default, one batch ID.** Without `-Mode Apply` nothing is changed. Apply asks one confirmation, journals the original state of every object, and prints the batch ID with the exact next command, also after a failure.
-- **Follow the batch.** `Check -Batch <ID> -Expect Provisioned|Deprovisioned|Retained [-Once]` reads the objects of a batch and tells whether they are in the state they should be in. One **global report** follows the batch from end to end.
+- **Follow the batch.** `Check -Batch <ID> -Expect Provisioned|Deprovisioned|Retained [-Once]` reads the objects of a batch and tells whether they are in the state they should be in. It follows **every** object of the batch, also the ones that Convert never started, and never says "provisioned" while the batch is not Complete. One **global report** follows the batch from end to end: every object and every step of its journey, with no limit, in one page and in two CSV files.
 - **Back without losing a mail.** `Recover -Batch <ID>` gives the identities back to AD in waves (one scheduler pause and one synchronisation per wave, not per object); the users' cloud data stays under an **eDiscovery case hold** (several policies in the same case once 1,000 mailboxes is reached), the cloud shared mailboxes become **inactive mailboxes**, and every licence is put back exactly as it was.
+- **What is not recreated.** Convert and Recover work on mailboxes: users, shared mailboxes and, if you turn it on, native rooms and equipment. **Contacts, distribution groups, mail-enabled security groups, dynamic distribution groups and Microsoft 365 groups are not recreated.** Collect can keep contacts, distribution groups and dynamic distribution groups in the snapshot, for reference only; Microsoft 365 groups are not collected. **Calendar settings are restored only for the native rooms and equipment** of the opt-in `CloudResource` mode.
 
 ## The console
 
@@ -146,12 +147,12 @@ Every run also writes a log, a PowerShell transcript, a CSV and an HTML report; 
 
 Do these steps in order. Each one is explained, with pictures, in the [user guide](package/docs/PraCloudMailbox-UserGuide.md).
 
-1. **Download the release, not the source.** On the [releases page](https://github.com/Nico77600/PraCloudMailbox/releases) take `PraCloudMailbox-2.0.0.zip` and its `.sha256` file from the **Assets** list. The "Source code" archives are not the tool.
+1. **Download the release, not the source.** On the [releases page](https://github.com/Nico77600/PraCloudMailbox/releases) take `PraCloudMailbox-2.1.0.zip` and its `.sha256` file from the **Assets** list. The "Source code" archives are not the tool.
 2. **Verify the download.** Compare the hash of the zip with the one in the `.sha256` file, then check the signature of the verifier:
 
    ```powershell
-   (Get-FileHash .\PraCloudMailbox-2.0.0.zip -Algorithm SHA256).Hash
-   Get-Content .\PraCloudMailbox-2.0.0.zip.sha256
+   (Get-FileHash .\PraCloudMailbox-2.1.0.zip -Algorithm SHA256).Hash
+   Get-Content .\PraCloudMailbox-2.1.0.zip.sha256
    Get-AuthenticodeSignature .\module\Test-PackageIntegrity.ps1 | Format-List Status, SignerCertificate    # in the extracted folder: Status must be Valid
    ```
 
@@ -182,14 +183,14 @@ Do these steps in order. Each one is explained, with pictures, in the [user guid
 >
 > - **Back it up every day and externalise the backup**: off-site, out of reach of the domain that can be compromised (offline, immutable, or separate credentials), in several generations.
 > - **Protect access to the file and to its backups.** They hold names, addresses, GUIDs and permissions: a restricted access list, no share open to *Domain Users*.
-> - **Copy the `.sha256` file with the snapshot.** Check, Convert and Recover verify the file against it. If it says the file **changed**, restore it from the external backup. `-AcceptUnverifiedSnapshot` is only for when you know why. A missing `.sha256` file only gives a warning.
+> - **Copy the `.sha256` file with the snapshot.** Check, Convert and Recover verify the file against it. If it says the file **changed**, restore it from the external backup. `-AcceptUnverifiedSnapshot` is only for when you know why. Without a `.sha256` file a Preview and a Check only warn, and a Convert or a Recover in Apply mode stops (`-AcceptUnverifiedSnapshot` accepts it).
 > - **Back up the journal too, during the operations.** `data\PraCloudMailbox-journal.db` is written by Convert and Recover themselves, so the hash does not cover it. It is the only input of the rollback.
 
 ## Upgrading from 1.x
 
 - Recreate the scheduled task of Collect with `pwsh.exe` (not `powershell.exe`): the tool runs in PowerShell 7.5 or later only.
 - Set `Exchange.Server` in the configuration and remove `Exchange.ConnectionMode`.
-- Your snapshot and journal files are read as before. A snapshot written before 2.0.0 has no `.sha256` file, so the first runs only warn: run a Collect to get one.
+- Your snapshot and journal files are read as before. A snapshot written before 2.0.0 has no `.sha256` file, so a Convert or a Recover in Apply mode stops until you run a Collect to get one (or add `-AcceptUnverifiedSnapshot`). A journal of an earlier version is upgraded when a Convert opens it; a batch made before 2.1.0 keeps working, and the tool warns that it cannot prove which snapshot it was made from.
 - The runtime now lives in the `package` folder of the repository (the release zip holds its content).
 
 ## Documentation

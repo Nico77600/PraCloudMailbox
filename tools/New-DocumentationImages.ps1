@@ -33,7 +33,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0  (from Web Services Client for Exchange 1.0.0)
+    Version : 2.1.0  (from Web Services Client for Exchange 1.0.0)
     Part of : PRA Cloud Mailbox (repository tool, not in the package)
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '', Justification = 'The in-memory tenant of the tests lives in global variables.')]
@@ -66,11 +66,17 @@ function Save-Screenshot([string]$Html, [string]$Png, [int]$Width, [int]$Height)
     if (-not (Test-Path $Png)) { throw "Screenshot not written: $Png" }
 }
 
+function Read-SharedText([string]$Path) {
+    $stream = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+    try { return [IO.StreamReader]::new($stream).ReadToEnd() } finally { $stream.Dispose() }
+}
+
 function Get-PageHeight([string]$Html, [int]$Width) {
-    # The page writes its height in body[data-h]; Edge returns the DOM with --dump-dom. A headless Edge that exits without an answer is started again (up to three times).
+    # The page writes its height in body[data-h]; Edge returns the DOM with --dump-dom. A headless Edge that exits without an answer is started again (up to five times, a few seconds apart).
     $url = 'file:///' + ($Html -replace '\\', '/')
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        $dom = Join-Path $work ('dom-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.html')
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        if ($attempt -gt 1) { Start-Sleep -Seconds 3 }
+        $dom =Join-Path $work ('dom-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.html')
         $edgeArgs = @('--headless=new', '--disable-gpu', '--hide-scrollbars', '--no-first-run', "--user-data-dir=`"$(Join-Path $work 'edge-profile')`"", "--window-size=$Width,2000", '--virtual-time-budget=3000', '--dump-dom', "`"$url`"")
         $proc = Start-Process -FilePath $edge -ArgumentList $edgeArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $dom
         if (-not $proc.WaitForExit(45000)) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
@@ -355,8 +361,9 @@ foreach ($job in @(foreach ($scenario in 'cloud', 'collect', 'problems') { forea
 }
 foreach ($r in $running) {
     $null = $r.Process.WaitForExit()
-    $text = [IO.File]::ReadAllText($r.Log)
-    if ($text -notmatch 'SHOTS-OK') { throw "Console harness failed ($($r.Job.Scenario), $($r.Job.Theme)):`n$text`n$([IO.File]::ReadAllText($r.Log + '.err'))" }
+    # A helper process of the child can still hold the redirected file: read it in shared mode.
+    $text = Read-SharedText $r.Log
+    if ($text -notmatch 'SHOTS-OK') { throw "Console harness failed ($($r.Job.Scenario), $($r.Job.Theme)):`n$text`n$(Read-SharedText ($r.Log + '.err'))" }
 }
 Get-ChildItem -LiteralPath $shots -Filter 'console-*.png' | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $OutputFolder $_.Name) -Force }
 Write-Host ('  {0} console pictures' -f @(Get-ChildItem -LiteralPath $shots -Filter 'console-*.png').Count)
@@ -369,7 +376,7 @@ function Save-Report([string]$Path, [string]$Name) {
     $measure = "<script>window.addEventListener('load', () => setTimeout(() => document.body.setAttribute('data-h', Math.ceil(document.body.getBoundingClientRect().height) + 24), 50));</script></body>"
     foreach ($theme in 'light', 'dark') {
         # The report follows the colour scheme of the browser: the picture of the other theme asks for it.
-        $html = $original.Replace('window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"', ('"{0}"' -f $theme)).Replace('@media (prefers-color-scheme:dark){', $(if ($theme -eq 'dark') { '@media all{' } else { '@media not all{' }))
+        $html = $original.Replace('window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"', ('"{0}"' -f $theme)).Replace('@media (prefers-color-scheme:dark){', $(if ($theme -eq 'dark') { '@media all{' } else { '@media not all{' })).Replace('@media (prefers-color-scheme: dark) {', $(if ($theme -eq 'dark') { '@media all {' } else { '@media not all {' }))
         $page = Join-Path $work "$Name-$theme.html"
         [IO.File]::WriteAllText($page, $html.Replace('</body>', $measure), [Text.UTF8Encoding]::new($true))
         Save-Page $page "$Name-$theme" 1280

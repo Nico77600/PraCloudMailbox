@@ -134,7 +134,7 @@ Describe 'Case: helpers' {
         Resolve-PcmOfficialValue 'users' @('All', 'UsersOnly') | Should -BeNullOrEmpty
     }
     It 'reads the tool version in one place' {
-        Get-PcmToolVersion | Should -Be '2.0.0'
+        Get-PcmToolVersion | Should -Be '2.1.0'
         $script:EntrySource | Should -Match '(?m)^\$toolVersion = Get-PcmToolVersion'
         $script:EntrySource | Should -Not -Match "(?m)^\`$toolVersion = '"
     }
@@ -321,7 +321,7 @@ Describe 'Case: Collect removes duplicates that differ by letter case' {
         $settings.Calendar.ResourceDelegates | Should -Be @('Delegate@Contoso.com', 'other@contoso.com')
     }
     It 'keeps one DN of a group whose members differ by letter case' {
-        Mock Get-Group -ModuleName PRA.Collect { if ($Identity -eq 'g1') { [pscustomobject]@{ Members = @('CN=A,DC=x', 'cn=a,dc=X', 'CN=B,DC=x') } } else { throw 'not a group' } }
+        Mock Get-Group -ModuleName PRA.Collect { if ($Identity -eq 'g1') { [pscustomobject]@{ Members = @('CN=A,DC=x', 'cn=a,dc=X', 'CN=B,DC=x') } } else { throw "The operation couldn't be performed because object '$Identity' couldn't be found on 'dc01.contoso.com'." } }
         $context = @{ Config = @{ Exchange = @{ DomainController = '' } } }
         @(Get-PcmGroupMemberDn -Context $context -Identity 'g1') | Should -Be @('CN=A,DC=x', 'CN=B,DC=x')
     }

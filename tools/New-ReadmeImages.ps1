@@ -30,7 +30,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0  (from Web Services Client for Exchange 1.0.0)
+    Version : 2.1.0  (from Web Services Client for Exchange 1.0.0)
     Part of : PRA Cloud Mailbox (repository tool, not in the package)
 #>
 [CmdletBinding()]

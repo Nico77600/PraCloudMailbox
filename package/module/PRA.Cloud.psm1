@@ -24,7 +24,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0
+    Version : 2.1.0
 #>
 #Requires -Version 7.5
 Set-StrictMode -Version Latest
@@ -175,6 +175,7 @@ $finish = {
     if ($s.Extra) { $lines += @($s.Extra) }
     $lines += 'Next steps:'
     foreach ($step in @($s.NextSteps)) { $lines += ('  ' + $step) }
+    $lines += 'RESULT: FAIL'
     $text = ($lines -join [Environment]::NewLine)
     try { [Console]::Error.WriteLine($text) } catch { $null = $_ }
     try { $log = [string]$s.Context['LogFile']; if ($log) { [IO.File]::AppendAllText($log, $text + [Environment]::NewLine) } } catch { $null = $_ }
@@ -1065,12 +1066,12 @@ function Test-PcmTenantReadiness {
             elseif (-not $Tenant.LicenceGroup) { & $add 'Error' 'LICENCE_GROUP' "Licence group $($licensing.Users.GroupId) not found in Entra ID." }
             else {
                 $group = $Tenant.LicenceGroup
-                $plans = @(); $free = 0; $names = @(); $drawsShared = $false
+                $plans = @(); $free = $null; $names = @(); $drawsShared = $false
                 foreach ($assigned in @($group.assignedLicenses)) {
                     $sku = $skuById[[string]$assigned.skuId]
                     if (-not $sku) { continue }
                     $exchange = @(Get-PcmSkuExchangePlan -Sku $sku -DisabledPlanIds @($assigned.disabledPlans | ForEach-Object { [string]$_ }))
-                    if ($exchange.Count) { $plans += $exchange; $free += (Get-PcmFreeUnit $sku); $names += [string]$sku.skuPartNumber; if ($sharedSkuId -and [string]$sku.skuId -eq $sharedSkuId) { $drawsShared = $true } }
+                    if ($exchange.Count) { $plans += $exchange; $free = if ($null -eq $free) { Get-PcmFreeUnit $sku } else { [Math]::Min($free, (Get-PcmFreeUnit $sku)) }; $names += [string]$sku.skuPartNumber; if ($sharedSkuId -and [string]$sku.skuId -eq $sharedSkuId) { $drawsShared = $true } }
                 }
                 if (-not $plans.Count) { & $add 'Error' 'LICENCE_GROUP' "Group $($group.displayName) assigns no licence with an Exchange plan enabled." }
                 else {
@@ -1237,6 +1238,22 @@ function Get-PcmExoStateSet {
     return $result
 }
 
+function Get-PcmRetryAfterSecond {
+    <# The Retry-After (seconds) that Microsoft Graph gave in the answer of one request of a batch: 0 when there is none, never more than two minutes. #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([AllowNull()][object]$Response)
+    $headers = Get-PcmValue $Response 'headers' $null
+    if ($null -eq $headers) { return 0 }
+    $names = if ($headers -is [System.Collections.IDictionary]) { @($headers.Keys) } else { @($headers.PSObject.Properties.Name) }
+    foreach ($name in $names) {
+        if (-not [string]::Equals([string]$name, 'Retry-After', [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $seconds = 0
+        if ([int]::TryParse([string](Get-PcmValue $headers ([string]$name) ''), [ref]$seconds) -and $seconds -gt 0) { return [Math]::Min($seconds, 120) }
+    }
+    return 0
+}
+
 function Invoke-PcmGraphBatch {
     <#
     .SYNOPSIS
@@ -1266,6 +1283,7 @@ function Invoke-PcmGraphBatch {
     }
     for ($round = 1; $round -le 3 -and $pending.Count; $round++) {
         $again = [System.Collections.Generic.List[int]]::new()
+        $retryAfter = 0
         for ($start = 0; $start -lt $pending.Count; $start += $script:GraphBatchSize) {
             $chunk = @($pending.GetRange($start, [Math]::Min($script:GraphBatchSize, $pending.Count - $start)))
             $batch = @(foreach ($index in $chunk) {
@@ -1279,12 +1297,12 @@ function Invoke-PcmGraphBatch {
             foreach ($response in @($answer.responses)) {
                 $index = [int]$response.id; $seen[$index] = $true
                 $status = [int]$response.status
-                if ($status -eq 429 -or $status -ge 500) { $again.Add($index) } else { $results[$index] = & $toResult $status (Get-PcmValue $response 'body' $null) }
+                if ($status -eq 429 -or $status -ge 500) { $again.Add($index); $retryAfter = [Math]::Max($retryAfter, (Get-PcmRetryAfterSecond -Response $response)) } else { $results[$index] = & $toResult $status (Get-PcmValue $response 'body' $null) }
             }
             foreach ($index in $chunk) { if (-not $seen.ContainsKey($index)) { $again.Add($index) } }
         }
         $pending = $again
-        if ($pending.Count -and $round -lt 3) { Start-Sleep -Seconds (5 * $round) }
+        if ($pending.Count -and $round -lt 3) { Start-Sleep -Seconds ([Math]::Max((5 * $round), $retryAfter)) }
     }
     foreach ($index in $pending) {
         $request = $Requests[$index]
@@ -2484,7 +2502,10 @@ function Get-PcmReadiness {
     elseif ($type -eq 'MailUser') {
         if ([string]$State.ExchangeGuid -eq $onPremGuid) { & $add 'Ok' 'ExchangeOnline' 'EXO_MAILUSER' 'MailUser with the on-premises ExchangeGuid.' }
         elseif ([string]$State.ExchangeGuid -eq [guid]::Empty.ToString()) { & $add 'Warn' 'ExchangeOnline' 'GUID_CLEARED' 'MailUser with an empty ExchangeGuid: Convert already started for this object.' }
-        else { & $add 'Warn' 'ExchangeOnline' 'GUID_MISMATCH' ("MailUser ExchangeGuid {0} differs from the on-premises mailbox {1}." -f $State.ExchangeGuid, $onPremGuid) }
+        else {
+            & $add 'Warn' 'ExchangeOnline' 'GUID_MISMATCH' ("MailUser ExchangeGuid {0} differs from the on-premises mailbox {1}." -f $State.ExchangeGuid, $onPremGuid)
+            if ($State.MatchedBy -eq 'UPN') { & $add 'Error' 'Entra' 'ENTRA_WRONG_OBJECT' ("The Entra ID account with this UPN is probably not this person: it was found by UPN only (its onPremisesImmutableId is '{0}', not the one of the snapshot) and its mailbox GUID {1} differs from the on-premises mailbox {2}. Nothing is changed on it. Fix the source anchor or the UPN in Entra ID, or leave this object out." -f $user.onPremisesImmutableId, $State.ExchangeGuid, $onPremGuid) }
+        }
     } elseif ($type -match 'Mailbox$') {
         & $add 'Error' 'ExchangeOnline' 'ALREADY_CLOUD_MAILBOX' ("Already a cloud mailbox ($type): converted already, or migrated to Exchange Online (then it is outside the scenario).")
     } else { & $add 'Error' 'ExchangeOnline' 'EXO_UNEXPECTED_TYPE' "Unexpected Exchange Online recipient type $type." }
@@ -2994,7 +3015,8 @@ function Invoke-PcmEntraConnect {
     .DESCRIPTION
         EntraConnect.Mode:
           Remoting  Invoke-Command to EntraConnect.Server (ADSync cmdlets), with the current account.
-          Script    EntraConnect.ScriptPath -Operation <op>: any way to reach the server (exit 0 = done).
+          Script    EntraConnect.ScriptPath -Operation <op>: any way to reach the server (exit 0 = done). EntraConnect.Server and EntraConnect.CredentialPath are given
+                    as -Server and -CredentialPath to a script that declares those parameters (the sample does), so that a signed script needs no edit.
           Manual    The operator does it; the tool asks for a confirmation (in the console, or in the window when the
                     run belongs to it; impossible with -Force in the console).
     #>
@@ -3042,10 +3064,17 @@ function Invoke-PcmEntraConnect {
         'Script' {
             # A script that ends without 'exit' leaves $LASTEXITCODE unset (StrictMode) or at the value of an earlier call.
             $global:LASTEXITCODE = 0
-            $output = & $entra.ScriptPath -Operation $Operation
+            # The server and the credential file of the configuration go to a script that declares -Server and -CredentialPath (the signed sample does), so that it runs as it is signed;
+            # a script of the administrator that does not declare them gets -Operation only.
+            $scriptArguments = @{ Operation = $Operation }
+            $declared = (Get-Command -Name $entra.ScriptPath -CommandType ExternalScript -ErrorAction Stop).Parameters
+            if ($entra.Server -and $declared.ContainsKey('Server')) { $scriptArguments.Server = [string]$entra.Server }
+            if ((Get-PcmValue $entra 'CredentialPath' '') -and $declared.ContainsKey('CredentialPath')) { $scriptArguments.CredentialPath = [string]$entra.CredentialPath }
+            $output = & $entra.ScriptPath @scriptArguments
             $code = Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly -ErrorAction SilentlyContinue
-            if ($code) { throw "EntraConnect.ScriptPath -Operation $Operation ended with exit code $code." }
-            return (@($output | ForEach-Object { [string]$_ -split '\r?\n' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | ')
+            $lines = (@($output | ForEach-Object { [string]$_ -split '\r?\n' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | ')
+            if ($code) { throw "EntraConnect.ScriptPath -Operation $Operation ended with exit code $code$(if ($lines) { ': ' + $lines } else { '.' })" }
+            return $lines
         }
         'Manual' {
             $text = @{ Pause = 'Pause the Entra Connect scheduler (Set-ADSyncScheduler -SyncCycleEnabled $false)'; Resume = 'Resume the Entra Connect scheduler (Set-ADSyncScheduler -SyncCycleEnabled $true)'; Delta = 'Run a delta synchronisation (Start-ADSyncSyncCycle -PolicyType Delta) and wait for its end' }[$Operation]
@@ -3054,6 +3083,106 @@ function Invoke-PcmEntraConnect {
             $where = if ($entra.Server) { $entra.Server } else { 'the Entra Connect server' }
             if (-not (Request-PcmOperator -Question "$text on $where. Done?" -Title 'PRA Cloud Mailbox - Entra Connect' -Caller $Caller)) { throw "Entra Connect operation $Operation not confirmed by the operator." }
             return 'confirmed by the operator'
+        }
+    }
+}
+
+function Invoke-PcmEntraConnectObject {
+    <#
+    .SYNOPSIS
+        Targeted synchronisation of single objects on the Entra Connect server, by their on-premises distinguished name.
+    .DESCRIPTION
+        Recover uses it for a deleted shared identity that a delta cycle did not recreate. It returns one answer per object (Dn, Ok, Detail) and does not throw for an object that failed.
+        EntraConnect.Mode:
+          Remoting  Invoke-Command to EntraConnect.Server. Invoke-ADSyncSingleObjectSync (Entra Connect 2.x) reads the object from Active Directory, synchronises it and exports it, one
+                    object after the other. That cmdlet needs a session that can reach the management service of Entra Connect, which a remote session often cannot: the objects it does
+                    not synchronise (and every object, once two were refused) are synchronised together by one cycle in which the Active Directory connector runs a full
+                    synchronisation (Set-ADSyncSchedulerConnectorOverride -FullSyncRequired, then Start-ADSyncSyncCycle -PolicyType Delta, waited for).
+          Script    EntraConnect.ScriptPath -Operation SyncObject -ObjectDn <dn>, one object after the other (the signed sample does it). An answer that says the full synchronisation of
+                    the connector ran covers the objects that are left. A script that does not take -ObjectDn, or that refuses the operation, gives a failed answer.
+          Manual    The operator is given the exact command for each object and confirms.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string[]]$ObjectDn, [object]$Caller)
+    $entra = $Context.Config.EntraConnect
+    $failed = { param($Detail) @($ObjectDn | ForEach-Object { [pscustomobject]@{ Dn = [string]$_; Ok = $false; Detail = [string]$Detail } }) }
+    if (-not $PSCmdlet.ShouldProcess("Entra Connect ($($entra.Mode))", 'SyncObject')) { return @(& $failed 'planned') }
+    if (-not (Test-PcmSameText $entra.Mode 'Manual')) { Confirm-PcmWrite -Target ("Entra Connect ({0})" -f $entra.Mode) -Operation 'SyncObject' }
+    switch ($entra.Mode) {
+        'Remoting' {
+            $rows = @(Invoke-Command -ComputerName $entra.Server -ErrorAction Stop -ScriptBlock {
+                    Import-Module ADSync -ErrorAction Stop
+                    $single = Get-Command -Name Invoke-ADSyncSingleObjectSync -ErrorAction SilentlyContinue
+                    # A cycle of the scheduler that is running is waited for; a call that Entra Connect refuses with an error (not with an answer) is tried again, as its services may be busy with that cycle.
+                    $retry = {
+                        param([scriptblock]$Call)
+                        for ($attempt = 1; $attempt -le 3; $attempt++) {
+                            $t0 = Get-Date; while ((Get-ADSyncScheduler).SyncCycleInProgress -and ((Get-Date) - $t0).TotalMinutes -lt 15) { Start-Sleep -Seconds 10 }
+                            try { return (& $Call) } catch { if ($attempt -ge 3) { throw }; Start-Sleep -Seconds 30 }
+                        }
+                    }
+                    $answers = @{}
+                    $left = [System.Collections.Generic.List[string]]::new()
+                    $refused = 0
+                    foreach ($dn in @($using:ObjectDn)) {
+                        $detail = 'Invoke-ADSyncSingleObjectSync is not available on this server'
+                        if ($single -and $refused -lt 2) {
+                            try {
+                                $report = (& $retry { Invoke-ADSyncSingleObjectSync -DistinguishedName $dn -NoHtmlReport -ErrorAction Stop | Out-String }) | ConvertFrom-Json
+                                if ([string]$report.StatusInfo.Status -eq 'Success') { $answers[$dn] = @{ Ok = $true; Detail = ('{0} by Invoke-ADSyncSingleObjectSync' -f $report.Action) }; continue }
+                                $detail = (@($report.StatusInfo.ErrorCode, $report.StatusInfo.Reason) | Where-Object { $_ }) -join ' '
+                            } catch { $detail = $_.Exception.Message }
+                            $refused++
+                        } elseif ($single) { $detail = 'not tried: the objects before it were refused by Invoke-ADSyncSingleObjectSync' }
+                        $left.Add($dn); $answers[$dn] = @{ Ok = $false; Detail = $detail }
+                    }
+                    if ($left.Count) {
+                        try {
+                            $connectors = @(Get-ADSyncConnector)
+                            $names = @($left | ForEach-Object {
+                                    $dn = $_
+                                    ($connectors | Where-Object { $_.Type -eq 'AD' -and @($_.Partitions | Where-Object { $_.DN -and $dn.EndsWith($_.DN, [StringComparison]::OrdinalIgnoreCase) }).Count } | Select-Object -First 1).Name
+                                } | Where-Object { $_ } | Select-Object -Unique)
+                            if (-not $names.Count) { throw 'the Active Directory connector of the objects was not found' }
+                            $null = & $retry { foreach ($name in $names) { Set-ADSyncSchedulerConnectorOverride -ConnectorName $name -FullSyncRequired $true -ErrorAction Stop } }
+                            $null = & $retry { Start-ADSyncSyncCycle -PolicyType Delta -ErrorAction Stop }
+                            Start-Sleep -Seconds 10
+                            $t0 = Get-Date; while ((Get-ADSyncScheduler).SyncCycleInProgress -and ((Get-Date) - $t0).TotalMinutes -lt 30) { Start-Sleep -Seconds 10 }
+                            foreach ($dn in $left) { $answers[$dn] = @{ Ok = $true; Detail = ('full synchronisation of the Active Directory connector, one cycle for {0} object(s) ({1})' -f $left.Count, $answers[$dn].Detail) } }
+                        } catch { foreach ($dn in $left) { $answers[$dn] = @{ Ok = $false; Detail = ('{0}; full synchronisation of the connector: {1}' -f $answers[$dn].Detail, $_.Exception.Message) } } }
+                    }
+                    foreach ($dn in @($using:ObjectDn)) { [pscustomobject]@{ Dn = $dn; Ok = [bool]$answers[$dn].Ok; Detail = [string]$answers[$dn].Detail } }
+                })
+            return @($rows | ForEach-Object { [pscustomobject]@{ Dn = [string]$_.Dn; Ok = [bool]$_.Ok; Detail = [string]$_.Detail } })
+        }
+        'Script' {
+            $declared = (Get-Command -Name $entra.ScriptPath -CommandType ExternalScript -ErrorAction Stop).Parameters
+            if (-not $declared.ContainsKey('ObjectDn')) { return @(& $failed 'EntraConnect.ScriptPath does not take -ObjectDn: it cannot synchronise one object') }
+            $rows = [System.Collections.Generic.List[object]]::new()
+            $covered = ''
+            foreach ($dn in $ObjectDn) {
+                if ($covered) { $rows.Add([pscustomobject]@{ Dn = [string]$dn; Ok = $true; Detail = $covered }); continue }
+                $global:LASTEXITCODE = 0
+                $scriptArguments = @{ Operation = 'SyncObject'; ObjectDn = [string]$dn }
+                if ($entra.Server -and $declared.ContainsKey('Server')) { $scriptArguments.Server = [string]$entra.Server }
+                if ((Get-PcmValue $entra 'CredentialPath' '') -and $declared.ContainsKey('CredentialPath')) { $scriptArguments.CredentialPath = [string]$entra.CredentialPath }
+                try {
+                    $output = & $entra.ScriptPath @scriptArguments
+                    $code = Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+                    $lines = (@($output | ForEach-Object { [string]$_ -split '\r?\n' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | ')
+                    $rows.Add([pscustomobject]@{ Dn = [string]$dn; Ok = (-not $code); Detail = $(if ($code) { "exit code $code$(if ($lines) { ': ' + $lines })" } else { $lines }) })
+                    if (-not $code -and $lines -match 'full synchronisation of the Active Directory connector') { $covered = $lines }
+                } catch { $rows.Add([pscustomobject]@{ Dn = [string]$dn; Ok = $false; Detail = $_.Exception.Message }) }
+            }
+            return @($rows)
+        }
+        'Manual' {
+            if (-not $Caller -and -not $env:PRA_EVENT_FILE) { return @(& $failed 'EntraConnect.Mode = Manual needs the operator') }
+            $where = if ($entra.Server) { $entra.Server } else { 'the Entra Connect server' }
+            $commands = @($ObjectDn | ForEach-Object { "Invoke-ADSyncSingleObjectSync -DistinguishedName '{0}' -NoHtmlReport" -f ([string]$_).Replace("'", "''") })
+            $question = "On $where, run these commands one after the other (each answer must show Status Success):`n" + ($commands -join "`n") + "`nIf one of them fails, run Start-ADSyncSyncCycle -PolicyType Delta after Set-ADSyncSchedulerConnectorOverride -ConnectorName <the Active Directory connector> -FullSyncRequired `$true.`nDone?"
+            if (-not (Request-PcmOperator -Question $question -Title 'PRA Cloud Mailbox - Entra Connect' -Caller $Caller)) { return @(& $failed 'not confirmed by the operator') }
+            return @($ObjectDn | ForEach-Object { [pscustomobject]@{ Dn = [string]$_; Ok = $true; Detail = 'confirmed by the operator' } })
         }
     }
 }
@@ -3070,13 +3199,13 @@ Export-ModuleMember -Function Get-PcmRunningPipeline, Get-PcmCallTimeout, Get-Pc
     Wait-PcmCondition, Get-PcmExoState, Set-PcmSourceOfAuthority, Get-PcmSourceOfAuthority, Set-PcmUsageLocation, Set-PcmGroupMember,
     Test-PcmGroupMember, Get-PcmDisabledPlanForExchangeOnly, Set-PcmLicence, Get-PcmUserLicence, Get-PcmDirectLicence, Enable-PcmLicencePlan,
     Restore-PcmLicence, Remove-PcmIdentity, Test-PcmDeletedIdentity,
-    Connect-PcmCompliance, Get-PcmHoldPolicySet, Test-PcmToolHold, Add-PcmHoldLocationSet, Remove-PcmHoldLocationSet, Get-PcmKioskAssignment, Get-PcmSharedGrant, Grant-PcmSharedPermission, Invoke-PcmEntraConnect
+    Connect-PcmCompliance, Get-PcmHoldPolicySet, Test-PcmToolHold, Add-PcmHoldLocationSet, Remove-PcmHoldLocationSet, Get-PcmKioskAssignment, Get-PcmSharedGrant, Grant-PcmSharedPermission, Invoke-PcmEntraConnect, Invoke-PcmEntraConnectObject
 
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDJeXo5tAyTK7ju
-# dbhNOprjzVk3dB5GUI5QN8Qox7+N8KCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAAfFVmaISZ1iOT
+# hE4LEVQtKAG/o3tZWGcZgOe03b0KUKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -3153,23 +3282,23 @@ Export-ModuleMember -Function Get-PcmRunningPipeline, Get-PcmCallTimeout, Get-Pc
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCzDEks/IHH
-# m/PcJP5I7ojfAs56zX8gpvIE8EbKgfWfljANBgkqhkiG9w0BAQEFAASCAgA2qCSp
-# ZR7tEsYRWuDYtGuKpeemtaEUthcQsys7BQmH4k6zP8vuDfQWKC0+PFmmqV2MpSWK
-# kRNwbBBHDdIuVwbXi96fwK6n2DFb4P3KrTFaFiOWK2KeY/TkTs3Es6GCHtKSeqK4
-# 8tzI1YaWJvHZ2Efbv4KOkLYXTbxEB3zK+Rp05RPg6tTPKaWh/u4rhhg1JabDEGFP
-# xEoJtOPFXuIqzZeYzD62eGiVkr/Xoyl13r833l0DMzG4o7lcmvQz0VASCXXpnQIK
-# yJaqkk8qt2WVXPwCRI1oI3AQbO2vtQ0kIC7QAdw/E6IHujFL4/GR/NJFcgWM13nT
-# w0nCwY1PR/NTI1ENdinIgdEYkyucZIg5UEymHqUql3UivW73A3Hq2mQ+R1NJ26bt
-# WOlVcqDvHGaHmZymOebG5X0uUy/ZklRK7RSYZJw9YtW0m9tvV6gwTokfLSj2RbWz
-# 7f4niW5ZBHGEmvk7opyvlC9rJfvVjxu6QQaeFcBSWRKpe1ssrN5Xm9jpeb+nya4R
-# rybKmUnwBBHsKdaagK3F//iDgpZ+uedBxdu7q6aFMhXpnu1Iv5FVbncHaGQ+6KGz
-# vV0nNh6/b16BEC5dDZ4RDKH1GnZNer08KTQSlXH+Q7mHWJ4tuKlTI8cOtO8nSX3x
-# ZFJAwuVsEaNZk1BYhF7rSwsCzx8niEIQRJ4emaGCFM4wghTKBgorBgEEAYI3AwMB
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDah8Fhb89F
+# j/dAWrRw+8ir8O37WcpAr+vtIrMSYlZtazANBgkqhkiG9w0BAQEFAASCAgA+6UHd
+# Uvr0DsK6pBSBLjqAl2SKEcVBwDlk7msHIxeaO5gpd0V6fbFtFAeRLLI4QLV0hnji
+# QLWZojwjwMLAYYx2Qsjq3U0MlVe+S1aZxmZ5J3sr89BIyxp3tSchmGEuge5w/i6r
+# i6BaB+cJz489yd+stjov+AzcQr9YoJuV3YLia8rRsw4dgg8AgC2jbsrVrRPBkcyc
+# kFbM6FXA4OHaShd3zhi7v95FTD/kEzO5vils3JBuiDZHg+AZ3SxEfNQLC13sKF77
+# X44r8oXHcZBYiQsf7+Lf3QQ3wUk8WwIys5Wbg17qWseWKxTfdbq4OVJdzDBqnxWZ
+# KTwlBzGLY7utAoTn+2b8yqSC6hNeAUiLoDqMzhvl9sTXkPVRm8gkNhAPgS6FgYJ0
+# EgdCTAdinSfvPl07/r72gYMydLbTkOxgd9xAcZxyzAv/oxEw0vy7lUQPezeuVSnC
+# NJ+uNFwbe/KsuW+rOzPHnlxd+viJcZ+MW+xhnGtZ65TPMiBWvlCqIerxwaPhGzJq
+# mLHj6P3AayMdWwSXcR3OWRguG66ulIZvZi8gj8chqS4tGC12B3WxmtljzYwZJAGh
+# 7XrGKMtvqS/xfIso2Tn79AcBT+NkgHeIak4eHr0izlmYQmz0HHmYDLZVxsdPpngN
+# 0EoTIqyERKPjSk3U5FLK1AMt9MHPr+cetFCVhqGCFM4wghTKBgorBgEEAYI3AwMB
 # MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIDK57NDX/78ikEi1gIgGG/l3u3XrXZ8MT/wqSpEwWb2OAghijb3YTPVH
-# aBgPMjAyNjExMTQwODE2NTlaMAMCAQECEA9UuXY6rLybVsUDnzoyLNGgghGnMIIE
+# BAIBBQAEIAaQOmNqe+/J+6nc8DWNFORwNfk9LhaNHsIBSRnVl5tpAggipVm4Curx
+# GBgPMjAyNjExMTUyMDA2MjBaMAMCAQECEE3eph2uAR6JllzBtqHTZ6agghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -3268,13 +3397,13 @@ Export-ModuleMember -Function Get-PcmRunningPipeline, Get-PcmCallTimeout, Get-Pc
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNDA4MTY1OVowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIN8S
-# sRKAaTlty9H/3Hx5eicb8quHhRwQSM5V2L7/V2CFMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNTIwMDYyMFowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIHxj
+# rSBC0BKADGDDKMihyqzQPiAy7FRTIR1+3LXcAU+tMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiEA8GN0Tw/co3fHOPFRkm7z4aWYpj7g6isI0My7PZLH+TwCICSQ
-# /58VKVIwkD4tY0kL+yrr9tSokrp+teqzPcx5bTn2
+# zj0EAwIERzBFAiAGEfWMwmZuclUMQbIvbdNJhc68Pynpdqw+XDOWX5IcgwIhAI9O
+# 6i1frtMzL5VAQoeMh+hu2cMLQUzpUf/EYSIlDhkz
 # SIG # End signature block

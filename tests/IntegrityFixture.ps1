@@ -13,7 +13,7 @@
     claimed to be equivalent.
 .NOTES
     Author : Nicolas Fabert
-    Version: 2.0.0
+    Version: 2.1.0
 #>
 #Requires -Version 7.5
 
@@ -51,7 +51,7 @@ function global:Get-PcmExpectedInventory {
         'module\PRA.Common.psm1', 'module\PRA.Store.psm1', 'module\PRA.Collect.psm1', 'module\PRA.Cloud.psm1', 'module\PRA.Gui.psm1'
         'module\PRA.Gui.Data.ps1', 'module\PRA.Gui.Detect.ps1', 'module\PRA.Gui.Process.ps1', 'module\PRA.Gui.Run.ps1', 'module\PRA.Gui.RunConfig.ps1', 'module\PRA.Gui.View.ps1'
         'module\Test-PackageIntegrity.ps1', 'module\PRA.Gui.xaml'
-        'templates\Report.template.html'
+        'templates\Report.template.html', 'templates\GlobalReport.template.html'
         'config\Targets.sample.csv', 'config\EntraConnect.sample.ps1'
         'lib\sqlite\README.txt', 'lib\sqlite\netstandard2.0\System.Data.SQLite.dll', 'lib\sqlite\netstandard2.0\x64\SQLite.Interop.dll'
         'README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md'
