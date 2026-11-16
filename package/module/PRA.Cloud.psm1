@@ -611,16 +611,17 @@ function Disconnect-PcmCloud {
     param([Parameter(Mandatory)][hashtable]$Context)
     $signOutErrors = [System.Collections.Generic.List[string]]::new()
     Uninstall-PcmCallGuard
-    if ($Context.ContainsKey('ExoConnected') -and $Context['ExoConnected']) {
+    $owned = @(if ($Context.ContainsKey('ExoConnectionIds')) { $Context['ExoConnectionIds'] })
+    if (($Context.ContainsKey('ExoConnected') -and $Context['ExoConnected']) -or $owned.Count) {
         Enter-PcmCall -Call 'Disconnect-ExchangeOnline' -Seconds $script:CallGuardCleanupSeconds -Cleanup
         try {
-            $owned = @(if ($Context.ContainsKey('ExoConnectionIds')) { $Context['ExoConnectionIds'] })
             if (-not $owned.Count) { throw 'the Exchange Online connections of this run are not known, so none is closed' }
             $current = @(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { [string]$_.ConnectionId })
             foreach ($id in $owned) {
                 if ($current | Where-Object { Test-PcmSameText $_ $id }) { Disconnect-ExchangeOnline -ConnectionId $id -Confirm:$false -ErrorAction Stop 6>$null | Out-Null }
             }
             $Context['ExoConnected'] = $false
+            $Context['ExoConnectionIds'] = @()
         } catch { $signOutErrors.Add('Exchange Online sign-out: ' + $_.Exception.Message) } finally { Exit-PcmCall }
     }
     foreach ($text in @(Read-PcmModuleWarning)) { try { Write-PcmLog $Context ('Microsoft 365 module warning: ' + $text) -Level Detail } catch { $null = $_ } }

@@ -163,6 +163,12 @@ Describe 'Graph transport lifecycle (offline context model)' {
         Should -Invoke Disconnect-MgGraph -ModuleName PRA.Cloud -Times 1 -Exactly
         $global:PraFakeGraphAuth | Should -BeNullOrEmpty
     }
+    It 'signs out the connection that a failed sign-in left, and reports the failure of the sign-in' {
+        Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { $null = Add-PraFakeExoConnection -TenantId $Organization -AppId $AppId -ConnectionId 'partial'; throw 'Synthetic sign-in failure' }
+        { Connect-PcmCloud -Context $context } | Should -Throw '*Synthetic sign-in failure*'
+        @($global:PraFakeExo.Disconnects) | Should -Be @('partial')
+        @(Get-ConnectionInformation).Count | Should -Be 0
+    }
     It 'refuses to sign out when the connections of the run are not known' {
         $context['ExoConnected'] = $true
         { Disconnect-PcmCloud -Context $context } | Should -Throw '*Exchange Online sign-out: the Exchange Online connections of this run are not known*'
