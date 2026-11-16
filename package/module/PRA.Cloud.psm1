@@ -470,7 +470,7 @@ function Connect-PcmCloud {
     $certificate = Get-ChildItem -Path "Cert:\CurrentUser\My\$($cloud.CertificateThumbprint)", "Cert:\LocalMachine\My\$($cloud.CertificateThumbprint)" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $certificate) { throw "Certificate $($cloud.CertificateThumbprint) not found in Cert:\CurrentUser\My nor Cert:\LocalMachine\My." }
     if (-not $certificate.HasPrivateKey) { throw "Certificate $($cloud.CertificateThumbprint) has no private key on this computer." }
-    if ($certificate.NotAfter -lt (Get-Date).AddDays(30)) { $Context['CertificateWarning'] = "The certificate expires on $($certificate.NotAfter.ToString('yyyy-MM-dd'))." }
+    if ($certificate.NotAfter -lt (Get-Date).AddDays(30)) { $Context['CertificateWarning'] = "The certificate expires on $($certificate.NotAfter.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture))." }
     if ($Context['Approval'] -isnot [scriptblock]) { throw 'The run gives no approval for its changes: it cannot sign in to the cloud. Nothing was done.' }
     Import-Module Microsoft.Graph.Authentication -MinimumVersion $script:MinGraphVersion -ErrorAction Stop
     try {
@@ -489,7 +489,7 @@ function Connect-PcmCloud {
         } finally { Exit-PcmCall }
         $Context['ExoConnected'] = $true
         Install-PcmCallGuard
-        return ('Microsoft Graph and Exchange Online, app {0}, certificate {1} (valid until {2})' -f $cloud.AppId, $cloud.CertificateThumbprint.Substring(0, 8), $certificate.NotAfter.ToString('yyyy-MM-dd'))
+        return ('Microsoft Graph and Exchange Online, app {0}, certificate {1} (valid until {2})' -f $cloud.AppId, $cloud.CertificateThumbprint.Substring(0, 8), $certificate.NotAfter.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture))
     } catch {
         Disconnect-PcmCloud -Context $Context
         throw
@@ -1132,7 +1132,7 @@ function Test-PcmTenantReadiness {
     $organization = $Tenant.Organization
     if ($organization -and $organization.onPremisesSyncEnabled -and $organization.onPremisesLastSyncDateTime) {
         $last = [datetime]$organization.onPremisesLastSyncDateTime
-        & $add 'Info' 'DIRECTORY_SYNC' ('Last Entra Connect synchronisation: {0:yyyy-MM-dd HH:mm} UTC.' -f $last.ToUniversalTime())
+        & $add 'Info' 'DIRECTORY_SYNC' ('Last Entra Connect synchronisation: {0} UTC.' -f $last.ToUniversalTime().ToString('yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture))
     }
     $orgHolds = @(if ($Tenant.PSObject.Properties['OrgHolds']) { $Tenant.OrgHolds | Where-Object { $_ } })
     if ($orgHolds.Count) {

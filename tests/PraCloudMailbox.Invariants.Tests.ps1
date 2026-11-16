@@ -82,3 +82,43 @@ Describe 'A date-like value of a resource survives a restore' {
         $global:PcmDateFake.Set.CustomAttribute4 | Should -BeExactly 'plain'
     }
 }
+
+Describe 'Dates are written the same under every culture' {
+    BeforeAll {
+        $script:SavedCulture = [Threading.Thread]::CurrentThread.CurrentCulture
+        [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('th-TH')
+    }
+    AfterAll { [Threading.Thread]::CurrentThread.CurrentCulture = $script:SavedCulture }
+
+    It 'sanity: the Thai culture prints the Buddhist year' {
+        [datetime]::new(2026, 11, 16).ToString('yyyy') | Should -BeExactly '2569'
+    }
+
+    It 'prints the year 2026 in the dates of the global report (<Text>)' -TestCases @(
+        @{ Text = '2026-11-16T10:20:30Z'; Expected = '2026-11-16 10:20:30 UTC' }
+        @{ Text = '2026-11-16T12:20:30+02:00'; Expected = '2026-11-16 10:20:30 UTC' }
+        @{ Text = '2026-11-16T10:20:30.1234567Z'; Expected = '2026-11-16 10:20:30 UTC' }
+        @{ Text = '2026-11-16 10:20:30'; Expected = '2026-11-16 10:20:30 UTC' }
+        @{ Text = 'not a date'; Expected = 'not a date' }
+        @{ Text = ''; Expected = '' }
+    ) {
+        param($Text, $Expected)
+        Format-PcmUtcText $Text | Should -BeExactly $Expected
+    }
+
+    It 'prints a DateTime value as UTC with the year 2026' {
+        Format-PcmUtcText ([datetime]::new(2026, 11, 16, 10, 20, 30, [DateTimeKind]::Utc)) | Should -BeExactly '2026-11-16 10:20:30 UTC'
+    }
+
+    It 'has no date format in the package that follows the culture' {
+        $files = @(Get-ChildItem -LiteralPath (Join-Path $script:Repository 'package') -Recurse -File -Include *.ps1, *.psm1)
+        $found = foreach ($file in $files) {
+            $number = 0
+            foreach ($line in [IO.File]::ReadAllLines($file.FullName)) {
+                $number++
+                if ($line -cmatch "Get-Date\s+-Format|\{\d+:(yyyy|MM|dd|HH|d|g|G)[^}]*\}|\.ToString\('(yyyy|HH|MM|dd)[^']*'\)") { '{0}:{1}: {2}' -f $file.Name, $number, $line.Trim() }
+            }
+        }
+        @($found) | Should -BeNullOrEmpty
+    }
+}

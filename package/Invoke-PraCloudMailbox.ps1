@@ -336,7 +336,7 @@ function New-PcmApprovalCallback {
     }.GetNewClosure()
 }
 $context = @{
-    Root = $PSScriptRoot; Version = $toolVersion; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
+    Root = $PSScriptRoot; Version = $toolVersion; RunId = ((Get-Date).ToString('yyyyMMdd_HHmmss', [Globalization.CultureInfo]::InvariantCulture) + '-' + [guid]::NewGuid().ToString('N'))
     StartTime = Get-Date; Action = $Action; Mode = $effectiveMode; Phase = ''
     CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; StepTotal = 0; Warnings = 0
     Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
@@ -1093,7 +1093,7 @@ function Invoke-PcmCollect {
             try { Set-PcmSnapshotStatus $connection $id Failed $counts $_.Exception.Message } catch { $null = $_ }
             throw
         }
-        $context.SnapshotLabel = '{0} {1} {2}' -f $id, $dot, (Get-Date -Format 'yyyy-MM-dd HH:mm')
+        $context.SnapshotLabel = '{0} {1} {2}' -f $id, $dot, (Get-Date).ToString('yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture)
         Write-PcmItem -Context $context -Status Ok -Icon Batch -Text ('Snapshot {0} written to {1}' -f $id, $config.Store.Path)
         $inUse = Get-PcmSnapshotInUse -JournalPath $config.Store.JournalPath -Root $context.Root
         $pruned = 0
@@ -1105,7 +1105,7 @@ function Invoke-PcmCollect {
             Write-PcmLog -Context $context -Message ('The journal {0} could not be read ({1}): no old snapshot is deleted in this run, because a batch may still need it.' -f $config.Store.JournalPath, $inUse.Message) -Level Warning
         }
         if ($pruned) { Write-PcmItem -Context $context -Status Info -Text ('{0} old snapshot(s) deleted (Store.KeepSnapshots = {1})' -f $pruned, $config.Store.KeepSnapshots) }
-        $backup = Backup-PcmStore $connection $config.Store.BackupFolder ('PraCloudMailbox_{0}_snapshot{1}_{2}.db' -f $config.Environment, $id, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        $backup = Backup-PcmStore $connection $config.Store.BackupFolder ('PraCloudMailbox_{0}_snapshot{1}_{2}.db' -f $config.Environment, $id, (Get-Date).ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture))
         [void]$context.BackupFiles.Add($backup)
         Write-PcmItem -Context $context -Status Ok -Icon Backup -Text "Copy of the database: $backup"
         $finished = $true
@@ -1341,11 +1341,11 @@ function Read-PcmSnapshotData {
     }
     $taken = [datetime]::Parse([string]$snap.finished_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
     $age = (Get-Date).ToUniversalTime() - $taken.ToUniversalTime()
-    $context.SnapshotLabel = '{0} {1} {2:yyyy-MM-dd HH:mm} UTC {1} {3}' -f $snap.id, $dot, $taken.ToUniversalTime(), $snap.exchange_server
+    $context.SnapshotLabel = '{0} {1} {2} UTC {1} {3}' -f $snap.id, $dot, $taken.ToUniversalTime().ToString('yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture), $snap.exchange_server
     $context.Server = [string]$snap.exchange_server
     $scopeInfo = $null; try { $scopeInfo = [string]$snap.scope_json | ConvertFrom-PcmJson } catch { $scopeInfo = $null }
     $partial = $scopeInfo -and [string](Get-PcmValue $scopeInfo 'Identity' '')
-    Write-PcmItem -Context $context -Status Ok -Text ('Snapshot {0} of {1:yyyy-MM-dd HH:mm} UTC from {2} ({3} mailbox(es), {4} permission(s))' -f $snap.id, $taken.ToUniversalTime(), $snap.exchange_server, $records.Count, $permissions.Count)
+    Write-PcmItem -Context $context -Status Ok -Text ('Snapshot {0} of {1} UTC from {2} ({3} mailbox(es), {4} permission(s))' -f $snap.id, $taken.ToUniversalTime().ToString('yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture), $snap.exchange_server, $records.Count, $permissions.Count)
     if ($partial) { Write-PcmLog -Context $context -Message ('Snapshot {0} holds one object only ({1}): not a full Collect.' -f $snap.id, $scopeInfo.Identity) -Level Warning }
     if ($age.TotalDays -gt $config.Store.MaxSnapshotAgeDays) { Write-PcmLog -Context $context -Message ('Snapshot {0:0} day(s) old (Store.MaxSnapshotAgeDays = {1}): permissions and addresses may have changed since.' -f $age.TotalDays, $config.Store.MaxSnapshotAgeDays) -Level Warning }
     if ($Group) { $context.GroupTarget = Resolve-PcmGroupTarget -Snapshot $snap -Found $found -CapturedMembers $capturedMembers -Records $records }

@@ -458,7 +458,7 @@ function Write-PcmGuiWave {
     <# The objects ticked for a wave, as the CSV given to -CsvPath: a column Identity (the object ID) and a column Name for the reader. #>
     param([Parameter(Mandatory)][string]$Folder, [Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][object[]]$Rows)
     $null = New-Item -ItemType Directory -Path $Folder -Force
-    $path = Join-Path $Folder ('wave-{0}-{1}.csv' -f $Name, (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+    $path = Join-Path $Folder ('wave-{0}-{1}.csv' -f $Name, (Get-Date).ToString('yyyyMMdd-HHmmss-fff', [Globalization.CultureInfo]::InvariantCulture))
     $lines = [Collections.Generic.List[string]]::new()
     $lines.Add('Identity,Name')
     foreach ($row in $Rows) { $lines.Add(('{0},"{1}"' -f $row.Guid, ([string]$row.Name).Replace('"', "'"))) }

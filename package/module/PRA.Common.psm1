@@ -473,7 +473,7 @@ function Add-PcmWarning {
     param([hashtable]$Context, [string]$Message)
     if (-not $Context.ContainsKey('WarningList')) { $Context['WarningList'] = New-Object 'Collections.Generic.List[object]' }
     [void]$Context['WarningList'].Add([pscustomobject]@{
-        Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); Phase = [string](Get-PcmValue $Context 'CurrentPhase' ''); Message = $Message
+        Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture); Phase = [string](Get-PcmValue $Context 'CurrentPhase' ''); Message = $Message
     })
 }
 
@@ -536,7 +536,7 @@ function Write-PcmLogFile {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost','',Justification='Last-resort console message when the log is broken.')]
     param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$Level, [AllowEmptyString()][string]$Message)
     if (-not $Context.LogFile) { return }
-    $line = '{0} [{1,-6}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $Level, ($Message -replace '[\r\n]+', ' | ')
+    $line = '{0} [{1,-6}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture), $Level, ($Message -replace '[\r\n]+', ' | ')
     try { [IO.File]::AppendAllText($Context.LogFile, $line + "`r`n", (New-Object Text.UTF8Encoding($false))) }
     catch {
         $failure = 'The log file cannot be written: {0}' -f $_.Exception.Message
@@ -1571,7 +1571,7 @@ function Write-PcmReportHtml {
         'Exchange server' = [string](Get-PcmValue $Context 'Server' '')
         'Tenant' = [string](Get-PcmValue (Get-PcmValue $Context.Config 'Cloud' @{}) 'Organization' '')
         'Computer / account' = ('{0} · {1}\{2}' -f $env:COMPUTERNAME, $env:USERDOMAIN, $env:USERNAME)
-        'Started' = ([datetime]$Context.StartTime).ToString('yyyy-MM-dd HH:mm:ss')
+        'Started' = ([datetime]$Context.StartTime).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
         'Duration' = (Format-PcmDuration ((Get-Date) - [datetime]$Context.StartTime).TotalSeconds)
         'Run ID' = [string]$Context.RunId
         'Run settings changed' = ($overrides -join '; ')
@@ -1584,7 +1584,7 @@ function Write-PcmReportHtml {
     $notice = '{0} object row(s), {1} run error(s) and {2} warning(s) are stored in this file.' -f $Outcome.Rows.Count, $issueList.Count, $warningList.Count
     $values = @{
         '{{TITLE}}' = ConvertTo-PcmHtmlText ('PRA Cloud Mailbox - {0}' -f $Context.Action)
-        '{{SUBTITLE}}' = ConvertTo-PcmHtmlText ('{0} · {1}' -f $modeText, ([datetime]$Context.StartTime).ToString('yyyy-MM-dd HH:mm'))
+        '{{SUBTITLE}}' = ConvertTo-PcmHtmlText ('{0} · {1}' -f $modeText, ([datetime]$Context.StartTime).ToString('yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture))
         '{{VERSION}}' = ConvertTo-PcmHtmlText $Context.Version
         '{{META}}' = $metaHtml.ToString(); '{{TILES}}' = $tiles.ToString(); '{{NEXT}}' = $nextHtml
         '{{DATA_NOTICE}}' = ConvertTo-PcmHtmlText $notice
@@ -1961,10 +1961,17 @@ function Get-PcmStatusClass {
 
 function Format-PcmUtcText {
     param([AllowNull()][object]$Value)
+    if ($Value -is [datetime]) {
+        $moment = [datetime]$Value
+        $utc = if ($moment.Kind -eq [DateTimeKind]::Unspecified) { [datetime]::SpecifyKind($moment, [DateTimeKind]::Utc) } else { $moment.ToUniversalTime() }
+        return $utc.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ' UTC'
+    }
     $text = [string]$Value
     if (-not $text) { return '' }
-    $parsed = [datetime]::MinValue
-    if ([datetime]::TryParse($text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) { return ($parsed.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC') }
+    $parsed = [datetimeoffset]::MinValue
+    if ([datetimeoffset]::TryParse($text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
+        return $parsed.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ' UTC'
+    }
     return $text
 }
 
