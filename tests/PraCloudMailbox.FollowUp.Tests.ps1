@@ -19,8 +19,7 @@ BeforeAll {
     . (Join-Path $PSScriptRoot 'GraphRequestContext.Fake.ps1')
     function global:Connect-MgGraph { [CmdletBinding()] param($ClientId, $TenantId, $CertificateThumbprint, $ContextScope, [switch]$NoWelcome, $Scopes) }
     function global:Disconnect-MgGraph { [CmdletBinding()] param() }
-    function global:Connect-ExchangeOnline { [CmdletBinding()] param($AppId, $CertificateThumbprint, $Organization, $ShowBanner, $CommandName, $UserPrincipalName, [switch]$DisableWAM) }
-    function global:Disconnect-ExchangeOnline { [CmdletBinding(SupportsShouldProcess)] param() Write-Host 'Disconnected successfully !' }
+    . (Join-Path $PSScriptRoot 'ExoSession.Fake.ps1')
     function global:Connect-IPPSSession { [CmdletBinding()] param($AppId, $CertificateThumbprint, $Organization, $ShowBanner, $CommandName, $UserPrincipalName, [switch]$EnableSearchOnlySession) }
     function script:New-FollowConfig {
         param([hashtable]$Cloud = @{}, [hashtable]$Licensing = @{ Users = @{ Mode = 'Group' } }, [hashtable]$Scope = @{ ResourceMode = 'SynchronizedShared' })
@@ -31,9 +30,10 @@ BeforeAll {
 }
 
 AfterAll {
-    foreach ($name in @('Get-MgContext', 'Get-MgRequestContext', 'Set-MgRequestContext', 'Reset-PraFakeGraphTransport', 'Connect-MgGraph', 'Disconnect-MgGraph', 'Connect-ExchangeOnline', 'Disconnect-ExchangeOnline', 'Connect-IPPSSession')) {
+    foreach ($name in @('Get-MgContext', 'Get-MgRequestContext', 'Set-MgRequestContext', 'Reset-PraFakeGraphTransport', 'Connect-MgGraph', 'Disconnect-MgGraph', 'Connect-IPPSSession')) {
         Remove-Item -Path "function:$name" -ErrorAction SilentlyContinue
     }
+    Remove-PraFakeExoSession
     Restore-PcmGlobalState $script:GlobalBefore
 }
 
@@ -312,7 +312,9 @@ Describe 'Interactive sign-in of an administrator' {
             $global:PraFakeGraphAuth = [pscustomobject]@{ Account = 'admin@contoso.com'; Scopes = @($Scopes) }
         }
         Mock Disconnect-MgGraph -ModuleName PRA.Cloud { $global:PraFakeGraphAuth = $null }
+        Reset-PraFakeExoSession
         Mock Connect-ExchangeOnline -ModuleName PRA.Cloud {
+            $null = Add-PraFakeExoConnection
             $value = { param($name) Get-Variable -Name $name -ValueOnly -ErrorAction SilentlyContinue }
             $script:captured.Exo = @{ UserPrincipalName = (& $value 'UserPrincipalName'); AppId = (& $value 'AppId'); CertificateThumbprint = (& $value 'CertificateThumbprint'); DisableWAM = [bool](& $value 'DisableWAM') }
             $script:captured.ExoCommands = @($CommandName)

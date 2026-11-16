@@ -22,10 +22,7 @@ Describe 'Graph transport lifecycle (offline context model)' {
             param($ClientId, $TenantId, $CertificateThumbprint, $ContextScope, [switch]$NoWelcome)
         }
         function global:Disconnect-MgGraph { [CmdletBinding()]param() }
-        function global:Connect-ExchangeOnline {
-            [CmdletBinding()]
-            param($AppId, $CertificateThumbprint, $Organization, $ShowBanner, $CommandName)
-        }
+        . (Join-Path $PSScriptRoot 'ExoSession.Fake.ps1')
     }
     BeforeEach {
         Reset-PraFakeGraphTransport
@@ -38,7 +35,8 @@ Describe 'Graph transport lifecycle (offline context model)' {
             Approval = { param($Target, $Operation) $true } }
         Mock Import-Module -ModuleName PRA.Cloud { }
         Mock Get-ChildItem -ModuleName PRA.Cloud { [pscustomobject]@{ HasPrivateKey = $true; NotAfter = (Get-Date).AddYears(1) } }
-        Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { }
+        Reset-PraFakeExoSession
+        Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { $null = Add-PraFakeExoConnection -TenantId $Organization -AppId $AppId }
         Mock Connect-MgGraph -ModuleName PRA.Cloud {
             $global:PraFakeGraphRequest.MaxRetry | Should -Be 0
             $ContextScope | Should -BeExactly Process
@@ -47,9 +45,10 @@ Describe 'Graph transport lifecycle (offline context model)' {
         Mock Disconnect-MgGraph -ModuleName PRA.Cloud { $global:PraFakeGraphAuth = $null }
     }
     AfterAll {
-        foreach ($name in @('Get-MgContext', 'Get-MgRequestContext', 'Set-MgRequestContext', 'Reset-PraFakeGraphTransport', 'Connect-MgGraph', 'Disconnect-MgGraph', 'Connect-ExchangeOnline')) {
+        foreach ($name in @('Get-MgContext', 'Get-MgRequestContext', 'Set-MgRequestContext', 'Reset-PraFakeGraphTransport', 'Connect-MgGraph', 'Disconnect-MgGraph')) {
             Remove-Item -Path "function:$name" -ErrorAction SilentlyContinue
         }
+        Remove-PraFakeExoSession
     }
     It 'initializes before authentication and restores only after disconnect, preserving other request settings' {
         $before = $global:PraFakeGraphRequest | ConvertTo-Json -Compress
@@ -97,10 +96,77 @@ Describe 'Graph transport lifecycle (offline context model)' {
     It 'does not restore request settings when SDK disconnect fails' {
         Connect-PcmCloud -Context $context | Out-Null
         Mock Disconnect-MgGraph -ModuleName PRA.Cloud { throw 'Synthetic disconnect failure' }
-        Disconnect-PcmCloud -Context $context -WarningAction SilentlyContinue
+        { Disconnect-PcmCloud -Context $context -WarningAction SilentlyContinue } | Should -Throw '*Microsoft Graph sign-out: Synthetic disconnect failure*'
         $global:PraFakeGraphClientGeneration | Should -Be 2
         $global:PraFakeGraphRequest.MaxRetry | Should -Be 0
         & (Get-Module PRA.Cloud) { $script:GraphTransportReady } | Should -BeFalse
+    }
+    It 'refuses an Exchange Online session that already exists, and signs nothing out' {
+        $null = Add-PraFakeExoConnection -TenantId 'contoso.onmicrosoft.com' -ConnectionId 'foreign'
+        { Connect-PcmCloud -Context $context } | Should -Throw '*An Exchange Online session already exists in this PowerShell window*nothing was signed out*'
+        Should -Invoke Connect-ExchangeOnline -ModuleName PRA.Cloud -Times 0 -Exactly
+        $global:PraFakeExo.Disconnects.Count | Should -Be 0
+        @(Get-ConnectionInformation).Count | Should -Be 1
+    }
+    It 'refuses an Exchange Online module that cannot sign out one connection' {
+        Mock Get-Command -ModuleName PRA.Cloud { [pscustomobject]@{ Parameters = @{ Confirm = $true } } } -ParameterFilter { $Name -eq 'Disconnect-ExchangeOnline' }
+        Mock Get-Command -ModuleName PRA.Cloud { Microsoft.PowerShell.Core\Get-Command @PSBoundParameters }
+        { Connect-PcmCloud -Context $context } | Should -Throw '*cannot sign out one connection*'
+        Should -Invoke Connect-ExchangeOnline -ModuleName PRA.Cloud -Times 0 -Exactly
+    }
+    It 'refuses an Exchange Online session of another tenant, and signs out only its own connection' {
+        $context.Config.Cloud.TenantId = '33333333-3333-3333-3333-333333333333'
+        Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { $null = Add-PraFakeExoConnection -TenantId 'other.onmicrosoft.com' -AppId $AppId -ConnectionId 'own' }
+        { Connect-PcmCloud -Context $context } | Should -Throw "*The Exchange Online session is in tenant other.onmicrosoft.com, and Cloud.TenantId is 33333333-3333-3333-3333-333333333333. Nothing was changed.*"
+        @($global:PraFakeExo.Disconnects) | Should -Be @('own')
+    }
+    It 'accepts the tenant GUID or the organisation domain, in any letter case' -TestCases @(
+        @{ Tenant = 'AAAAAAAA-0000-0000-0000-000000000001' }, @{ Tenant = 'aaaaaaaa-0000-0000-0000-000000000001' }, @{ Tenant = 'CONTOSO.onmicrosoft.com' }) {
+        param($Tenant)
+        $context.Config.Cloud.TenantId = 'aaaaaaaa-0000-0000-0000-000000000001'
+        $context.Config.Cloud.Organization = 'contoso.ONMICROSOFT.com'
+        $global:PraFakeExo.InteractiveTenant = $Tenant
+        Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { $null = Add-PraFakeExoConnection -TenantId $global:PraFakeExo.InteractiveTenant -AppId 'SYNTHETIC' }
+        Connect-PcmCloud -Context $context | Should -Not -BeNullOrEmpty
+        Disconnect-PcmCloud -Context $context
+    }
+    It 'refuses a session opened by another application' {
+        Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { $null = Add-PraFakeExoConnection -TenantId $Organization -AppId 'another-app' -ConnectionId 'own' }
+        { Connect-PcmCloud -Context $context } | Should -Throw '*opened by application another-app, and Cloud.AppId is synthetic*'
+        @($global:PraFakeExo.Disconnects) | Should -Be @('own')
+    }
+    It 'signs out only the connection of the tool, and leaves the others open' {
+        Connect-PcmCloud -Context $context | Out-Null
+        $own = @($context['ExoConnectionIds'])
+        $own.Count | Should -Be 1
+        $null = Add-PraFakeExoConnection -TenantId 'contoso.onmicrosoft.com' -ConnectionId 'added-later'
+        Disconnect-PcmCloud -Context $context
+        @($global:PraFakeExo.Disconnects) | Should -Be $own
+        @(Get-ConnectionInformation | ForEach-Object { $_.ConnectionId }) | Should -Be @('added-later')
+        $context['ExoConnected'] | Should -BeFalse
+    }
+    It 'signs out the Security and Compliance connection that the run opened, and only that one' {
+        Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { $null = Add-PraFakeExoConnection -TenantId $Organization -AppId $AppId -ConnectionId 'exchange' }
+        Mock Connect-IPPSSession -ModuleName PRA.Cloud { $null = Add-PraFakeExoConnection -TenantId $Organization -AppId $AppId -ConnectionId 'compliance' }
+        Connect-PcmCloud -Context $context | Out-Null
+        Connect-PcmCompliance -Context $context
+        @($context['ExoConnectionIds']) | Should -Be @('exchange', 'compliance')
+        $null = Add-PraFakeExoConnection -TenantId 'contoso.onmicrosoft.com' -ConnectionId 'foreign'
+        Disconnect-PcmCloud -Context $context
+        @($global:PraFakeExo.Disconnects) | Should -Be @('exchange', 'compliance')
+        @(Get-ConnectionInformation | ForEach-Object { $_.ConnectionId }) | Should -Be @('foreign')
+    }
+    It 'reports a sign-out that fails, and still signs out of Graph' {
+        Connect-PcmCloud -Context $context | Out-Null
+        $global:PraFakeExo.FailDisconnect = 'Synthetic sign-out failure'
+        { Disconnect-PcmCloud -Context $context } | Should -Throw '*Exchange Online sign-out: Synthetic sign-out failure*'
+        Should -Invoke Disconnect-MgGraph -ModuleName PRA.Cloud -Times 1 -Exactly
+        $global:PraFakeGraphAuth | Should -BeNullOrEmpty
+    }
+    It 'refuses to sign out when the connections of the run are not known' {
+        $context['ExoConnected'] = $true
+        { Disconnect-PcmCloud -Context $context } | Should -Throw '*Exchange Online sign-out: the Exchange Online connections of this run are not known*'
+        $global:PraFakeExo.Disconnects.Count | Should -Be 0
     }
     It 'does not relinquish ownership when restoration cannot be verified' {
         Connect-PcmCloud -Context $context | Out-Null

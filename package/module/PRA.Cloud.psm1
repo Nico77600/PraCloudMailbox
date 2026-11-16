@@ -482,17 +482,20 @@ function Connect-PcmCloud {
         try { Connect-MgGraph -ClientId $cloud.AppId -TenantId $cloud.TenantId -CertificateThumbprint $cloud.CertificateThumbprint -ContextScope Process -NoWelcome -ErrorAction Stop } finally { Exit-PcmCall }
         Assert-PcmGraphTransport
         Import-Module ExchangeOnlineManagement -MinimumVersion ([string](Get-PcmValue (Get-PcmValue $Context.Config 'Exo' @{}) 'MinModuleVersion' $script:MinExoVersion)) -ErrorAction Stop
+        Assert-PcmNoExoSession
         Enter-PcmCall -Call 'Connect-ExchangeOnline'
         try {
             Connect-ExchangeOnline -AppId $cloud.AppId -CertificateThumbprint $cloud.CertificateThumbprint -Organization $cloud.Organization -ShowBanner:$false `
                 -CommandName @(Get-PcmExoCommandName -Context $Context) -ErrorAction Stop
-        } finally { Exit-PcmCall }
+        } finally { Exit-PcmCall; Save-PcmExoConnectionId -Context $Context }
         $Context['ExoConnected'] = $true
+        Confirm-PcmExoSession -Context $Context
         Install-PcmCallGuard
         return ('Microsoft Graph and Exchange Online, app {0}, certificate {1} (valid until {2})' -f $cloud.AppId, $cloud.CertificateThumbprint.Substring(0, 8), $certificate.NotAfter.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture))
     } catch {
-        Disconnect-PcmCloud -Context $Context
-        throw
+        $failure = $_
+        Disconnect-PcmCloudAfterFailure -Context $Context
+        throw $failure
     }
 }
 
@@ -542,25 +545,83 @@ function Connect-PcmCloudInteractive {
         $connect = @{ ShowBanner = $false; CommandName = @(Get-PcmExoCommandName -Context $Context); ErrorAction = 'Stop' }
         $hint = if ([string]$cloud['UserPrincipalName']) { [string]$cloud['UserPrincipalName'] } else { $account }
         if ($hint) { $connect.UserPrincipalName = $hint }
+        Assert-PcmNoExoSession
         Enter-PcmCall -Call 'Connect-ExchangeOnline' -Seconds $signInSeconds
-        try { Connect-ExchangeOnline @connect } finally { Exit-PcmCall }
+        try { Connect-ExchangeOnline @connect } finally { Exit-PcmCall; Save-PcmExoConnectionId -Context $Context }
         $Context['ExoConnected'] = $true
+        Confirm-PcmExoSession -Context $Context
         Install-PcmCallGuard
         return ('Microsoft Graph and Exchange Online, interactive sign-in{0} (delegated permissions: {1})' -f $(if ($account) { " as $account" } else { '' }), ($scopes -join ', '))
     } catch {
-        Disconnect-PcmCloud -Context $Context
-        throw
+        $failure = $_
+        Disconnect-PcmCloudAfterFailure -Context $Context
+        throw $failure
     }
+}
+
+function Assert-PcmNoExoSession {
+    <# The tool never uses or closes an Exchange Online session that it did not open: one that already exists in this PowerShell stops the sign-in. #>
+    [CmdletBinding()]
+    param()
+    if (@(Get-ConnectionInformation -ErrorAction Stop).Count) { throw 'An Exchange Online session already exists in this PowerShell window: run the tool in a new PowerShell 7 window (nothing was signed out).' }
+    if (-not (Get-Command -Name Disconnect-ExchangeOnline -ErrorAction Stop).Parameters.ContainsKey('ConnectionId')) {
+        throw 'This version of the ExchangeOnlineManagement module cannot sign out one connection (-ConnectionId): update the module, then run the command again.'
+    }
+}
+
+function Save-PcmExoConnectionId {
+    <# Keeps the IDs of the Exchange Online connections that exist after a sign-in: they are the only ones that the tool signs out. -Add keeps the ones of earlier sign-ins of the run too. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context, [switch]$Add)
+    $known = @(if ($Add -and $Context.ContainsKey('ExoConnectionIds')) { $Context['ExoConnectionIds'] })
+    try { $now = @(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { [string]$_.ConnectionId } | Where-Object { $_ }) } catch { $now = @() }
+    $Context['ExoConnectionIds'] = @($known + @($now | Where-Object { $id = $_; -not ($known | Where-Object { Test-PcmSameText $_ $id }) }))
+}
+
+function Confirm-PcmExoSession {
+    <# The Exchange Online session that the sign-in opened is the only one of this PowerShell and belongs to the tenant of the configuration (a certificate sign-in reports the organisation domain). #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context)
+    $cloud = $Context.Config.Cloud
+    $connections = @(Get-ConnectionInformation -ErrorAction Stop)
+    if ($connections.Count -ne 1) { throw 'Exactly one Exchange Online connection is expected in this PowerShell window after the sign-in. Close the other sessions, then run the command again.' }
+    $tenant = [string](Get-PcmValue $cloud 'TenantId' '')
+    $organization = [string](Get-PcmValue $cloud 'Organization' '')
+    $sessionTenant = [string](Get-PcmValue $connections[0] 'TenantID' '')
+    if (-not ((Test-PcmSameText $sessionTenant $tenant) -or ($organization -and (Test-PcmSameText $sessionTenant $organization)))) {
+        throw ('The Exchange Online session is in tenant {0}, and Cloud.TenantId is {1}. Nothing was changed. Sign in with an account of tenant {1}, then run the command again.' -f $(if ($sessionTenant) { $sessionTenant } else { 'unknown' }), $tenant)
+    }
+    $appId = [string](Get-PcmValue $cloud 'AppId' '')
+    $sessionApp = [string](Get-PcmValue $connections[0] 'AppId' '')
+    if ($appId -and -not (Test-PcmSameText (Get-PcmValue $cloud 'SignIn' 'Certificate') 'Interactive') -and -not (Test-PcmSameText $sessionApp $appId)) {
+        throw ('The Exchange Online session was opened by application {0}, and Cloud.AppId is {1}. Nothing was changed. Check Cloud.AppId and Cloud.CertificateThumbprint, then run the command again.' -f $(if ($sessionApp) { $sessionApp } else { 'unknown' }), $appId)
+    }
+}
+
+function Disconnect-PcmCloudAfterFailure {
+    <# Signs out after a sign-in that failed. A sign-out that fails too is logged: the error of the sign-in is the one that stops the run. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context)
+    try { Disconnect-PcmCloud -Context $Context }
+    catch { try { Write-PcmLog -Context $Context -Message ('Sign-out after the failed sign-in: {0}' -f $_.Exception.Message) -Level Warning } catch { $null = $_ } }
 }
 
 function Disconnect-PcmCloud {
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context)
+    $signOutErrors = [System.Collections.Generic.List[string]]::new()
     Uninstall-PcmCallGuard
     if ($Context.ContainsKey('ExoConnected') -and $Context['ExoConnected']) {
         Enter-PcmCall -Call 'Disconnect-ExchangeOnline' -Seconds $script:CallGuardCleanupSeconds -Cleanup
-        try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction Stop 6>$null | Out-Null } catch { $null = $_ } finally { Exit-PcmCall }
-        $Context['ExoConnected'] = $false
+        try {
+            $owned = @(if ($Context.ContainsKey('ExoConnectionIds')) { $Context['ExoConnectionIds'] })
+            if (-not $owned.Count) { throw 'the Exchange Online connections of this run are not known, so none is closed' }
+            $current = @(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { [string]$_.ConnectionId })
+            foreach ($id in $owned) {
+                if ($current | Where-Object { Test-PcmSameText $_ $id }) { Disconnect-ExchangeOnline -ConnectionId $id -Confirm:$false -ErrorAction Stop 6>$null | Out-Null }
+            }
+            $Context['ExoConnected'] = $false
+        } catch { $signOutErrors.Add('Exchange Online sign-out: ' + $_.Exception.Message) } finally { Exit-PcmCall }
     }
     foreach ($text in @(Read-PcmModuleWarning)) { try { Write-PcmLog $Context ('Microsoft 365 module warning: ' + $text) -Level Detail } catch { $null = $_ } }
     if ([object]::ReferenceEquals($script:GraphRequestOwner, $Context)) {
@@ -568,8 +629,7 @@ function Disconnect-PcmCloud {
         Set-PcmWriteApproval -Approval $null
         if ($Context.ContainsKey('GraphConnected') -and $Context['GraphConnected']) {
             Enter-PcmCall -Call 'Disconnect-MgGraph' -Seconds $script:CallGuardCleanupSeconds -Cleanup
-            try { $null = Disconnect-MgGraph -ErrorAction Stop } catch { $null = $_ } finally { Exit-PcmCall }
-            $Context['GraphConnected'] = $false
+            try { $null = Disconnect-MgGraph -ErrorAction Stop; $Context['GraphConnected'] = $false } catch { $signOutErrors.Add('Microsoft Graph sign-out: ' + $_.Exception.Message) } finally { Exit-PcmCall }
         }
         try {
             # Never reset a cached authenticated client just to restore request settings.
@@ -590,6 +650,7 @@ function Disconnect-PcmCloud {
         } catch { Write-Warning $_.Exception.Message }
     }
     if ($null -ne $script:CallGuard -and [object]::ReferenceEquals($script:CallGuard.Context, $Context)) { Stop-PcmCallGuard }
+    if ($signOutErrors.Count) { throw ($signOutErrors -join ' | ') }
 }
 
 function Test-PcmNetworkFailure {
@@ -2790,13 +2851,13 @@ function Connect-PcmCompliance {
             CommandName = @('Get-CaseHoldPolicy', 'Set-CaseHoldPolicy', 'New-CaseHoldPolicy', 'New-CaseHoldRule') }
         if ($hint) { $interactive.UserPrincipalName = $hint }
         Enter-PcmCall -Call 'Connect-IPPSSession' -Seconds ([Math]::Max((Get-PcmCallTimeoutSecond -Config $Context.Config), $script:CallGuardInteractiveSeconds))
-        try { Connect-IPPSSession @interactive } finally { Exit-PcmCall }
+        try { Connect-IPPSSession @interactive } finally { Exit-PcmCall; Save-PcmExoConnectionId -Context $Context -Add }
     } else {
         Enter-PcmCall -Call 'Connect-IPPSSession'
         try {
             Connect-IPPSSession -AppId $cloud.AppId -CertificateThumbprint $cloud.CertificateThumbprint -Organization $cloud.Organization -ShowBanner:$false -EnableSearchOnlySession `
                 -CommandName Get-CaseHoldPolicy, Set-CaseHoldPolicy, New-CaseHoldPolicy, New-CaseHoldRule -ErrorAction Stop
-        } finally { Exit-PcmCall }
+        } finally { Exit-PcmCall; Save-PcmExoConnectionId -Context $Context -Add }
     }
     $Context['ComplianceConnected'] = $true
     Install-PcmCallGuard
