@@ -126,6 +126,7 @@ $script:Tables = @('mailbox','permission','group_member','contact','distribution
 # a run interrupted (session cut, reboot) is resumed with the same -Batch.
 $script:JournalSchemaVersion = 3
 # Journal schema 3 adds snapshot_run_id and snapshot_hash to batch (the snapshot a batch was made from, by its run and by its content) and an index on batch_item (object_guid); older journals stay readable.
+# The column tenant_id of batch (the tenant a batch was made in) is added to a journal that lacks it, without a change of the schema version: a journal without it is read as a batch of no known tenant.
 $script:JournalSchema = @(
     'CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)'
     @'
@@ -133,7 +134,7 @@ CREATE TABLE IF NOT EXISTS batch (
     id TEXT PRIMARY KEY, action TEXT NOT NULL CHECK (action IN ('Convert','Recover')), convert_batch TEXT,
     status TEXT NOT NULL CHECK (status IN ('Running','Complete','Partial','Failed')),
     created_utc TEXT NOT NULL, updated_utc TEXT, snapshot_id INTEGER, environment TEXT, computer TEXT, account TEXT,
-    tool_version TEXT, scope_json TEXT, counts_json TEXT, note TEXT, snapshot_run_id TEXT, snapshot_hash TEXT)
+    tool_version TEXT, scope_json TEXT, counts_json TEXT, note TEXT, snapshot_run_id TEXT, snapshot_hash TEXT, tenant_id TEXT)
 '@
     @'
 CREATE TABLE IF NOT EXISTS batch_item (
@@ -229,7 +230,7 @@ function Open-PcmStore {
                 }
             } else {
                 $columns = @(Invoke-PcmSql $connection 'PRAGMA table_info(batch)' -As Rows | ForEach-Object { [string]$_.name })
-                foreach ($column in @('snapshot_run_id', 'snapshot_hash')) {
+                foreach ($column in @('snapshot_run_id', 'snapshot_hash', 'tenant_id')) {
                     if ($column -notin $columns) { $null = Invoke-PcmSql $connection ('ALTER TABLE batch ADD COLUMN {0} TEXT' -f $column) }
                 }
             }
@@ -689,11 +690,11 @@ function New-PcmBatch {
     $id = New-PcmBatchId
     if (-not $PSCmdlet.ShouldProcess("batch $id", "New $Action batch")) { return '' }
     $null = Invoke-PcmSql $Connection @'
-INSERT INTO batch (id, action, convert_batch, status, created_utc, updated_utc, snapshot_id, environment, computer, account, tool_version, scope_json, snapshot_run_id, snapshot_hash)
-VALUES (@id, @action, @convert, 'Running', @now, @now, @snapshot, @environment, @computer, @account, @tool, @scope, @run, @hash)
+INSERT INTO batch (id, action, convert_batch, status, created_utc, updated_utc, snapshot_id, environment, computer, account, tool_version, scope_json, snapshot_run_id, snapshot_hash, tenant_id)
+VALUES (@id, @action, @convert, 'Running', @now, @now, @snapshot, @environment, @computer, @account, @tool, @scope, @run, @hash, @tenant)
 '@ @{ id = $id; action = $Action; convert = [string]$Info['ConvertBatch']; now = [datetime]::UtcNow; snapshot = $Info['SnapshotId']
         environment = [string]$Info['Environment']; computer = $env:COMPUTERNAME; account = [string]$Info['Account']; tool = [string]$Info['ToolVersion']
-        scope = [string]$Info['ScopeJson']; run = [string]$Info['SnapshotRunId']; hash = [string]$Info['SnapshotHash'] }
+        scope = [string]$Info['ScopeJson']; run = [string]$Info['SnapshotRunId']; hash = [string]$Info['SnapshotHash']; tenant = [string]$Info['TenantId'] }
     return $id
 }
 

@@ -1291,6 +1291,29 @@ function Confirm-PcmSnapshotHash {
     }
 }
 
+function Assert-PcmSameEnvironment {
+    <# Refuses a snapshot or a batch made for another Environment than the one of the configuration (letter case ignored). A record that holds no Environment is accepted. #>
+    param([Parameter(Mandatory)][string]$What, [AllowNull()][object]$Recorded)
+    $recorded = [string]$Recorded
+    $expected = [string]$context.Config.Environment
+    if (-not $recorded -or (Test-PcmSameText $recorded $expected)) { return }
+    $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+    throw ("{0} was made for Environment '{1}' and the configuration says '{2}'. Nothing was changed. Run the command with the configuration of Environment '{1}'{3}." -f $What, $recorded, $expected, $(if ($What -like 'Snapshot*') { ', or run Collect again with this configuration' } else { '' }))
+}
+
+function Assert-PcmBatchOwner {
+    <# Refuses a batch made for another Environment or in another tenant than the ones of the configuration. A batch of an earlier version holds no tenant: it is accepted. #>
+    param([Parameter(Mandatory)][object]$Row)
+    $what = 'Batch {0}' -f (Get-PcmValue $Row 'id' '')
+    Assert-PcmSameEnvironment -What $what -Recorded (Get-PcmValue $Row 'environment' '')
+    $tenant = [string](Get-PcmValue $Row 'tenant_id' '')
+    $expected = [string](Get-PcmValue (Get-PcmValue $context.Config 'Cloud' @{}) 'TenantId' '')
+    if (-not $tenant) { Write-PcmLog -Context $context -Message ('{0} was made before batches kept their tenant: the tenant of the batch is not checked.' -f $what) -Level Detail; return }
+    if (-not $expected -or (Test-PcmSameText $tenant $expected)) { return }
+    $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+    throw ("{0} was made in tenant {1} and Cloud.TenantId is {2}. Nothing was changed. Run the command with the configuration of tenant {1}: a batch cannot be continued, checked or rolled back in another tenant." -f $what, $tenant, $expected)
+}
+
 function Read-PcmSnapshotData {
     <#
     Loads one snapshot (default: the last complete one), resolves -Group, applies the source of the run (-Identity, -CsvPath, -SearchBase, -Group), -Scope and -MaxObjects
@@ -1316,6 +1339,7 @@ function Read-PcmSnapshotData {
                 else { "No complete snapshot in $($config.Store.Path): run Collect -Mode Apply (it reads Exchange.Server) or copy the snapshot database here." })
         }
         if ($snap.status -ne 'Complete') { throw "Snapshot $($snap.id) is $($snap.status), not Complete." }
+        Assert-PcmSameEnvironment -What ('Snapshot {0}' -f $snap.id) -Recorded (Get-PcmValue $snap 'environment' '')
         $records = @(Read-PcmTable $connection mailbox $snap.id)
         $permissions = @(Read-PcmTable $connection permission $snap.id)
         $members = @(Read-PcmTable $connection group_member $snap.id)
@@ -1498,9 +1522,11 @@ function Invoke-PcmCheckBatch {
     $context.Journal = Open-PcmStore -Path $config.Store.JournalPath -Root $context.Root -Kind Journal -ReadOnly
     $given = Get-PcmBatch $context.Journal -Id $Batch
     if (-not $given) { throw "Batch $Batch not found in $($config.Store.JournalPath)." }
+    Assert-PcmBatchOwner -Row $given
     $isRecover = Test-PcmSameText $given.action 'Recover'
     $convert = if ($isRecover) { Get-PcmBatch $context.Journal -Id ([string]$given.convert_batch) } else { $given }
     if (-not $convert) { throw ('The Convert batch {0} of Recover batch {1} is not in the journal.' -f $given.convert_batch, $given.id) }
+    if ($isRecover) { Assert-PcmBatchOwner -Row $convert }
     $expect = if ($Expect) { $Expect } elseif ($isRecover) { 'Deprovisioned' } else { 'Provisioned' }
     if ($isRecover -and $expect -eq 'Provisioned') { throw ('Batch {0} is a Recover batch: its objects are rolled back, not converted. Use -Expect Deprovisioned or -Expect Retained.' -f $given.id) }
     $context.BatchId = [string]$given.id
@@ -2435,6 +2461,7 @@ function Invoke-PcmConvert {
         $context.CurrentOperation = 'Read-Batch'
         $resume = Get-PcmBatch $context.Journal -Id $Batch
         if (-not $resume -or $resume.action -ne 'Convert') { throw "Convert batch $Batch not found in $($config.Store.JournalPath)." }
+        Assert-PcmBatchOwner -Row $resume
         $rollbacks = @(Invoke-PcmSql $context.Journal "SELECT id, status FROM batch WHERE action = 'Recover' AND convert_batch = @c COLLATE NOCASE ORDER BY created_utc" @{ c = [string]$resume.id } -As Rows)
         if ($rollbacks.Count) {
             $context.NoChangeMade = $true; $context.NextOnFailure = $true; $context.CurrentIdentity = ''
@@ -2552,7 +2579,7 @@ function Invoke-PcmConvert {
     if (-not $plan.Count) { throw 'No object can be converted (see the reasons above).' }
     Confirm-PcmApply ('Convert {0} object(s) to Exchange Online ({1} user(s), {2} shared, {3} native resources)?' -f $plan.Count, $planUsers.Count, $planShared.Count, $planResources.Count)
     if (-not $resume) {
-        $context.BatchId = New-PcmBatch $context.Journal Convert @{ SnapshotId = [long]$data.Snapshot.id; SnapshotRunId = [string]$data.Snapshot.run_id; SnapshotHash = [string]$context.SnapshotHash; Environment = $config.Environment; Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $context.BatchId = New-PcmBatch $context.Journal Convert @{ SnapshotId = [long]$data.Snapshot.id; SnapshotRunId = [string]$data.Snapshot.run_id; SnapshotHash = [string]$context.SnapshotHash; Environment = $config.Environment; TenantId = [string]$config.Cloud.TenantId; Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
             ToolVersion = $toolVersion; ScopeJson = (@{ Identity = $Identity; CsvPath = $CsvPath; SearchBase = $SearchBase; Group = $Group; MaxObjects = $MaxObjects; Identities = @(Get-PcmIdentityList).Count; Scope = $Scope; UsersMode = $config.Licensing.Users.Mode } | ConvertTo-Json -Compress) }
         foreach ($entry in $plan) {
             if ($entry -in $planResources) {
@@ -3236,10 +3263,12 @@ function Invoke-PcmRecover {
     $convert = Get-PcmBatch $context.Journal -Id $Batch
     if ($convert -and $convert.action -eq 'Recover' -and $convert.convert_batch) {
         $given = $convert
+        Assert-PcmBatchOwner -Row $given
         $convert = Get-PcmBatch $context.Journal -Id ([string]$given.convert_batch)
         if ($convert) { Write-PcmItem -Context $context -Status Info -Icon Batch -Text ('Batch {0} is a rollback of Convert batch {1}: the rollback goes on with Convert batch {1}.' -f $given.id, $convert.id) }
     }
     if (-not $convert -or $convert.action -ne 'Convert') { throw "Convert batch $Batch not found in $($config.Store.JournalPath)." }
+    Assert-PcmBatchOwner -Row $convert
     $existing = @(Invoke-PcmSql $context.Journal "SELECT * FROM batch WHERE action = 'Recover' AND convert_batch = @c COLLATE NOCASE ORDER BY created_utc DESC" @{ c = $convert.id } -As Rows)
     $resume = $existing | Where-Object { $_.status -in @('Running','Partial') } | Select-Object -First 1
     $context.ConvertBatchId = [string]$convert.id
@@ -3403,7 +3432,7 @@ function Invoke-PcmRecover {
     Confirm-PcmApply (('Roll back {0} object(s) of Convert batch {1}?' -f $plan.Count, $convert.id) + $lossWarning)
     if ($resume) { $context.BatchId = [string]$resume.id }
     else {
-        $context.BatchId = New-PcmBatch $context.Journal Recover @{ ConvertBatch = $convert.id; SnapshotId = [long]$convert.snapshot_id; SnapshotRunId = [string]$context.SnapshotRunId; SnapshotHash = [string]$context.SnapshotHash; Environment = $config.Environment
+        $context.BatchId = New-PcmBatch $context.Journal Recover @{ ConvertBatch = $convert.id; SnapshotId = [long]$convert.snapshot_id; SnapshotRunId = [string]$context.SnapshotRunId; SnapshotHash = [string]$context.SnapshotHash; Environment = $config.Environment; TenantId = [string]$config.Cloud.TenantId
             Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name; ToolVersion = $toolVersion; ScopeJson = (@{ Identity = $Identity; CsvPath = $CsvPath; SearchBase = $SearchBase; Group = $Group; MaxObjects = $MaxObjects; Identities = @(Get-PcmIdentityList).Count; Scope = $Scope } | ConvertTo-Json -Compress) }
     }
     foreach ($entry in $plan) {

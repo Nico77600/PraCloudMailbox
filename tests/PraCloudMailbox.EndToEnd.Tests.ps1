@@ -3841,4 +3841,78 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         } finally { Close-PcmStore $journal }
     }
     #endregion
+
+    #region Environment and tenant of a snapshot and of a batch
+    It 'refuses a snapshot of another Environment in Check, Convert and Recover, whatever the letter case of the name' -Tag 'Ownership' {
+        Start-E2E -Action Convert
+        Invoke-PcmConvert
+        $convertBatch = $context.BatchId
+        Close-E2E
+        $cn = Open-PcmStore -Path $global:PraE2E.Db -Root $global:PraE2E.Root
+        try { $null = Invoke-PcmSql $cn "UPDATE snapshot SET environment = 'OTHER'" } finally { Close-PcmStore $cn }
+        foreach ($case in @(@{ Action = 'Check'; Call = { Invoke-PcmCheck } }, @{ Action = 'Convert'; Call = { Invoke-PcmConvert } }, @{ Action = 'Recover'; Call = { Invoke-PcmRecover } })) {
+            Start-E2E -Action $case.Action -Mode Preview -Batch $(if ($case.Action -eq 'Recover') { $convertBatch } else { '' })
+            { & $case.Call } | Should -Throw "*Snapshot * was made for Environment 'OTHER' and the configuration says 'TEST'. Nothing was changed.*Collect again*"
+            $context.NoChangeMade | Should -BeTrue
+        }
+        $cn = Open-PcmStore -Path $global:PraE2E.Db -Root $global:PraE2E.Root
+        try { $null = Invoke-PcmSql $cn "UPDATE snapshot SET environment = 'test'" } finally { Close-PcmStore $cn }
+        Start-E2E -Action Check -Mode Preview
+        { Invoke-PcmCheck } | Should -Not -Throw
+    }
+
+    It 'refuses a batch of another Environment or of another tenant in Check, Convert and Recover, and keeps the tenant of the configuration in a new batch' -Tag 'Ownership' {
+        Start-E2E -Action Convert
+        Invoke-PcmConvert
+        $batch = $context.BatchId
+        Close-E2E
+        (Get-E2EJournal $batch).Batch.tenant_id | Should -BeExactly '33333333-3333-3333-3333-333333333333'
+        $set = { param($sql) $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal; try { $null = Invoke-PcmSql $journal $sql } finally { Close-PcmStore $journal } }
+        $calls = @(@{ Action = 'Check'; Call = { Invoke-PcmCheckBatch } }, @{ Action = 'Convert'; Call = { Invoke-PcmConvert } }, @{ Action = 'Recover'; Call = { Invoke-PcmRecover } })
+        & $set "UPDATE batch SET environment = 'OTHER'"
+        foreach ($case in $calls) {
+            Start-E2E -Action $case.Action -Mode Preview -Batch $batch
+            { & $case.Call } | Should -Throw "*Batch $batch was made for Environment 'OTHER' and the configuration says 'TEST'. Nothing was changed.*"
+        }
+        & $set "UPDATE batch SET environment = 'test', tenant_id = '44444444-4444-4444-4444-444444444444'"
+        foreach ($case in $calls) {
+            Start-E2E -Action $case.Action -Mode Preview -Batch $batch
+            { & $case.Call } | Should -Throw "*Batch $batch was made in tenant 44444444-4444-4444-4444-444444444444 and Cloud.TenantId is 33333333-3333-3333-3333-333333333333. Nothing was changed.*"
+            $context.NoChangeMade | Should -BeTrue
+        }
+    }
+
+    It 'accepts a batch whose tenant is written in capitals, and a batch of an earlier version that holds no tenant' -Tag 'Ownership' {
+        [IO.File]::WriteAllText($global:PraE2E.Config, [IO.File]::ReadAllText($global:PraE2E.Config).Replace('33333333-3333-3333-3333-333333333333', 'abcdef01-2345-6789-abcd-ef0123456789'), [Text.UTF8Encoding]::new($true))
+        Start-E2E -Action Convert
+        Invoke-PcmConvert
+        $batch = $context.BatchId
+        Close-E2E
+        $set = { param($sql) $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal; try { $null = Invoke-PcmSql $journal $sql } finally { Close-PcmStore $journal } }
+        & $set "UPDATE batch SET tenant_id = 'ABCDEF01-2345-6789-ABCD-EF0123456789', environment = 'Test'"
+        Start-E2E -Action Check -Mode Preview -Batch $batch
+        { Invoke-PcmCheckBatch } | Should -Not -Throw
+        & $set 'UPDATE batch SET tenant_id = NULL'
+        Start-E2E -Action Check -Mode Preview -Batch $batch
+        { Invoke-PcmCheckBatch } | Should -Not -Throw
+        Start-E2E -Action Recover -Mode Preview -Batch $batch
+        { Invoke-PcmRecover } | Should -Not -Throw
+        $log = [IO.File]::ReadAllText($context.LogFile)
+        $log | Should -Match 'was made before batches kept their tenant'
+    }
+
+    It 'adds the tenant column to a journal of an earlier version, and reads that journal without it' -Tag 'Ownership' {
+        Start-E2E -Action Convert
+        Invoke-PcmConvert
+        $batch = $context.BatchId
+        Close-E2E
+        $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal
+        try { $null = Invoke-PcmSql $journal 'ALTER TABLE batch DROP COLUMN tenant_id' } finally { Close-PcmStore $journal }
+        Start-E2E -Action Check -Mode Preview -Batch $batch
+        { Invoke-PcmCheckBatch } | Should -Not -Throw
+        Close-E2E
+        $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal
+        try { @(Invoke-PcmSql $journal 'PRAGMA table_info(batch)' -As Rows | ForEach-Object { $_.name }) | Should -Contain 'tenant_id' } finally { Close-PcmStore $journal }
+    }
+    #endregion
 }
