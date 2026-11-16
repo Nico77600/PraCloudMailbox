@@ -706,7 +706,7 @@ function Invoke-PcmGraph {
             $code = 0
             try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = 0 }
             if ($code -eq 404 -and $AllowNotFound) { return $null }
-            if (-not $NoRetry -and $code -in @(429, 502, 503, 504) -and $attempt -lt 5) { Start-Sleep -Seconds (5 * $attempt); continue }
+            if (-not $NoRetry -and $code -in @(429, 502, 503, 504) -and $attempt -lt 5) { Start-Sleep -Seconds ([Math]::Max((5 * $attempt), (Get-PcmErrorRetryAfterSecond -Exception $_.Exception))); continue }
             if (-not $NoRetry -and $code -eq 0 -and $attempt -lt 5 -and (Test-PcmNetworkFailure $_.Exception)) { Start-Sleep -Seconds (10 * $attempt); continue }
             # The Graph message (error.code: error.message) says what is wrong; the exception alone only says "BadRequest".
             $detail = ''
@@ -1299,8 +1299,25 @@ function Get-PcmExoStateSet {
     return $result
 }
 
+function ConvertTo-PcmRetryAfterSecond {
+    <# The seconds that a Retry-After value asks for: a number of seconds, or an HTTP date (the time left until it). 0 when it is empty, unreadable or past; never more than two minutes. #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return 0 }
+    $value = $Text.Trim()
+    $seconds = 0
+    if ([int]::TryParse($value, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$seconds)) { return [Math]::Min([Math]::Max($seconds, 0), 120) }
+    $date = [datetimeoffset]::MinValue
+    if ([datetimeoffset]::TryParse($value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$date)) {
+        $left = [Math]::Ceiling(($date - [datetimeoffset]::UtcNow).TotalSeconds)
+        return [int][Math]::Min([Math]::Max($left, 0), 120)
+    }
+    return 0
+}
+
 function Get-PcmRetryAfterSecond {
-    <# The Retry-After (seconds) that Microsoft Graph gave in the answer of one request of a batch: 0 when there is none, never more than two minutes. #>
+    <# The Retry-After (seconds or HTTP date) that Microsoft Graph gave in an answer: the headers of one request of a batch, or the headers of the response of a failed direct request. 0 when there is none, never more than two minutes. #>
     [CmdletBinding()]
     [OutputType([int])]
     param([AllowNull()][object]$Response)
@@ -1309,9 +1326,23 @@ function Get-PcmRetryAfterSecond {
     $names = if ($headers -is [System.Collections.IDictionary]) { @($headers.Keys) } else { @($headers.PSObject.Properties.Name) }
     foreach ($name in $names) {
         if (-not [string]::Equals([string]$name, 'Retry-After', [StringComparison]::OrdinalIgnoreCase)) { continue }
-        $seconds = 0
-        if ([int]::TryParse([string](Get-PcmValue $headers ([string]$name) ''), [ref]$seconds) -and $seconds -gt 0) { return [Math]::Min($seconds, 120) }
+        $seconds = ConvertTo-PcmRetryAfterSecond -Text ([string](Get-PcmValue $headers ([string]$name) ''))
+        if ($seconds -gt 0) { return $seconds }
     }
+    return 0
+}
+
+function Get-PcmErrorRetryAfterSecond {
+    <# The Retry-After of the answer that a failed direct request got (the response of the exception): 0 when the exception holds no response or the response no such header. #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([AllowNull()][Exception]$Exception)
+    try {
+        $headers = $Exception.Response.Headers
+        if ($null -eq $headers) { return 0 }
+        $values = $null
+        if ($headers.TryGetValues('Retry-After', [ref]$values)) { return (ConvertTo-PcmRetryAfterSecond -Text ([string]($values | Select-Object -First 1))) }
+    } catch { $null = $_ }
     return 0
 }
 

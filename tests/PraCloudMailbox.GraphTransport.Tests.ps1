@@ -216,6 +216,78 @@ Describe 'Entra Connect check (authenticated, read-only)' {
     }
 }
 
+Describe 'Retry-After of a direct Graph request' {
+    BeforeAll {
+        Import-Module (Join-Path $script:Package 'module\PRA.Cloud.psm1') -Force
+        function global:Invoke-MgGraphRequest { [CmdletBinding()] param([string]$Method = 'GET', [string]$Uri, [object]$Body, [string]$ContentType, [string]$OutputType, [System.Collections.IDictionary]$Headers) }
+        function global:New-PcmThrottleFailure {
+            param([int]$Code, [string]$RetryAfter = '')
+            $response = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]$Code)
+            if ($RetryAfter) { $null = $response.Headers.TryAddWithoutValidation('retry-after', $RetryAfter) }
+            $exception = [Microsoft.PowerShell.Commands.HttpResponseException]::new("Response status code does not indicate success: $Code.", $response)
+            [System.Management.Automation.ErrorRecord]::new($exception, 'FakeGraph', 'InvalidOperation', $null)
+        }
+    }
+    BeforeEach {
+        $global:PcmSlept = [System.Collections.Generic.List[int]]::new()
+        $global:PcmGraphFailures = [System.Collections.Generic.Queue[object]]::new()
+        Mock Assert-PcmGraphTransport -ModuleName PRA.Cloud { }
+        Mock Enter-PcmCall -ModuleName PRA.Cloud { }
+        Mock Exit-PcmCall -ModuleName PRA.Cloud { }
+        Mock Start-Sleep -ModuleName PRA.Cloud { $global:PcmSlept.Add([int]$Seconds) }
+        Mock Invoke-MgGraphRequest -ModuleName PRA.Cloud { if ($global:PcmGraphFailures.Count) { throw $global:PcmGraphFailures.Dequeue() }; [pscustomobject]@{ ok = $true } }
+    }
+    AfterAll {
+        foreach ($name in 'Invoke-MgGraphRequest', 'New-PcmThrottleFailure') { Remove-Item -Path "Function:\$name" -ErrorAction SilentlyContinue }
+        Remove-Variable -Name PcmSlept, PcmGraphFailures -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'waits for the Retry-After of the answer, whatever the status (<Code>), at least the usual pause' -TestCases @(
+        @{ Code = 429 }, @{ Code = 502 }, @{ Code = 503 }, @{ Code = 504 }) {
+        param($Code)
+        $global:PcmGraphFailures.Enqueue((New-PcmThrottleFailure -Code $Code -RetryAfter '17'))
+        (Invoke-PcmGraph -Uri 'v1.0/users/x').ok | Should -BeTrue
+        @($global:PcmSlept) | Should -Be @(17)
+    }
+
+    It 'reads a Retry-After that is an HTTP date, as the time left until it' {
+        $global:PcmGraphFailures.Enqueue((New-PcmThrottleFailure -Code 429 -RetryAfter ([datetimeoffset]::UtcNow.AddSeconds(46).ToString('r', [Globalization.CultureInfo]::InvariantCulture))))
+        $null = Invoke-PcmGraph -Uri 'v1.0/users/x'
+        $global:PcmSlept.Count | Should -Be 1
+        $global:PcmSlept[0] | Should -BeGreaterThan 30
+        $global:PcmSlept[0] | Should -BeLessOrEqual 47
+    }
+
+    It 'keeps the usual backoff when there is no Retry-After, a smaller one, a date in the past or a text that is not one' -TestCases @(
+        @{ Header = ''; Expected = 5 }, @{ Header = '2'; Expected = 5 }, @{ Header = 'soon'; Expected = 5 }, @{ Header = '0'; Expected = 5 }
+        @{ Header = ([datetimeoffset]::UtcNow.AddMinutes(-5).ToString('r', [Globalization.CultureInfo]::InvariantCulture)); Expected = 5 }) {
+        param($Header, $Expected)
+        $global:PcmGraphFailures.Enqueue((New-PcmThrottleFailure -Code 503 -RetryAfter $Header))
+        $null = Invoke-PcmGraph -Uri 'v1.0/users/x'
+        @($global:PcmSlept) | Should -Be @($Expected)
+    }
+
+    It 'grows the usual backoff with the attempt, and takes the larger of the two each time' {
+        $global:PcmGraphFailures.Enqueue((New-PcmThrottleFailure -Code 429))
+        $global:PcmGraphFailures.Enqueue((New-PcmThrottleFailure -Code 429 -RetryAfter '3'))
+        $global:PcmGraphFailures.Enqueue((New-PcmThrottleFailure -Code 429 -RetryAfter '40'))
+        $null = Invoke-PcmGraph -Uri 'v1.0/users/x'
+        @($global:PcmSlept) | Should -Be @(5, 10, 40)
+    }
+
+    It 'never waits more than two minutes' {
+        $global:PcmGraphFailures.Enqueue((New-PcmThrottleFailure -Code 429 -RetryAfter '900'))
+        $null = Invoke-PcmGraph -Uri 'v1.0/users/x'
+        @($global:PcmSlept) | Should -Be @(120)
+    }
+
+    It 'does not send a request again that must not be resent' {
+        $global:PcmGraphFailures.Enqueue((New-PcmThrottleFailure -Code 429 -RetryAfter '9'))
+        { Invoke-PcmGraph -Uri 'v1.0/users/x' -NoRetry } | Should -Throw
+        $global:PcmSlept.Count | Should -Be 0
+    }
+}
+
 # Optional installed-SDK qualification: the normal offline gate does not install Graph or sign in.
 Describe 'Installed Graph SDK transport (in-memory HTTP, no authentication)' -Skip:($PSVersionTable.PSEdition -ne 'Core' -or -not (Get-Module -ListAvailable Microsoft.Graph.Authentication)) {
     BeforeAll {
