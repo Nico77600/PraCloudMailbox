@@ -897,17 +897,17 @@ function Get-PcmCollectSizeProblem {
         $connection = $null
         try {
             $connection = Open-PcmStore -Path $config.Store.Path -Root $context.Root -ReadOnly
-            $now = $ScopeJson | ConvertFrom-Json
+            $now = $ScopeJson | ConvertFrom-PcmJson
             $oneObject = [bool][string](Get-PcmValue $now 'Identity' '')
             foreach ($row in @(if (-not $oneObject) { Invoke-PcmSql $connection "SELECT id, scope_json, counts_json FROM snapshot WHERE status = 'Complete' ORDER BY id DESC LIMIT 50" -As Rows })) {
-                $then = $null; try { $then = [string]$row.scope_json | ConvertFrom-Json } catch { $then = $null }
+                $then = $null; try { $then = [string]$row.scope_json | ConvertFrom-PcmJson } catch { $then = $null }
                 if (-not $then -or [string](Get-PcmValue $then 'Identity' '')) { continue }
                 $same = $true
                 foreach ($name in @('Mode', 'SearchBase', 'GroupDN', 'CsvPath', 'Filter', 'IncludeUsers', 'IncludeShared', 'IncludeRoom', 'IncludeEquipment')) {
                     if (-not (Test-PcmSameText ([string](Get-PcmValue $then $name '')) ([string](Get-PcmValue $now $name '')))) { $same = $false; break }
                 }
                 if (-not $same) { continue }
-                $mailboxes = [int](Get-PcmValue ([string]$row.counts_json | ConvertFrom-Json) 'mailbox' 0)
+                $mailboxes = [int](Get-PcmValue ([string]$row.counts_json | ConvertFrom-PcmJson) 'mailbox' 0)
                 $previous = [pscustomobject]@{ Id = [long]$row.id; Count = $mailboxes }
                 break
             }
@@ -1036,7 +1036,7 @@ function Invoke-PcmCollect {
     foreach ($record in $records) {
         $row = New-PcmRow ([pscustomobject]$record)
         $row.Permissions = [string]$permissionText[[string]$record.object_guid]
-        $row.Detail = 'X500 {0} {1} {2} address(es)' -f $(if ($record.legacy_exchange_dn) { 'kept' } else { 'missing' }), $dot, @(($record.email_addresses_json | ConvertFrom-Json) | ForEach-Object { $_ }).Count
+        $row.Detail = 'X500 {0} {1} {2} address(es)' -f $(if ($record.legacy_exchange_dn) { 'kept' } else { 'missing' }), $dot, @(($record.email_addresses_json | ConvertFrom-PcmJson) | ForEach-Object { $_ }).Count
         [void]$context.Rows.Add($row)
     }
 
@@ -1343,7 +1343,7 @@ function Read-PcmSnapshotData {
     $age = (Get-Date).ToUniversalTime() - $taken.ToUniversalTime()
     $context.SnapshotLabel = '{0} {1} {2:yyyy-MM-dd HH:mm} UTC {1} {3}' -f $snap.id, $dot, $taken.ToUniversalTime(), $snap.exchange_server
     $context.Server = [string]$snap.exchange_server
-    $scopeInfo = $null; try { $scopeInfo = [string]$snap.scope_json | ConvertFrom-Json } catch { $scopeInfo = $null }
+    $scopeInfo = $null; try { $scopeInfo = [string]$snap.scope_json | ConvertFrom-PcmJson } catch { $scopeInfo = $null }
     $partial = $scopeInfo -and [string](Get-PcmValue $scopeInfo 'Identity' '')
     Write-PcmItem -Context $context -Status Ok -Text ('Snapshot {0} of {1:yyyy-MM-dd HH:mm} UTC from {2} ({3} mailbox(es), {4} permission(s))' -f $snap.id, $taken.ToUniversalTime(), $snap.exchange_server, $records.Count, $permissions.Count)
     if ($partial) { Write-PcmLog -Context $context -Message ('Snapshot {0} holds one object only ({1}): not a full Collect.' -f $snap.id, $scopeInfo.Identity) -Level Warning }
@@ -1480,7 +1480,7 @@ function Get-PcmJsonField {
     if (-not $Item) { return $null }
     $text = [string](Get-PcmValue $Item 'result_json' '')
     if (-not $text) { return $null }
-    try { $value = $text | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
+    try { $value = $text | ConvertFrom-PcmJson } catch { return $null }
     if ($null -eq $value -or -not $value.PSObject.Properties[$Name]) { return $null }
     return $value.$Name
 }
@@ -1717,7 +1717,7 @@ function Get-PcmOriginalLicence {
     <# Direct licences recorded by Convert in original_json (none when the batch did not record them). #>
     param([AllowNull()][object]$Item)
     if (-not $Item -or -not $Item.original_json) { return @() }
-    try { $original = [string]$Item.original_json | ConvertFrom-Json } catch { return @() }
+    try { $original = [string]$Item.original_json | ConvertFrom-PcmJson } catch { return @() }
     if (-not $original.PSObject.Properties['licences']) { return @() }
     return @($original.licences | ForEach-Object { $_ } | Where-Object { $_ })
 }
@@ -2458,7 +2458,7 @@ function Invoke-PcmConvert {
     $context.RoomListIntents = @{}
     if ($resume) {
         foreach ($change in @(Get-PcmTenantChange $context.Journal $resume.id | Where-Object kind -eq 'NativeRoomList')) {
-            $intent = [string]$change.original_json | ConvertFrom-Json -ErrorAction Stop
+            $intent = [string]$change.original_json | ConvertFrom-PcmJson
             if ([string]$intent.lifecycle -ne 'CloudRoomList' -or [string]$intent.sourceGuid -ne [string]$change.target_id) { throw 'Invalid room-list creation journal.' }
             $context.RoomListIntents[[string]$change.target_id] = $intent
         }
@@ -3224,7 +3224,7 @@ function Get-PcmBatchUsersMode {
     param([AllowNull()][object]$Row)
     $text = [string](Get-PcmValue $Row 'scope_json' '')
     if (-not $text) { return '' }
-    try { $scope = $text | ConvertFrom-Json -ErrorAction Stop } catch { return '' }
+    try { $scope = $text | ConvertFrom-PcmJson } catch { return '' }
     return [string](Get-PcmValue $scope 'UsersMode' '')
 }
 
@@ -3360,7 +3360,7 @@ function Invoke-PcmRecover {
         $row.ExchangeOnline = $exo.Type; $row.Holds = ($exo.Holds -join ', ')
         $lastStep = if ($previous.ContainsKey($guid)) { [string](Get-PcmValue $previous[$guid] 'step' '') } else { '' }
         if ($item.kind -ne 'User' -and $lastStep -in @('Deleting', 'Deleted', 'Inactive', 'Purged', 'TargetedSync') -and -not $exo.Type) {
-            $result = $null; try { $result = [string](Get-PcmValue $previous[$guid] 'result_json' '') | ConvertFrom-Json } catch { $result = $null }
+            $result = $null; try { $result = [string](Get-PcmValue $previous[$guid] 'result_json' '') | ConvertFrom-PcmJson } catch { $result = $null }
             $entry.Path = 'SharedDeleted'
             $entry.CloudGuid = [string](Get-PcmValue $result 'inactiveGuid' '')
             if (-not $entry.CloudGuid) { $entry.CloudGuid = [string](Get-PcmValue $result 'cloudGuid' '') }
@@ -3489,7 +3489,7 @@ WHERE cb.action = 'Convert' AND ci.kind = 'User' AND ci.step IS NOT NULL
             (Get-PcmCommandLine -ActionName 'Recover' -ModeName 'Apply' -BatchId ([string]$convert.id) -KeepFilters)
         })
     $createdLists = @(Get-PcmTenantChange $context.Journal $convert.id | Where-Object kind -eq 'NativeRoomList' |
-        ForEach-Object { [string]$_.original_json | ConvertFrom-Json -ErrorAction Stop } | Where-Object { $_.operation -eq 'Create' -and $_.creationAttempted })
+        ForEach-Object { [string]$_.original_json | ConvertFrom-PcmJson } | Where-Object { $_.operation -eq 'Create' -and $_.creationAttempted })
     if ($createdLists.Count) {
         Write-PcmItem -Context $context -Status Info -Text "$($createdLists.Count) journaled cloud room list(s) retained: Recover never deletes groups or inserts routing contacts into RoomLists; review room discovery separately."
     }

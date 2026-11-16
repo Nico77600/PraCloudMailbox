@@ -62,6 +62,21 @@ $script:RowFields = @('Identity','Kind','PrimarySmtpAddress','ObjectGuid','Excha
 # Final statuses a row can have. 'AlreadyDone' is counted as a success.
 $script:FinalStatuses = @('Planned','AlreadyDone','Success','Error','Pending','Skipped')
 
+function ConvertFrom-PcmJson {
+    <#
+    .SYNOPSIS
+        The only way the tool reads JSON (the snapshot and journal columns, the events, the answers of the reports).
+    .DESCRIPTION
+        ConvertFrom-Json of PowerShell 7 turns a text that looks like an ISO 8601 date and time into a [DateTime]; written back, it is another text.
+        -DateKind String keeps every date as the text that was written. A test refuses any other ConvertFrom-Json call in the package.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory, ValueFromPipeline)][AllowEmptyString()][string]$InputObject)
+    begin { $parts = New-Object 'Collections.Generic.List[string]' }
+    process { $parts.Add($InputObject) }
+    end { ($parts -join "`n") | ConvertFrom-Json -DateKind String -ErrorAction Stop }
+}
+
 #region 1. Console theme ----------------------------------------------------------------------
 # The classic console (conhost) is the reference: colours are console
 # colours (no ANSI sequences, so the transcript and the log stay clean text) and the default icons
@@ -1623,7 +1638,7 @@ function Read-PcmReportChunk {
     param([Parameter(Mandatory)][string]$Html)
     $meta = [regex]::Match($Html, '<script type="application/json" id="pra-meta">(.*?)</script>', [Text.RegularExpressions.RegexOptions]::Singleline)
     if (-not $meta.Success) { throw 'The report holds no data header.' }
-    $header = $meta.Groups[1].Value | ConvertFrom-Json
+    $header = $meta.Groups[1].Value | ConvertFrom-PcmJson
     $result = @{}
     foreach ($kind in @($header.chunks.PSObject.Properties.Name)) { $result[$kind] = [System.Collections.Generic.List[object]]::new() }
     $dictionaries = @{}
@@ -1631,7 +1646,7 @@ function Read-PcmReportChunk {
         $kind = $chunk.Groups[1].Value
         $bytes = [Convert]::FromBase64String($chunk.Groups[3].Value)
         $reader = New-Object IO.StreamReader((New-Object IO.Compression.GZipStream((New-Object IO.MemoryStream(, $bytes)), [IO.Compression.CompressionMode]::Decompress)), [Text.Encoding]::UTF8)
-        try { $data = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+        try { $data = $reader.ReadToEnd() | ConvertFrom-PcmJson } finally { $reader.Dispose() }
         $fields = @($header.$kind.fields)
         if (-not $dictionaries.ContainsKey($kind)) { $dictionaries[$kind] = @(for ($f = 0; $f -lt $fields.Count; $f++) { , (New-Object 'Collections.Generic.List[object]') }) }
         for ($f = 0; $f -lt $fields.Count; $f++) { foreach ($value in @($data.d[$f])) { $dictionaries[$kind][$f].Add($value) } }
@@ -2238,7 +2253,7 @@ function Get-PcmConfigurationDifference {
 }
 #endregion
 
-Export-ModuleMember -Function Get-PcmValue, Format-PcmDuration, Add-PcmIssue, Write-PcmLog, Write-PcmItem, Write-PcmProgress, Get-PcmDurationEstimate, Get-PcmRecoverWaveSize,
+Export-ModuleMember -Function ConvertFrom-PcmJson, Get-PcmValue, Format-PcmDuration, Add-PcmIssue, Write-PcmLog, Write-PcmItem, Write-PcmProgress, Get-PcmDurationEstimate, Get-PcmRecoverWaveSize,
     Write-PcmBanner, Write-PcmStep, Write-PcmPlan, Write-PcmStepState, Write-PcmStepCount, Write-PcmSummary, Write-PcmHost, Resolve-PcmPath, Import-PcmConfiguration, Initialize-PcmAudit, Get-PcmOutcome, Complete-PcmRun,
     Write-PcmEvent, Test-PcmStopRequest, Request-PcmOperator, Get-PcmToolVersion, Test-PcmSameText, Get-PcmDistinctText, Resolve-PcmOfficialValue, Get-PcmCloudModuleReport,
     Get-PcmReportHtml, Write-PcmReportHtml, Read-PcmReportData, Read-PcmGlobalReportData, ConvertTo-PcmHtmlText, Get-PcmGlobalModel, Write-PcmGlobalReport, Write-PcmGlobalReportHtml, Write-PcmGlobalReportCsv, Write-PcmGlobalEventsCsv, Format-PcmUtcText,

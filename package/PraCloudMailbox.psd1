@@ -29,7 +29,7 @@
     # Functions called by Invoke-PraCloudMailbox.ps1, the window and the other modules. The other functions stay internal.
     FunctionsToExport     = @(
         # Console, log, configuration, reports and shared helpers (PRA.Common)
-        'Get-PcmValue', 'Format-PcmDuration', 'Add-PcmIssue', 'Write-PcmLog', 'Write-PcmItem', 'Write-PcmProgress', 'Get-PcmDurationEstimate', 'Get-PcmRecoverWaveSize',
+        'ConvertFrom-PcmJson', 'Get-PcmValue', 'Format-PcmDuration', 'Add-PcmIssue', 'Write-PcmLog', 'Write-PcmItem', 'Write-PcmProgress', 'Get-PcmDurationEstimate', 'Get-PcmRecoverWaveSize',
         'Write-PcmBanner', 'Write-PcmStep', 'Write-PcmPlan', 'Write-PcmStepState', 'Write-PcmStepCount', 'Write-PcmSummary', 'Write-PcmHost', 'Resolve-PcmPath',
         'Import-PcmConfiguration', 'Initialize-PcmAudit', 'Get-PcmOutcome', 'Complete-PcmRun', 'Write-PcmEvent', 'Test-PcmStopRequest', 'Request-PcmOperator',
         'Get-PcmToolVersion', 'Test-PcmSameText', 'Get-PcmDistinctText', 'Resolve-PcmOfficialValue', 'Get-PcmCloudModuleReport', 'Get-PcmReportHtml', 'Write-PcmReportHtml',

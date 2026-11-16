@@ -235,7 +235,7 @@ function Read-PcmGuiEvents {
     $events = [Collections.Generic.List[object]]::new()
     foreach ($line in $text.Split([char]10)) {
         if (-not $line.Trim()) { continue }
-        try { $events.Add(($line | ConvertFrom-Json)) } catch { $events.Add([pscustomobject]@{ kind = 'item'; status = 'Info'; text = $line.Trim(); identity = '' }) }
+        try { $events.Add(($line | ConvertFrom-PcmJson)) } catch { $events.Add([pscustomobject]@{ kind = 'item'; status = 'Info'; text = $line.Trim(); identity = '' }) }
     }
     return [pscustomobject]@{ Events = $events.ToArray(); Position = $Position + $last + 1; HasPartial = $partial }
 }
@@ -603,7 +603,7 @@ function Get-PcmGuiSnapshotFact {
         $connection = Open-PcmStore -Path $State.Config.Store.Path -Root $State.Root -ReadOnly
         try {
             $row = @(Invoke-PcmSql $connection 'SELECT email_addresses_json, recipient_type_details, organizational_unit FROM mailbox WHERE snapshot_id = @id AND object_guid = @g COLLATE NOCASE' @{ id = [long]$State.Snapshot.id; g = [string]$match.object_guid } -As Rows) | Select-Object -First 1
-            if ($row -and $row.email_addresses_json) { foreach ($address in @($row.email_addresses_json | ConvertFrom-Json)) { foreach ($one in @($address)) { $lines.Add(([string]$one -replace '^smtp:', 'SMTP ')) } } }
+            if ($row -and $row.email_addresses_json) { foreach ($address in @($row.email_addresses_json | ConvertFrom-PcmJson)) { foreach ($one in @($address)) { $lines.Add(([string]$one -replace '^smtp:', 'SMTP ')) } } }
             else { $lines.Add('SMTP ' + [string]$match.primary_smtp_address) }
             $lines.Add('Mailbox type: ' + $(if ($row -and $row.recipient_type_details) { [string]$row.recipient_type_details } else { ([string]$match.kind).ToLowerInvariant() }))
             if ($row -and $row.organizational_unit) { $lines.Add('OU: ' + [string]$row.organizational_unit) }

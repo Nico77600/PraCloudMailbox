@@ -649,7 +649,7 @@ function Invoke-PcmGraph {
             if (-not $NoRetry -and $code -eq 0 -and $attempt -lt 5 -and (Test-PcmNetworkFailure $_.Exception)) { Start-Sleep -Seconds (10 * $attempt); continue }
             # The Graph message (error.code: error.message) says what is wrong; the exception alone only says "BadRequest".
             $detail = ''
-            try { $graphError = ([string]$_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop).error; $detail = '{0}: {1}' -f $graphError.code, $graphError.message } catch { $detail = '' }
+            try { $graphError = ([string]$_.ErrorDetails.Message | ConvertFrom-PcmJson).error; $detail = '{0}: {1}' -f $graphError.code, $graphError.message } catch { $detail = '' }
             if ($detail) { throw [System.InvalidOperationException]::new(('{0} {1} failed ({2}): {3}' -f $Method, ($Uri -replace '\?.*$', ''), $code, $detail), $_.Exception) }
             throw
         }
@@ -1449,7 +1449,7 @@ function Test-PcmNativeResource {
 function Get-PcmResourceIntent {
     param([AllowNull()][object]$Item)
     if (-not $Item -or -not (Get-PcmValue $Item 'original_json' '')) { return $null }
-    $value = [string]$Item.original_json | ConvertFrom-Json -ErrorAction Stop
+    $value = [string]$Item.original_json | ConvertFrom-PcmJson
     if ([string](Get-PcmValue $value 'lifecycle' '') -eq 'CloudResource') {
         $token = [string](Get-PcmValue $value 'token' '')
         if ($token -notmatch '^[a-f0-9]{32}$' -or [string](Get-PcmValue $value 'creationName' '') -cnotmatch ("^PRA-R-[a-f0-9]{{8}}-[a-f0-9]{{8}}-{0}$" -f $token) -or
@@ -1595,7 +1595,7 @@ function Get-PcmResourceAddresses {
     if ($primary -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw 'Resource primary SMTP address is invalid.' }
     $values = @("SMTP:$primary")
     $json = [string](Get-PcmValue $Record 'email_addresses_json' '')
-    if ($json) { $values += @(($json | ConvertFrom-Json -ErrorAction Stop) | ForEach-Object { [string]$_ }) }
+    if ($json) { $values += @(($json | ConvertFrom-PcmJson) | ForEach-Object { [string]$_ }) }
     $legacy = [string](Get-PcmValue $Record 'legacy_exchange_dn' '')
     if ($legacy) { $values += "X500:$legacy" }
     # Keep the original primary, not an accidental primary flag on another collected proxy.
@@ -1968,7 +1968,7 @@ function Read-PcmResourceSettings {
     param([object]$Record)
     $json = [string](Get-PcmValue $Record 'resource_settings_json' '')
     if (-not $json) { throw 'Native resource settings are missing (v1 snapshot): Collect is required before CloudResource Convert.' }
-    $settings = $json | ConvertFrom-Json -ErrorAction Stop
+    $settings = $json | ConvertFrom-PcmJson
     if ([int](Get-PcmValue $settings 'SchemaVersion' 0) -ne 2 -or -not $settings.PSObject.Properties['Capacity'] -or
         -not $settings.PSObject.Properties['ResourceCustom'] -or -not $settings.PSObject.Properties['Calendar'] -or
         -not $settings.PSObject.Properties['CalendarConfiguration'] -or -not $settings.PSObject.Properties['Directory'] -or
@@ -2319,7 +2319,7 @@ function Set-PcmResourceConfiguration {
     $parameters[[string]$Intent.markerAttribute] = [string]$Intent.token
     $attributes = [string](Get-PcmValue $Record 'custom_attributes_json' '')
     if ($attributes) {
-        $custom = $attributes | ConvertFrom-Json -ErrorAction Stop
+        $custom = $attributes | ConvertFrom-PcmJson
         foreach ($property in $custom.PSObject.Properties) {
             if ($property.Name -match '^CustomAttribute([1-9]|1[0-5])$' -and $property.Name -ne [string]$Intent.markerAttribute) { $parameters[$property.Name] = [string]$property.Value }
         }
