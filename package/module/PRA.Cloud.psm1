@@ -3148,6 +3148,74 @@ function Invoke-PcmEntraConnect {
     }
 }
 
+# Read-only check of Entra Connect, run on EntraConnect.Server: it proves that the account of the run can use the ADSync module there. A bare WinRM test would not do, it does not authenticate.
+# It is self-contained: it also runs in the Windows PowerShell 5.1 endpoint.
+$script:PcmSyncProbe = {
+    $ErrorActionPreference = 'Stop'
+    $import = @{ Name = 'ADSync'; ErrorAction = 'Stop' }
+    if ([string]$PSVersionTable.PSEdition -eq 'Core') { $import.UseWindowsPowerShell = $true }
+    Import-Module @import
+    $scheduler = Get-ADSyncScheduler -ErrorAction Stop
+    [pscustomobject]@{ Computer = $env:COMPUTERNAME; CycleEnabled = [bool]$scheduler.SyncCycleEnabled }
+}
+
+function New-PcmSyncResult {
+    <# One answer of the Entra Connect check: Ok, Kind (Ok, Denied, Unreachable, NoModule or Failed), Server, Reason (plain words, with what to do) and Technical (the raw message). #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'In-memory constructor, no change to any target or file.')]
+    [CmdletBinding()]
+    param([bool]$Ok, [string]$Kind, [string]$Server = '', [string]$Reason = '', [string]$Technical = '')
+    [pscustomobject]@{ Ok = $Ok; Kind = $Kind; Server = $Server; Reason = $Reason; Technical = $Technical }
+}
+
+function Get-PcmSyncFailure {
+    <#
+    .SYNOPSIS
+        Plain words for a failed Entra Connect check: Kind (Denied, Unreachable, NoModule or Failed), Reason (what happened and what to do) and Technical (the raw message, for the log).
+        The account that is refused is the usual cause, so it is tested first.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Failure, [string]$Server = '')
+    $exception = if ($Failure -is [Management.Automation.ErrorRecord]) { $Failure.Exception } else { [Exception]$Failure }
+    $technical = ([string]$exception.Message -replace '\s+', ' ').Trim()
+    $firstLine = ([string]$exception.Message -split '\r?\n' | Where-Object { $_.Trim() } | Select-Object -First 1)
+    $firstLine = ([regex]::Replace([string]$firstLine, '^\s*(?:[\w.]+Exception:\s*)', '') -replace '\s+at\s+[\w.]+\(.*$', '').Trim().TrimEnd('.')
+    if ($firstLine.Length -gt 200) { $firstLine = $firstLine.Substring(0, 197) + '...' }
+    $errorId = if ($Failure -is [Management.Automation.ErrorRecord]) { [string]$Failure.FullyQualifiedErrorId } else { '' }
+    $where = if ($Server) { $Server } else { 'this server' }
+    if (([int](Get-PcmValue $exception 'ErrorCode' 0) -eq 5) -or $technical -match '(?i)access is denied|access denied|acc[eè]s refus|unauthorized|not authorized|logon failure|authentication|permission') {
+        $reason = if ($Server) { 'the account of the run has no right on {0}: it must be allowed to open a remote session there (member of Remote Management Users or Administrators) and to use Entra Connect (member of ADSyncAdmins)' -f $Server }
+            else { 'the account of the run has no right to use Entra Connect on this server: it must be a member of ADSyncAdmins (or Administrators)' }
+        return New-PcmSyncResult -Ok $false -Kind 'Denied' -Server $Server -Reason $reason -Technical $technical
+    }
+    if ($errorId -match 'ModuleNotFound' -or ($technical -match '(?i)ADSync' -and $technical -match '(?i)not loaded|no valid module|could not be found|not recognized|cannot find|not found|FileNotFound')) {
+        $reason = if ($Server) { '{0} answered but the ADSync module is not installed there: it is not the Entra Connect server (check EntraConnect.Server)' -f $Server } else { 'the ADSync module is not on this server' }
+        return New-PcmSyncResult -Ok $false -Kind 'NoModule' -Server $Server -Reason $reason -Technical $technical
+    }
+    if ($Server -and ($exception.GetType().Name.Contains('PSRemotingTransportException') -or $technical -match '(?i)cannot connect|could not connect|cannot be resolved|cannot find the computer|no such host|network path|network name|timed out|did not respond|unreachable|WinRM|WS-Management|connection (was )?(refused|closed)|actively refused|server is unavailable')) {
+        return New-PcmSyncResult -Ok $false -Kind 'Unreachable' -Server $Server -Reason ('{0} does not answer to PowerShell remoting (WinRM, port 5985): check the server name in EntraConnect.Server, the network and the firewall' -f $Server) -Technical $technical
+    }
+    New-PcmSyncResult -Ok $false -Kind 'Failed' -Server $Server -Reason ('Entra Connect could not be checked on {0}: {1}' -f $where, $firstLine) -Technical $technical
+}
+
+function Test-PcmSyncServer {
+    <#
+    .SYNOPSIS
+        Proves that Entra Connect can be used FOR THIS ACCOUNT: an authenticated, read-only call to the ADSync module of the server (PowerShell remoting, bounded time). Starts nothing, changes nothing.
+    .PARAMETER Credential
+        The account that the operations of the run use when it is not the current one (EntraConnect.Mode = Script with a saved credential).
+    .OUTPUTS
+        Ok, Kind (Ok, Denied, Unreachable, NoModule or Failed), Server, Reason (plain words) and Technical (the raw message).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Server, [ValidateRange(5, 600)][int]$TimeoutSeconds = 30, [pscredential]$Credential)
+    $option = New-PSSessionOption -OpenTimeout ($TimeoutSeconds * 1000) -OperationTimeout ($TimeoutSeconds * 1000)
+    $call = @{ ComputerName = $Server; ScriptBlock = $script:PcmSyncProbe; SessionOption = $option; ErrorAction = 'Stop' }
+    if ($Credential) { $call.Credential = $Credential }
+    try { $answer = Invoke-Command @call } catch { return (Get-PcmSyncFailure $_ $Server) }
+    if ($null -eq $answer) { return New-PcmSyncResult -Ok $false -Kind 'Failed' -Server $Server -Reason ('{0} answered nothing to the Entra Connect check' -f $Server) -Technical 'empty answer' }
+    New-PcmSyncResult -Ok $true -Kind 'Ok' -Server $Server -Reason ('{0} accepts this account and Entra Connect answers' -f $Server)
+}
+
 function Invoke-PcmEntraConnectObject {
     <#
     .SYNOPSIS
@@ -3260,7 +3328,7 @@ Export-ModuleMember -Function Get-PcmRunningPipeline, Get-PcmCallTimeout, Get-Pc
     Wait-PcmCondition, Get-PcmExoState, Set-PcmSourceOfAuthority, Get-PcmSourceOfAuthority, Set-PcmUsageLocation, Set-PcmGroupMember,
     Test-PcmGroupMember, Get-PcmDisabledPlanForExchangeOnly, Set-PcmLicence, Get-PcmUserLicence, Get-PcmDirectLicence, Enable-PcmLicencePlan,
     Restore-PcmLicence, Remove-PcmIdentity, Test-PcmDeletedIdentity,
-    Connect-PcmCompliance, Get-PcmHoldPolicySet, Test-PcmToolHold, Add-PcmHoldLocationSet, Remove-PcmHoldLocationSet, Get-PcmKioskAssignment, Get-PcmSharedGrant, Grant-PcmSharedPermission, Invoke-PcmEntraConnect, Invoke-PcmEntraConnectObject
+    Connect-PcmCompliance, Get-PcmHoldPolicySet, Test-PcmToolHold, Add-PcmHoldLocationSet, Remove-PcmHoldLocationSet, Get-PcmKioskAssignment, Get-PcmSharedGrant, Grant-PcmSharedPermission, Test-PcmSyncServer, Invoke-PcmEntraConnect, Invoke-PcmEntraConnectObject
 
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor

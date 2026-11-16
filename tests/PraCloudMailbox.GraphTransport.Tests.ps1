@@ -177,6 +177,45 @@ Describe 'Graph transport lifecycle (offline context model)' {
     }
 }
 
+Describe 'Entra Connect check (authenticated, read-only)' {
+    BeforeAll { Import-Module (Join-Path $script:Package 'module\PRA.Cloud.psm1') -Force }
+
+    It 'answers Ok when the server answers, and sends no credential unless one is given' {
+        Mock Invoke-Command -ModuleName PRA.Cloud { [pscustomobject]@{ Computer = 'AADC'; CycleEnabled = $true } }
+        $answer = Test-PcmSyncServer -Server 'aadc'
+        $answer.Ok | Should -BeTrue
+        $answer.Kind | Should -BeExactly 'Ok'
+        Should -Invoke Invoke-Command -ModuleName PRA.Cloud -Times 1 -Exactly -ParameterFilter { $ComputerName -eq 'aadc' -and -not $Credential -and $null -ne $SessionOption }
+        $account = [pscredential]::new('CONTOSO\svc', (ConvertTo-SecureString 'not a secret' -AsPlainText -Force))
+        $null = Test-PcmSyncServer -Server 'aadc' -Credential $account
+        Should -Invoke Invoke-Command -ModuleName PRA.Cloud -Times 1 -Exactly -ParameterFilter { $Credential.UserName -eq 'CONTOSO\svc' }
+    }
+
+    It 'says in plain words what is wrong (<Kind>)' -TestCases @(
+        @{ Kind = 'Denied'; Message = 'Access is denied.'; Text = '*no right on aadc*ADSyncAdmins*' }
+        @{ Kind = 'Denied'; Message = 'Accès refusé.'; Text = '*no right on aadc*' }
+        @{ Kind = 'NoModule'; Message = 'The specified module ADSync was not loaded because no valid module file was found'; Text = '*not installed there*EntraConnect.Server*' }
+        @{ Kind = 'Unreachable'; Message = 'Connecting to remote server aadc failed with the following error message: WinRM cannot process the request'; Text = '*does not answer to PowerShell remoting*port 5985*' }
+        @{ Kind = 'Failed'; Message = 'Something else happened.'; Text = '*could not be checked on aadc: Something else happened*' }) {
+        param($Kind, $Message, $Text)
+        $global:PcmProbeMessage = $Message
+        Mock Invoke-Command -ModuleName PRA.Cloud { throw $global:PcmProbeMessage }
+        $answer = Test-PcmSyncServer -Server 'aadc'
+        $answer.Ok | Should -BeFalse
+        $answer.Kind | Should -BeExactly $Kind
+        $answer.Reason | Should -BeLike $Text
+        $answer.Technical | Should -Match ([regex]::Escape($Message.TrimEnd('.')))
+        Remove-Variable -Name PcmProbeMessage -Scope Global
+    }
+
+    It 'treats an empty answer as a failure' {
+        Mock Invoke-Command -ModuleName PRA.Cloud { $null }
+        $answer = Test-PcmSyncServer -Server 'aadc'
+        $answer.Ok | Should -BeFalse
+        $answer.Kind | Should -BeExactly 'Failed'
+    }
+}
+
 # Optional installed-SDK qualification: the normal offline gate does not install Graph or sign in.
 Describe 'Installed Graph SDK transport (in-memory HTTP, no authentication)' -Skip:($PSVersionTable.PSEdition -ne 'Core' -or -not (Get-Module -ListAvailable Microsoft.Graph.Authentication)) {
     BeforeAll {

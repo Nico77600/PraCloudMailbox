@@ -2745,6 +2745,7 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         Close-E2E
         $global:PraFake.Faults.NoRecreate = $true
         $global:PraFake.Faults.ObjectSyncNoEndpoint = $true
+        Mock Test-PcmSyncServer { [pscustomobject]@{ Ok = $true; Kind = 'Ok'; Server = 'aadc'; Reason = 'aadc accepts this account and Entra Connect answers'; Technical = '' } }
         foreach ($connectMode in @('REMOTING', 'script')) {
             Start-E2E -Action Recover -Batch $convert
             $context.Config.EntraConnect.Mode = $connectMode
@@ -2780,6 +2781,7 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         $global:PraFake.Faults.ObjectSyncFails = $true
         Start-E2E -Action Recover -Batch $convert
         $context.Config.EntraConnect.Mode = 'Remoting'
+        Mock Test-PcmSyncServer { [pscustomobject]@{ Ok = $true; Kind = 'Ok'; Server = 'aadc'; Reason = 'aadc accepts this account and Entra Connect answers'; Technical = '' } }
         Invoke-PcmRecover
         @($context.NextSteps)[0] | Should -Match 'even after it synchronised each object on its own'
         @($context.NextSteps)[0] | Should -Not -Match 'works only in a session'
@@ -3913,6 +3915,74 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         Close-E2E
         $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal
         try { @(Invoke-PcmSql $journal 'PRAGMA table_info(batch)' -As Rows | ForEach-Object { $_.name }) | Should -Contain 'tenant_id' } finally { Close-PcmStore $journal }
+    }
+    #endregion
+
+    #region Entra Connect check before the first change of a Recover
+    It 'stops a Recover Apply before any change when Entra Connect cannot be used from the tool, and only warns in a Preview' -Tag 'EntraProbe' {
+        Start-E2E -Action Convert
+        Invoke-PcmConvert
+        $convertBatch = $context.BatchId
+        Close-E2E
+        [IO.File]::WriteAllText($global:PraE2E.Config, [IO.File]::ReadAllText($global:PraE2E.Config).Replace("EntraConnect = @{ Mode = 'Manual'; Server = 'aadc' }", "EntraConnect = @{ Mode = 'Remoting'; Server = 'aadc' }"), [Text.UTF8Encoding]::new($true))
+        Mock Test-PcmSyncServer { [pscustomobject]@{ Ok = $false; Kind = 'Denied'; Server = 'aadc'; Reason = 'the account of the run has no right on aadc'; Technical = 'Access is denied' } }
+        $before = $global:PraFake.Calls.Count
+        Start-E2E -Action Recover -Mode Apply -Batch $convertBatch
+        { Invoke-PcmRecover } | Should -Throw '*Entra Connect cannot be used from this tool: the account of the run has no right on aadc. Fix that, or set EntraConnect.Mode = Manual*Nothing was changed.'
+        $context.NoChangeMade | Should -BeTrue
+        $global:PraFake.Calls.Count | Should -Be $before
+        Close-E2E
+        $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal -ReadOnly
+        try { @(Invoke-PcmSql $journal "SELECT id FROM batch WHERE action = 'Recover'" -As Rows).Count | Should -Be 0 } finally { Close-PcmStore $journal }
+        Should -Invoke Test-PcmSyncServer -Times 1 -Exactly -ParameterFilter { $Server -eq 'aadc' -and -not $Credential }
+        Start-E2E -Action Recover -Mode Preview -Batch $convertBatch
+        { Invoke-PcmRecover } | Should -Not -Throw
+        $context.Warnings | Should -BeGreaterThan 0
+        [IO.File]::ReadAllText($context.LogFile) | Should -Match 'Entra Connect cannot be used from this tool'
+        $global:PraFake.Calls.Count | Should -Be $before
+    }
+
+    It 'goes on with a Recover Apply when Entra Connect answers, and does not ask in Manual mode' -Tag 'EntraProbe' {
+        Start-E2E -Action Convert
+        Invoke-PcmConvert
+        $convertBatch = $context.BatchId
+        Close-E2E
+        Mock Test-PcmSyncServer { [pscustomobject]@{ Ok = $true; Kind = 'Ok'; Server = 'aadc'; Reason = 'aadc accepts this account and Entra Connect answers'; Technical = '' } }
+        Start-E2E -Action Recover -Mode Preview -Batch $convertBatch
+        Invoke-PcmRecover
+        Should -Invoke Test-PcmSyncServer -Times 0 -Exactly
+        Close-E2E
+        [IO.File]::WriteAllText($global:PraE2E.Config, [IO.File]::ReadAllText($global:PraE2E.Config).Replace("EntraConnect = @{ Mode = 'Manual'; Server = 'aadc' }", "EntraConnect = @{ Mode = 'remoting'; Server = 'aadc' }"), [Text.UTF8Encoding]::new($true))
+        Mock Confirm-PcmApply {}
+        Start-E2E -Action Recover -Mode Apply -Batch $convertBatch
+        Invoke-PcmRecover
+        Should -Invoke Test-PcmSyncServer -Times 1 -Exactly -ParameterFilter { $Server -eq 'aadc' }
+        Should -Invoke Confirm-PcmApply -Times 1 -Exactly
+        (Get-E2ERow 'alice@contoso.com').FinalStatus | Should -Be Success
+    }
+
+    It 'checks Entra Connect in Script mode with the saved credential, and not when the script has no server' -Tag 'EntraProbe' {
+        Start-E2E -Action Convert
+        Invoke-PcmConvert
+        $convertBatch = $context.BatchId
+        Close-E2E
+        $credentialFile = Join-Path $global:PraE2E.Dir 'entra.cred.xml'
+        [pscredential]::new('CONTOSO\svc', (ConvertTo-SecureString 'not a secret' -AsPlainText -Force)) | Export-Clixml -LiteralPath $credentialFile
+        $scriptFile = Join-Path $global:PraE2E.Dir 'entra.ps1'
+        [IO.File]::WriteAllText($scriptFile, "param(`$Operation)`n")
+        $text = [IO.File]::ReadAllText($global:PraE2E.Config).Replace("EntraConnect = @{ Mode = 'Manual'; Server = 'aadc' }", "EntraConnect = @{ Mode = 'Script'; Server = 'aadc'; ScriptPath = '$scriptFile'; CredentialPath = '$credentialFile' }")
+        [IO.File]::WriteAllText($global:PraE2E.Config, $text, [Text.UTF8Encoding]::new($true))
+        Mock Test-PcmSyncServer { [pscustomobject]@{ Ok = $true; Kind = 'Ok'; Server = 'aadc'; Reason = 'aadc accepts this account and Entra Connect answers'; Technical = '' } }
+        Mock Confirm-PcmApply {}
+        Start-E2E -Action Recover -Mode Preview -Batch $convertBatch
+        Invoke-PcmRecover
+        Should -Invoke Test-PcmSyncServer -Times 1 -Exactly -ParameterFilter { $Server -eq 'aadc' -and $Credential.UserName -eq 'CONTOSO\svc' }
+        Close-E2E
+        [IO.File]::WriteAllText($global:PraE2E.Config, [IO.File]::ReadAllText($global:PraE2E.Config).Replace("Server = 'aadc'; ScriptPath", "Server = ''; ScriptPath"), [Text.UTF8Encoding]::new($true))
+        Start-E2E -Action Recover -Mode Apply -Batch $convertBatch
+        Invoke-PcmRecover
+        Should -Invoke Test-PcmSyncServer -Times 1 -Exactly
+        [IO.File]::ReadAllText($context.LogFile) | Should -Match 'EntraConnect.Server is empty'
     }
     #endregion
 }

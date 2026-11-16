@@ -3255,6 +3255,43 @@ function Get-PcmBatchUsersMode {
     return [string](Get-PcmValue $scope 'UsersMode' '')
 }
 
+function Test-PcmEntraConnectAvailable {
+    <#
+    Before the first change of a Recover: proves, with the account that the Entra Connect operations use, that the server answers (an authenticated read-only call to its ADSync module). It is
+    asked only when the tool itself runs the cycles (EntraConnect.Mode = Remoting or Script). Apply: a server that does not answer stops the run before any change. Preview: the same answer, as a warning.
+    #>
+    $entra = $context.Config.EntraConnect
+    if (Test-PcmSameText $entra.Mode 'Manual') { return }
+    $context.CurrentOperation = 'Check-EntraConnect'
+    $server = [string](Get-PcmValue $entra 'Server' '')
+    if (-not $server) {
+        Write-PcmItem -Context $context -Status Info -Icon Sync -Text 'Entra Connect: EntraConnect.Server is empty and the script of EntraConnect.ScriptPath reaches the server its own way, so the tool cannot check it before the first change.'
+        return
+    }
+    $call = @{ Server = $server }
+    $unreadable = $null
+    if (Test-PcmSameText $entra.Mode 'Script') {
+        $file = [string](Get-PcmValue $entra 'CredentialPath' '')
+        if (-not $file -and [string](Get-PcmValue $entra 'ScriptPath' '')) {
+            $beside = Join-Path (Split-Path -Parent ([string]$entra.ScriptPath)) 'EntraConnect.cred.xml'
+            if ([IO.File]::Exists($beside)) { $file = $beside }
+        }
+        if ($file) {
+            try { $call.Credential = Import-Clixml -LiteralPath $file -ErrorAction Stop }
+            catch { $unreadable = [pscustomobject]@{ Ok = $false; Kind = 'Failed'; Reason = ('the credential file {0} cannot be read by this account (it can only be read by the Windows account and the computer that wrote it): write it again with Get-Credential | Export-Clixml' -f $file); Technical = $_.Exception.Message } }
+        }
+    }
+    $answer = if ($unreadable) { $unreadable } else { Test-PcmSyncServer @call }
+    if ($answer.Ok) {
+        Write-PcmItem -Context $context -Status Ok -Icon Sync -Text ('Entra Connect: {0}; the delta cycles run from this tool ({1})' -f $answer.Reason, $entra.Mode)
+        return
+    }
+    Write-PcmLog -Context $context -Message ('Entra Connect check, technical message: {0}' -f $answer.Technical) -Level Detail
+    $message = 'Entra Connect cannot be used from this tool: {0}. Fix that, or set EntraConnect.Mode = Manual in the configuration file and run the Entra Connect steps yourself when the tool asks.' -f $answer.Reason
+    if (Test-PcmSameText $context.Mode 'Apply') { $context.NoChangeMade = $true; $context.CurrentIdentity = ''; throw ('{0} Nothing was changed.' -f $message) }
+    Write-PcmLog -Context $context -Message $message -Level Warning
+}
+
 function Invoke-PcmRecover {
     $config = $context.Config
     if (-not $Batch) { throw '-Batch is required: the ID of the Convert batch to roll back (printed at the end of Convert).' }
@@ -3422,6 +3459,7 @@ function Invoke-PcmRecover {
     $recoverEstimate = Get-PcmDurationEstimate -UserWaves ([Math]::Ceiling(@($planUsers + $planBack).Count / [Math]::Max(1, [int](Get-PcmValue $context 'UserWaveSize' 500)))) -SharedRounds ([Math]::Ceiling($planShared.Count / (Get-PcmRecoverWaveSize $config)))
     if ($recoverEstimate.Text) { Write-PcmItem -Context $context -Status Info -Icon Clock -Text ('Rough estimate: about {0} (typical tenant; a slow Microsoft 365 evening can take much longer)' -f $recoverEstimate.Text) }
     foreach ($entry in $plan) { $entry.Row.FinalStatus = 'Planned'; Write-PcmLog -Context $context -Message ('Planned: {0} ({1})' -f $entry.Row.Identity, $entry.Path) -Level Sub }
+    if ($planUsers.Count -or $planShared.Count) { Test-PcmEntraConnectAvailable }
     if ($context.Mode -ne 'Apply') {
         foreach ($title in @('Users: back on-premises', 'Shared mailboxes', 'Licence group')) { Skip-PcmStep -Title $title -Reason 'Preview: not run.' -Icon Write }
         $context.NextSteps = @('To make the changes, run the same command in Apply mode (the confirmation is asked once):', (Get-PcmCommandLine -ActionName 'Recover' -ModeName 'Apply' -BatchId ([string]$convert.id) -KeepFilters))

@@ -34,7 +34,7 @@ BeforeAll {
     $text = $text.Replace('$caller = $PSCmdlet', '$caller = if ($global:ConsoleAnswersNo) { $global:ConsoleCaller } else { $PSCmdlet }')
     $script:Entry = Join-Path $script:Root 'Invoke-Console.ps1'
     [IO.File]::WriteAllText($script:Entry, $text, [Text.UTF8Encoding]::new($true))
-    $global:ConsoleWaveSize = 0; $global:ConsoleAnswersNo = $false
+    $global:ConsoleWaveSize = 0; $global:ConsoleAnswersNo = $false; $global:ConsoleSyncDenied = $false
     $global:ConsoleCaller = [pscustomobject]@{}
     $global:ConsoleCaller | Add-Member -MemberType ScriptMethod -Name ShouldContinue -Value { param($q, $t) $false }
     $global:ConsoleCaller | Add-Member -MemberType ScriptMethod -Name ShouldProcess -Value { param($t, $o) $true }
@@ -43,6 +43,11 @@ BeforeAll {
     function global:Connect-PcmCloud { 'Microsoft Graph and Exchange Online (fake tenant)' }
     function global:Disconnect-PcmCloud { }
     function global:Connect-PcmCompliance { }
+    function global:Test-PcmSyncServer {
+        param([string]$Server, [int]$TimeoutSeconds, [pscredential]$Credential)
+        if ($global:ConsoleSyncDenied) { return [pscustomobject]@{ Ok = $false; Kind = 'Denied'; Server = $Server; Reason = ('the account of the run has no right on {0}' -f $Server); Technical = 'Access is denied' } }
+        [pscustomobject]@{ Ok = $true; Kind = 'Ok'; Server = $Server; Reason = ('{0} accepts this account and Entra Connect answers' -f $Server); Technical = '' }
+    }
     function global:Get-PcmGraphRole { @('User.ReadWrite.All', 'User-OnPremisesSyncBehavior.ReadWrite.All', 'LicenseAssignment.ReadWrite.All', 'Organization.Read.All', 'GroupMember.ReadWrite.All', 'Group-OnPremisesSyncBehavior.ReadWrite.All') }
     function global:Get-PcmCloudModuleReport { param($MinExo) [pscustomobject]@{ Ok = $true; Graph = [pscustomobject]@{ Version = '2.41.1' }; Exo = [pscustomobject]@{ Version = '3.10.1' }; Messages = @() } }
     function global:Invoke-PcmEntraConnect { param([hashtable]$Context, [string]$Operation, [object]$Caller) $null = Invoke-PraFakeEntraConnect -Operation $Operation; 'SyncCycleEnabled=True InProgress=False' }
@@ -175,11 +180,11 @@ BeforeAll {
 }
 
 AfterAll {
-    foreach ($name in 'Start-Sleep', 'Connect-PcmCloud', 'Disconnect-PcmCloud', 'Connect-PcmCompliance', 'Get-PcmGraphRole', 'Get-PcmCloudModuleReport', 'Invoke-PcmEntraConnect', 'Wait-PcmCondition') {
+    foreach ($name in 'Start-Sleep', 'Connect-PcmCloud', 'Disconnect-PcmCloud', 'Connect-PcmCompliance', 'Test-PcmSyncServer', 'Get-PcmGraphRole', 'Get-PcmCloudModuleReport', 'Invoke-PcmEntraConnect', 'Wait-PcmCondition') {
         Remove-Item -Path "Function:$name" -ErrorAction SilentlyContinue
     }
     foreach ($name in $global:PraFakeCommands) { Remove-Item -Path "Function:$name" -ErrorAction SilentlyContinue }
-    Remove-Variable -Name PraFake, PraFakeCommands, ConsoleWaveSize, ConsoleAnswersNo, ConsoleCaller -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name PraFake, PraFakeCommands, ConsoleWaveSize, ConsoleAnswersNo, ConsoleCaller, ConsoleSyncDenied -Scope Global -ErrorAction SilentlyContinue
     if ($null -eq $script:AnsiBefore) { Remove-Item Env:\PRA_ANSI -ErrorAction SilentlyContinue } else { $env:PRA_ANSI = $script:AnsiBefore }
     if ($null -eq $script:IconsBefore) { Remove-Item Env:\PRA_ICONS -ErrorAction SilentlyContinue } else { $env:PRA_ICONS = $script:IconsBefore }
     Restore-PcmGlobalState $script:GlobalBefore
@@ -366,6 +371,21 @@ Describe 'Console: a run that fails' {
         $run.Text | Should -Match ('\.\\Invoke-PraCloudMailbox\.ps1 -Action Recover -Mode Apply -Batch {0} -ConfigPath' -f $batch)
         (Get-ConsoleVerdict $run).Text | Should -Be '  RESULT: FAIL'
         @($run.Lines | Where-Object { $_.Text -match '^ {6}\S+ .*rollback stopped' } | ForEach-Object Color | Select-Object -Unique) | Should -Be @($script:Theme.Fail)
+    }
+    It 'stops a Recover that cannot reach Entra Connect before any change, with the next step and the house error block' {
+        $convert = Invoke-Console @{ Action = 'Convert'; Mode = 'Apply'; Force = $true }
+        $convert.Code | Should -Be 0
+        $batch = [regex]::Match($convert.Text, '(?m)^ {5}\S+ Batch +(?<id>[0-9a-f]{8})$').Groups['id'].Value
+        $before = $global:PraFake.Calls.Count
+        $global:ConsoleSyncDenied = $true
+        try { $run = Invoke-Console @{ Action = 'Recover'; Mode = 'Apply'; Batch = $batch; Force = $true } } finally { $global:ConsoleSyncDenied = $false }
+        $run.Code | Should -Be 1
+        $card = Get-ConsoleCard $run Summary
+        $card.Top.Text | Should -Match 'Recover stopped - see the errors below'
+        (Get-ConsoleLabel $card.Rows | Where-Object Label -eq 'Error').Text | Should -Match 'Entra Connect cannot be used from this tool: the account of the run has no right on aadc01\.contoso\.com\. Fix that'
+        $run.Text | Should -Match ('\.\\Invoke-PraCloudMailbox\.ps1 -Action Recover -Mode Apply -Batch {0} -ConfigPath' -f $batch)
+        (Get-ConsoleVerdict $run).Text | Should -Be '  RESULT: FAIL'
+        $global:PraFake.Calls.Count | Should -Be $before
     }
     It 'prints the next step also when the run stopped before anything was done' {
         $run = Invoke-Console @{ Action = 'Convert'; Group = 'nogroup' }
