@@ -197,6 +197,8 @@ Add-RoleGroupMember -Identity eDiscoveryManager -Member <enterprise-application-
 
 **Interactive sign-in.** Set `Cloud.SignIn = 'Interactive'` (any letter case) and `Cloud.TenantId`; `Cloud.UserPrincipalName` is the administrator proposed at the sign-in. The tool then connects to Microsoft Graph with **delegated permissions** (`Connect-MgGraph -Scopes`, the same names as the application permissions above), to Exchange Online and, for the case hold, to Security & Compliance, all with the administrator's account and the Windows account broker (WAM). An administrator of the tenant consents once. The PowerShell process must have a window where someone can answer: it must **not** be started with `-NonInteractive` (the tool says so in plain words), so it cannot run in a scheduled task. `Cloud.AppId` and `Cloud.CertificateThumbprint` are not used.
 
+**One Exchange Online session.** The sign-in stops, in plain words, when an Exchange Online session already exists in the PowerShell window (open a new PowerShell 7 window: the tool never uses or closes a session that it did not open), and when the session that it opens is not in the tenant of `Cloud.TenantId` (a certificate sign-in is also checked against `Cloud.AppId`). At the end of the run the tool signs out only its own connection, and a sign-out that fails is an error of the run.
+
 ### 4.4 Case hold and retention
 
 Created once, before the disaster, by a compliance administrator:
@@ -324,7 +326,7 @@ There is no unsigned mode, switch or environment bypass. **Not covered, by desig
 
 | Section | Settings |
 |---|---|
-| `Environment` | Label used in the backup file names; a batch only continues in its own environment |
+| `Environment` | Label used in the backup file names; a snapshot or a batch made for another environment is refused (letter case ignored) |
 | `Exchange` | `Server` (host name of an Exchange server, **required by Collect**), `DomainController` (the same DC for every read of a run). `ConnectionMode` of 1.x is gone: `Local` is refused with a migration message, `Remote` is ignored |
 | `Scope` | `Mode` (`Auto`, `OU`, `Group`, `Csv`), `SearchBase`, `GroupDN`, `CsvPath` (column `Identity`: UPN, SMTP, sAMAccountName, DN or GUID), `IncludeUsers`, `IncludeShared`, `IncludeRoom`, `IncludeEquipment`, `ExcludeSamAccountNames`, `ConvertRooms` (default `$false`), `ResourceMode` (`SynchronizedShared`, default, or `CloudResource` for unsynchronised native resources) |
 | `Collect` | `SharedPermissions`, `ExpandGroupTrustees` (groups used as trustees: members stored and granted one by one), `ExcludeTrustees` (wildcards), `MailboxStatistics`, `Contacts`, `ContactsSearchBase`, `DistributionGroups`, `DistributionGroupsSearchBase`, `DynamicDistributionGroups`, `TargetGroups` (groups kept **with all their members**, nested groups, computers and contacts included, so that `-Group` works after the disaster; `Scope.GroupDN` is always kept too; a group that is not found is a warning), `MaxDropPercent` (0 to 100, default 50: a Collect that finds no mailbox, or more than this percentage fewer than the last complete snapshot of the same scope, writes nothing and fails; 100 accepts any size) |
@@ -377,6 +379,8 @@ EntraConnect = @{
 ```
 
 Create the credential file once, with the account that runs the tool: `Get-Credential CONTOSO\svc-pra-sync | Export-Clixml .\config\EntraConnect.cred.xml` (only that Windows account, on that computer, can read it back). A script of your own, outside the package, receives `-Server` and `-CredentialPath` only when it declares them; one that does not declare them is called with `-Operation` alone, as before.
+
+**The Entra Connect server is checked before the first change.** When `EntraConnect.Mode` is `Remoting` or `Script` and the rollback has users or shared mailboxes to bring back, Recover makes an authenticated, read-only call to the ADSync module of `EntraConnect.Server` (the account of the run, or the credential file of a `Script` run) before the confirmation. A Recover in Apply mode that cannot reach it stops with *Nothing was changed.* and says what to fix (the account, the server name, the firewall) or to set `EntraConnect.Mode = 'Manual'`; a Preview shows the same message as a warning. A `Script` run without `EntraConnect.Server` cannot be checked and says so. `Manual` mode is not checked.
 
 ### 6.2 Unsynchronised native resource lifecycle
 
@@ -514,6 +518,8 @@ What the verification does:
 With `-AcceptUnverifiedSnapshot` (Check, Convert, Recover) the run goes on although the snapshot changed or has no `.sha256`. Use it only when you know why and accept the file as it is. The run says so in the banner, the log, the summary and the report, and the next steps keep the switch. The console shows the light **Snapshot** as Verified, Not verifiable or Changed (red). Collect keeps the previous `.sha256` until the new one is written, and writes it again for the database as it is when a Collect fails after it opened the database, so a failed Collect does not leave the good snapshot without its hash.
 
 **A batch is tied to its snapshot.** Convert records, in the journal, the run of Collect and a digest of the content (mailboxes, permissions, group members) of the snapshot it was made from; Recover and `Check -Batch` use the same snapshot, found by its run and not by its number, and **stop, nothing changed**, when the snapshot is missing or its content is not the one the batch was made from (`-AcceptUnverifiedSnapshot` accepts a different content). When it is missing, the message points to `Store.BackupFolder`: every Collect writes a copy named `PraCloudMailbox_<Environment>_snapshot<number>_<date>.db` there, which is never deleted; copy it over `Store.Path` with its `.sha256` and run the command again. A batch made before this version has no record: the tool uses the number written in the journal and warns that it cannot prove the snapshot.
+
+**A snapshot and a batch are tied to their environment and their tenant.** Check, Convert, Recover and `Check -Batch` refuse, changing nothing, a snapshot or a batch made for another `Environment` than the one of the configuration (letter case ignored): the message names both. Convert also records `Cloud.TenantId` in the batch, and a batch made in another tenant is refused the same way. A batch made by an earlier version holds no tenant and is accepted.
 
 <!-- icon: check -->
 ## 8. Check

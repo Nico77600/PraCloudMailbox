@@ -531,6 +531,7 @@ Register-ScheduledTask -TaskName 'PRA Collect' -Action $action -Trigger $trigger
 <li><strong>If the check says the file changed, restore it from the external backup.</strong> The message says <em>Nothing was changed.</em> and <em>Restore the file from your external backup</em>. Use <code>-AcceptUnverifiedSnapshot</code> <strong>only</strong> when you know why the file changed and you accept it as it is. A snapshot with <strong>no</strong> <code>.sha256</code> file gives a warning in a Preview and in a Check. A <strong>Convert or a Recover in Apply mode stops</strong> and changes nothing: copy the <code>.sha256</code> file with the snapshot, or add <code>-AcceptUnverifiedSnapshot</code> when you know the file is the right one.</li>
 <li><strong>A Collect that lost its mailboxes is refused.</strong> Collect refuses to write a snapshot that has no mailbox. It also refuses one that has far fewer than the last good snapshot (<code>Collect.MaxDropPercent</code>, 50 by default). It writes nothing and ends with <code>RESULT: FAIL</code>. The last good snapshot stays. Find out why Exchange returned fewer mailboxes. Raise the setting only if the drop is expected.</li>
 <li><strong>A batch keeps its snapshot.</strong> Convert remembers which snapshot it was made from. Recover and the follow-up of a batch use <strong>that</strong> snapshot, and stop, changing nothing, if it is missing or not the same. Collect never deletes the snapshot of a batch that is not rolled back yet. If the tool says the snapshot of a batch is missing, copy that file from <code>data\backup</code> over <code>data\PraCloudMailbox.db</code>, with its <code>.sha256</code> file.</li>
+<li><strong>A snapshot and a batch stay in their environment.</strong> The tool refuses, changing nothing, a snapshot or a batch made for another environment (the <code>Environment</code> name) or, for a batch, another tenant. The message names both. Use the settings file of the right environment.</li>
 <li><strong>Back up the journal too.</strong> The journal is <code>data\PraCloudMailbox-journal.db</code>. It is written by Convert and Recover themselves, so the checksum does <strong>not</strong> cover it. It is the record of every change and the only input of the rollback. Copy it off-site <strong>during</strong> the operations, not only after.</li>
 </ol>
 <p>The cloud admin server needs the snapshot. If Collect does not run on it, copy <code>data\PraCloudMailbox.db</code> <strong>and</strong> <code>data\PraCloudMailbox.db.sha256</code> there after each Collect. A second scheduled task can do it.</p>
@@ -1151,6 +1152,21 @@ pwsh -File .\Invoke-PraCloudMailbox.ps1 -Action Check -Batch 1a2b3c4d -Expect Re
 <td><em>no cloud mailbox yet after …: run Convert -Batch … again later</em></td>
 <td>Exchange Online is still creating the mailbox.</td>
 <td>Wait a few minutes. Run the same command with <code>-Batch</code>.</td>
+</tr>
+<tr>
+<td><em>… was made for Environment '…' and the configuration says '…'</em> or <em>… was made in tenant … and Cloud.TenantId is …</em></td>
+<td>The snapshot or the batch belongs to another environment or tenant. Nothing was changed.</td>
+<td>Run the command with the settings file of that environment or tenant.</td>
+</tr>
+<tr>
+<td><em>An Exchange Online session already exists in this PowerShell window</em></td>
+<td>The tool does not use or close a session that it did not open.</td>
+<td>Open a new PowerShell 7 window. Run the command again.</td>
+</tr>
+<tr>
+<td><em>Entra Connect cannot be used from this tool: …</em></td>
+<td>The rollback could not reach Entra Connect with the account of the run. Nothing was changed.</td>
+<td>Do what the message says (account, server name, firewall), or ask the administrator to set <code>EntraConnect.Mode = 'Manual'</code>. Then run the same command again.</td>
 </tr>
 <tr>
 <td><em>not synchronised from AD yet: run Entra Connect, then Recover -Batch again</em></td>
