@@ -2711,6 +2711,21 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         @($events | Where-Object { $_.step -eq 'TargetedSync' -and $_.outcome -eq 'Ok' }).Count | Should -Be 1
         (Get-E2EJournal $context.BatchId).Batch.status | Should -Be 'Complete'
     }
+    It 'still finds the inactive mailbox of a shared mailbox for Check -Expect Retained after a targeted synchronisation' {
+        Start-E2E -Action Convert -Scope SharedOnly
+        Invoke-PcmConvert
+        $convert = $context.BatchId
+        Close-E2E
+        $global:PraFake.Faults.NoRecreate = $true
+        Start-E2E -Action Recover -Batch $convert
+        Invoke-PcmRecover
+        Close-E2E
+        $global:PraFake.Faults.NoRecreate = $false
+        Start-E2E -Action Check -Batch $convert -Expect Retained -Once
+        Invoke-PcmCheckBatch
+        @($context.Rows | ForEach-Object { $_.FinalStatus } | Sort-Object -Unique) | Should -Be @('Success') -Because (($context.Rows | ForEach-Object { $_.Detail }) -join ' | ')
+        (Get-E2ERow 'compta@contoso.com').Detail | Should -Match 'inactive mailbox kept'
+    }
     It 'stops with PENDING and the exact full-synchronisation command when the targeted synchronisation fails, and never runs a full one itself' {
         Start-E2E -Action Convert -Scope SharedOnly
         Invoke-PcmConvert

@@ -1628,6 +1628,7 @@ function Invoke-PcmCheckBatch {
                         $facts.HoldStamped = if ($holdSet) { Test-PcmToolHold -Set $holdSet -Holds @($holds) } else { [bool]@($holds | Where-Object { ([string]$_).StartsWith('UniH', [StringComparison]::OrdinalIgnoreCase) }).Count }
                     } else {
                         $inactive = Get-PcmJsonField $recoverByGuid[$guid] 'inactiveGuid'
+                        if (-not $inactive) { $inactive = Get-PcmJsonField $recoverByGuid[$guid] 'cloudGuid' }
                         if ($inactive) { $facts.InactiveFound = [bool](Get-Mailbox -InactiveMailboxOnly -Identity ([string]$inactive) -ErrorAction SilentlyContinue) }
                     }
                 }
