@@ -34,14 +34,14 @@ BeforeAll {
     $text = $text.Replace('$caller = $PSCmdlet', '$caller = if ($global:ConsoleAnswersNo) { $global:ConsoleCaller } else { $PSCmdlet }')
     $script:Entry = Join-Path $script:Root 'Invoke-Console.ps1'
     [IO.File]::WriteAllText($script:Entry, $text, [Text.UTF8Encoding]::new($true))
-    $global:ConsoleWaveSize = 0; $global:ConsoleAnswersNo = $false; $global:ConsoleSyncDenied = $false
+    $global:ConsoleWaveSize = 0; $global:ConsoleAnswersNo = $false; $global:ConsoleSyncDenied = $false; $global:ConsoleSignOutFails = $false
     $global:ConsoleCaller = [pscustomobject]@{}
     $global:ConsoleCaller | Add-Member -MemberType ScriptMethod -Name ShouldContinue -Value { param($q, $t) $false }
     $global:ConsoleCaller | Add-Member -MemberType ScriptMethod -Name ShouldProcess -Value { param($t, $o) $true }
 
     function global:Start-Sleep { Step-PraFake }
     function global:Connect-PcmCloud { 'Microsoft Graph and Exchange Online (fake tenant)' }
-    function global:Disconnect-PcmCloud { }
+    function global:Disconnect-PcmCloud { param([hashtable]$Context) if ($global:ConsoleSignOutFails) { throw 'Synthetic sign-out failure' } }
     function global:Connect-PcmCompliance { }
     function global:Test-PcmSyncServer {
         param([string]$Server, [int]$TimeoutSeconds, [pscredential]$Credential)
@@ -184,7 +184,7 @@ AfterAll {
         Remove-Item -Path "Function:$name" -ErrorAction SilentlyContinue
     }
     foreach ($name in $global:PraFakeCommands) { Remove-Item -Path "Function:$name" -ErrorAction SilentlyContinue }
-    Remove-Variable -Name PraFake, PraFakeCommands, ConsoleWaveSize, ConsoleAnswersNo, ConsoleCaller, ConsoleSyncDenied -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name PraFake, PraFakeCommands, ConsoleWaveSize, ConsoleAnswersNo, ConsoleCaller, ConsoleSyncDenied, ConsoleSignOutFails -Scope Global -ErrorAction SilentlyContinue
     if ($null -eq $script:AnsiBefore) { Remove-Item Env:\PRA_ANSI -ErrorAction SilentlyContinue } else { $env:PRA_ANSI = $script:AnsiBefore }
     if ($null -eq $script:IconsBefore) { Remove-Item Env:\PRA_ICONS -ErrorAction SilentlyContinue } else { $env:PRA_ICONS = $script:IconsBefore }
     Restore-PcmGlobalState $script:GlobalBefore
@@ -386,6 +386,15 @@ Describe 'Console: a run that fails' {
         $run.Text | Should -Match ('\.\\Invoke-PraCloudMailbox\.ps1 -Action Recover -Mode Apply -Batch {0} -ConfigPath' -f $batch)
         (Get-ConsoleVerdict $run).Text | Should -Be '  RESULT: FAIL'
         $global:PraFake.Calls.Count | Should -Be $before
+    }
+    It 'reports a sign-out that fails as a warning with the action, and the run keeps its result' {
+        $global:ConsoleSignOutFails = $true
+        try { $run = Invoke-Console @{ Action = 'Convert'; Mode = 'Apply'; Force = $true } } finally { $global:ConsoleSignOutFails = $false }
+        $run.Code | Should -Be 0
+        (Get-ConsoleVerdict $run).Text | Should -Be '  RESULT: PASS'
+        (Get-ConsoleCard $run Summary).Top.Text | Should -Not -Match 'stopped'
+        (Get-ConsoleLabel (Get-ConsoleCard $run Summary).Rows | Where-Object Label -eq 'Result').Text | Should -Match ('^\d+ done {0} 0 pending {0} 0 error\(s\) {0} 0 skipped$' -f $script:Dot)
+        $run.Text | Should -Match 'Signing out of Microsoft 365 failed \(Synthetic sign-out failure\)\. This does not change the result of the run\. Close this PowerShell window before you run another tool\.'
     }
     It 'prints the next step also when the run stopped before anything was done' {
         $run = Invoke-Console @{ Action = 'Convert'; Group = 'nogroup' }

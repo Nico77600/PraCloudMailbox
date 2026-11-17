@@ -3708,7 +3708,7 @@ finally {
         try { Disconnect-PcmExchange -Context $context } catch { $context.Issues.Add([pscustomobject]@{ Message = "Exchange session: $($_.Exception.Message)"; Source = 'Exchange' }) }
     }
     if ($Action -notin @('Collect', 'Schedule') -and (Get-Command Disconnect-PcmCloud -ErrorAction SilentlyContinue)) {
-        try { Add-PcmModuleWarning -Warning @($PcmEntryModuleWarnings); $PcmEntryModuleWarnings.Clear(); Disconnect-PcmCloud -Context $context } catch { $context.Issues.Add([pscustomobject]@{ Message = "Cloud sign-out: $($_.Exception.Message)"; Source = 'Cloud' }) }
+        try { Add-PcmModuleWarning -Warning @($PcmEntryModuleWarnings); $PcmEntryModuleWarnings.Clear(); Disconnect-PcmCloud -Context $context } catch { Write-PcmLog -Context $context -Message ('Signing out of Microsoft 365 failed ({0}). This does not change the result of the run. Close this PowerShell window before you run another tool.' -f (ConvertTo-PcmPlainMessage $_.Exception.Message)) -Level Warning }
     }
     # The time limit of the calls goes with the run, whatever stopped it.
     if ($Action -ne 'Collect' -and (Get-Command Stop-PcmCallGuard -ErrorAction SilentlyContinue)) { try { Stop-PcmCallGuard } catch { $null = $_ } }
