@@ -9,7 +9,7 @@
     the plan, as a run does when Microsoft 365 refuses the sign-in. Nothing here reads Exchange, Active Directory, Microsoft Graph or Entra Connect.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.1.0
+    Version : 2.1.1
     Part of : PRA Cloud Mailbox (repository tool, not in the package)
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'The stub takes every parameter of the real script, used or not.')]
@@ -50,7 +50,7 @@ $null = New-Item -ItemType Directory -Path $reports, $logs -Force
 $stem = '{0}-{1}-{2}' -f $Action, $Mode, [guid]::NewGuid().ToString('N').Substring(0, 6)
 $logFile = Join-Path $logs ($stem + '.log'); [IO.File]::WriteAllText($logFile, 'run log')
 $csvFile = Join-Path $reports ($stem + '.csv'); $htmlFile = Join-Path $reports ($stem + '.html'); [IO.File]::WriteAllText($htmlFile, '<html><body>report</body></html>')
-Ev @{ kind = 'start'; title = 'PRA Cloud Mailbox'; action = $Action; mode = $Mode; version = '2.1.0'; logFile = $logFile; details = [ordered]@{ Action = ('{0} · {1}' -f $Action, $Mode); Batch = $(if ($Action -in 'Convert', 'Recover' -and $apply -and -not (Test-Path (Join-Path $here 'fail.flag'))) { $batchId } else { '' }) } }
+Ev @{ kind = 'start'; title = 'PRA Cloud Mailbox'; action = $Action; mode = $Mode; version = '2.1.1'; logFile = $logFile; details = [ordered]@{ Action = ('{0} · {1}' -f $Action, $Mode); Batch = $(if ($Action -in 'Convert', 'Recover' -and $apply -and -not (Test-Path (Join-Path $here 'fail.flag'))) { $batchId } else { '' }) } }
 # The group a lookup finds: the one of the scenario (PRA-Wave1, captured by Collect in snapshot 42), in any letter case.
 $groupName = 'PRA-Wave1'
 if ($ResolveOnly -and $Group -ine $groupName) {

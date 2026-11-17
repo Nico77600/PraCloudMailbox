@@ -25,7 +25,7 @@ This folder contains everything needed to run the tool: `Invoke-PraCloudMailbox.
 
 ## Quick start
 
-1. Check the download: compare the hash of the zip with its `.sha256` file (`(Get-FileHash .\PraCloudMailbox-2.1.0.zip -Algorithm SHA256).Hash`), extract it, and check that `Get-AuthenticodeSignature .\module\Test-PackageIntegrity.ps1` says `Valid`.
+1. Check the download: compare the hash of the zip with its `.sha256` file (`(Get-FileHash .\PraCloudMailbox-2.1.1.zip -Algorithm SHA256).Hash`), extract it, and check that `Get-AuthenticodeSignature .\module\Test-PackageIntegrity.ps1` says `Valid`.
 2. Unblock the files (box above) and install the two modules in an administrator PowerShell 7: `Install-Module Microsoft.Graph.Authentication -MinimumVersion 2.41.1 -Scope AllUsers -Force`, then `Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope AllUsers -Force`.
 3. Fill in the configuration: `notepad .\config\PraCloudMailbox.config.psd1` (`Exchange.Server`, tenant, app registration or interactive sign-in, licences, case hold, Entra Connect).
 4. Schedule the daily Collect with `pwsh.exe`, before the disaster. In an administrator PowerShell 7 on the Collect computer, one command checks the account (a domain user that Exchange accepts) and registers the task:

@@ -1,7 +1,7 @@
 ﻿---
 title: PRA Cloud Mailbox
 subtitle: Administrator guide
-version: 2.1.0
+version: 2.1.1
 author: Nicolas Fabert
 updated: 2026-11-15
 ---
@@ -274,8 +274,8 @@ The tool creates the `data`, `logs` and `reports` folders itself when they are m
 1. Download `PraCloudMailbox-<version>.zip` and its `.sha256` file from the release page. Compare the hash of the zip with the one in the `.sha256` file (the file holds `<hash>  <file name>`; the letters can be capital or small):
 
 ```powershell
-(Get-FileHash .\PraCloudMailbox-2.1.0.zip -Algorithm SHA256).Hash
-Get-Content .\PraCloudMailbox-2.1.0.zip.sha256
+(Get-FileHash .\PraCloudMailbox-2.1.1.zip -Algorithm SHA256).Hash
+Get-Content .\PraCloudMailbox-2.1.1.zip.sha256
 ```
 
 2. Extract it, copy the folder to `C:\PRA\PraCloudMailbox` on the cloud admin server and on any other server that runs Collect, and unblock the files.
