@@ -1,6 +1,6 @@
 # PRA Cloud Mailbox
 
-When Active Directory, Exchange and Entra Connect are all lost, gives every user and shared mailbox a mailbox in Exchange Online, and rolls everything back when the infrastructure is rebuilt. PowerShell 7.5+ engine, guided WPF console. Author: Nicolas Fabert. Version 2.1.0.
+When Active Directory, Exchange and Entra Connect are all lost, gives every user and shared mailbox a mailbox in Exchange Online, and rolls everything back when the infrastructure is rebuilt. PowerShell 7.5+ engine, guided WPF console. Author: Nicolas Fabert. Version 2.1.1.
 
 This folder contains everything needed to run the tool: `Invoke-PraCloudMailbox.ps1`, its modules and the WPF console, the configuration and samples, the report template, the SQLite library and the two guides (user guide and administrator guide). Tests and build tools stay outside it, in the repository.
 
