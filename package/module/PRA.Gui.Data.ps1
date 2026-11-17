@@ -140,7 +140,7 @@ function ConvertTo-PcmGuiShownArgument {
     escape): the apostrophe AND the typographic quotes that PowerShell also reads as quotes are doubled.
     #>
     param([AllowEmptyString()][string]$Value)
-    if ($Value -match '^[A-Za-z0-9_.:\\/][A-Za-z0-9_.:@\\/-]*$') { return $Value }
+    if ($Value -match '^[A-Za-z0-9_.:\\/][A-Za-z0-9_.:@\\/-]*\z') { return $Value }
     $escaped = $Value.Replace("'", "''")
     foreach ($code in @(0x2018, 0x2019, 0x201A, 0x201B)) { $quote = [string][char]$code; $escaped = $escaped.Replace($quote, $quote + $quote) }
     return "'" + $escaped + "'"

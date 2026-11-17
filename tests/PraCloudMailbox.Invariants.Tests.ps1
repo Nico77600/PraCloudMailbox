@@ -61,15 +61,17 @@ Describe 'A date-like value of a resource survives a restore' {
         . (Join-Path $PSScriptRoot 'FakeTenant.ps1')
         Set-Item -Path Function:\global:Set-Mailbox -Value ([scriptblock]::Create($declaration))
         $settings = New-PraFakeResourceSettings
-        $settings.Directory.Office = '2025-01-31T00:00:00Z'
         $script:Record = [pscustomobject]@{ object_guid = 'source'; kind = 'Room'; primary_smtp_address = 'room@contoso.com'; email_addresses_json = '["SMTP:room@contoso.com"]'
             legacy_exchange_dn = ''; resource_settings_json = ($settings | ConvertTo-Json -Depth 8 -Compress)
             custom_attributes_json = '{"CustomAttribute3":"2025-01-31T00:00:00Z","CustomAttribute4":"plain"}' }
+        $settings.Directory.Office = '2025-01-31T00:00:00Z'
+        $script:DatedOffice = [pscustomobject]@{ object_guid = 'source'; kind = 'Room'; primary_smtp_address = 'room@contoso.com'; email_addresses_json = '[]'
+            legacy_exchange_dn = ''; resource_settings_json = ($settings | ConvertTo-Json -Depth 8 -Compress); custom_attributes_json = '' }
     }
     AfterAll { Remove-Variable -Name PcmDateFake -Scope Global -ErrorAction SilentlyContinue }
 
     It 'reads a directory field that looks like a date as the text it is' {
-        $read = Read-PcmResourceSettings -Record $script:Record
+        $read = Read-PcmResourceSettings -Record $script:DatedOffice
         $read.Directory.Office | Should -BeOfType [string]
         $read.Directory.Office | Should -BeExactly '2025-01-31T00:00:00Z'
     }

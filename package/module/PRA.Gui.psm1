@@ -251,7 +251,6 @@ function Test-PcmGuiModified {
     param([string]$Key)
     $g = $script:Gui
     if (-not $g.Defaults) { return $false }
-    if ($Key -eq 'Env' -and $g.EnvLock) { return $false }
     if ($Key -eq 'SnapId') { return (Test-PcmGuiSettingUsed 'SnapId') -and -not (Test-PcmGuiOrdinal (Get-PcmGuiField 'SnapId') $g.Defaults.SnapId) }
     if ($Key -eq 'Store') { return -not (Test-PcmGuiOrdinal (Get-PcmGuiField 'Store') $g.Defaults.Store) -and [bool](Get-PcmGuiField 'Store') }
     if ($script:GuiNumberRange.ContainsKey($Key)) {
@@ -278,7 +277,7 @@ function Get-PcmGuiOverride {
     <# The configuration settings the operator changed for this run, nested like the configuration (empty when nothing differs from the file). #>
     $g = $script:Gui
     $override = @{}; $cloud = @{}
-    if ((Test-PcmGuiModified 'Env') -and -not $g.EnvLock) { $override.Environment = Get-PcmGuiField 'Env' }
+    if (Test-PcmGuiModified 'Env') { $override.Environment = Get-PcmGuiField 'Env' }
     if (Test-PcmGuiModified 'Store') { $override.Store = @{ Path = (Get-PcmGuiField 'Store') } }
     if (Test-PcmGuiSettingUsed 'Signin') {
         foreach ($pair in @(@('Signin', 'SignIn'), @('Tenant', 'TenantId'), @('Org', 'Organization'))) {

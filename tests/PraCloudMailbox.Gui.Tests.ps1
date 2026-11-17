@@ -177,7 +177,8 @@ Describe 'Console: the request and the command line of a run' {
             @{ Value = 'alice@contoso.com'; Bare = $true }, @{ Value = 'D:\PRA\lab.config.psd1'; Bare = $true }, @{ Value = 'contoso.com/Paris'; Bare = $true }
             @{ Value = 'Sales $(Get-Date) team'; Bare = $false }, @{ Value = '$env:USERNAME'; Bare = $false }, @{ Value = 'ends with a backtick`'; Bare = $false }, @{ Value = "it's"; Bare = $false }
             @{ Value = 'a "b" ${c} @(1) ; & calc'; Bare = $false }, @{ Value = "smart $([char]0x2019) and $([char]0x2018) quotes"; Bare = $false }, @{ Value = ''; Bare = $false }
-            @{ Value = '@splat'; Bare = $false }, @{ Value = '-Force'; Bare = $false }, @{ Value = 'a b'; Bare = $false }, @{ Value = '$1'; Bare = $false }) {
+            @{ Value = '@splat'; Bare = $false }, @{ Value = '-Force'; Bare = $false }, @{ Value = 'a b'; Bare = $false }, @{ Value = '$1'; Bare = $false }
+            @{ Value = "abc`n"; Bare = $false }, @{ Value = "abc`r`n"; Bare = $false }, @{ Value = "abc`n--"; Bare = $false }) {
             param($Value, $Bare)
             $shown = & $script:Gui { param($v) ConvertTo-PcmGuiShownArgument $v } $Value
             $parse = Get-ShownParse "Get-X -Group $shown"
@@ -187,6 +188,16 @@ Describe 'Console: the request and the command line of a run' {
             $element | Should -BeOfType ([System.Management.Automation.Language.StringConstantExpressionAst])
             $element.Value | Should -BeExactly $Value
             if ($Bare) { $shown | Should -BeExactly $Value } else { $shown | Should -BeLike "'*'" }
+        }
+        It 'reads the events of the engine with a date-like text and the time of an event as text' -Tag 'ShownCommand' {
+            $path = Join-Path $TestDrive 'events.jsonl'
+            [IO.File]::WriteAllText($path, ('{"kind":"item","status":"Ok","time":"2026-11-16T10:20:30Z","text":"2025-01-31T00:00:00Z","identity":"a@contoso.com"}' + "`n"), [Text.UTF8Encoding]::new($false))
+            $read = Read-PcmGuiEvents -Path $path
+            @($read.Events).Count | Should -Be 1
+            $read.Events[0].text | Should -BeOfType [string]
+            $read.Events[0].text | Should -BeExactly '2025-01-31T00:00:00Z'
+            $read.Events[0].time | Should -BeOfType [string]
+            $read.Events[0].time | Should -BeExactly '2026-11-16T10:20:30Z'
         }
         It 'shows every value of the command of a run as a literal: Continue, Copy, the next step and the Started line all take this text' -Tag 'ShownCommand' {
             $request = New-PcmGuiRequest -Action Convert -Mode Apply -Group 'Sales $(Get-Date) team' -Scope SharedOnly
@@ -722,6 +733,11 @@ $o.batches = @($g.BatchRows | ForEach-Object { '{0}|{1}|{2}' -f $_.BatchId, $_.S
 $o.readyNoBatch = [bool](Mod { Test-PcmGuiTaskReady })
 $c.BatchList.SelectedItem = $g.BatchRows[0]; Pump 50
 $o.envLock = $c.EnvLock.Visibility.ToString(); $o.fEnvEnabled = $c.F_Env.IsEnabled
+$lock = [string](Mod { $script:Gui.EnvLock })
+Mod { $script:Gui.EnvLock = 'dr-eu'; Set-PcmGuiField 'Env' 'dr-eu' }
+$o.overrideLocked = [string](Mod { (Get-PcmGuiOverride).Environment })
+$o.changedLocked = @(Mod { Get-PcmGuiChangedSetting })
+Mod ([scriptblock]::Create("Set-PcmGuiField 'Env' '$lock'; `$script:Gui.EnvLock = '$lock'"))
 $o.waveRows = $g.WaveRows.Count; $o.readyWhole = [bool](Mod { Test-PcmGuiTaskReady })
 Check 'S_Wave_Wave'
 $o.readyNoTick = [bool](Mod { Test-PcmGuiTaskReady })
@@ -763,6 +779,8 @@ Done $o
     It 'locks the environment to the one of the batch and lists the mailboxes in the cloud for a wave' {
         $script:Wave.envLock | Should -Be 'Visible'
         $script:Wave.fEnvEnabled | Should -BeFalse
+        $script:Wave.overrideLocked | Should -BeExactly 'dr-eu'
+        $script:Wave.changedLocked | Should -Contain 'Environment'
         $script:Wave.waveRows | Should -Be 24
         $script:Wave.readyWhole | Should -BeTrue
         $script:Wave.readyNoTick | Should -BeFalse
