@@ -363,6 +363,12 @@ Describe 'Interactive sign-in of an administrator' {
         $printed.Count | Should -Be 0
         $context['ExoConnected'] | Should -BeFalse
     }
+    It 'refuses an Exchange Online session of another tenant after an interactive sign-in, and tells to sign in with an account of the right tenant' {
+        $context = @{ Config = (New-FollowConfig -Cloud @{ SignIn = 'Interactive' }); Approval = { param($Target, $Operation) $true } }
+        Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { $null = Add-PraFakeExoConnection -TenantId 'dddddddd-0000-0000-0000-000000000004' -ConnectionId 'own' }
+        { Connect-PcmCloud -Context $context } | Should -Throw '*The Exchange Online session is in tenant dddddddd-0000-0000-0000-000000000004, and Cloud.TenantId is 33333333-3333-3333-3333-333333333333. Nothing was changed. Sign in with an account of tenant 33333333-3333-3333-3333-333333333333, then run the command again.'
+        @($global:PraFakeExo.Disconnects) | Should -Be @('own')
+    }
     It 'refuses, in plain words, to sign in when PowerShell was started with -NonInteractive' {
         Mock Test-PcmNonInteractiveProcess -ModuleName PRA.Cloud { $true }
         $context = @{ Config = (New-FollowConfig -Cloud @{ SignIn = 'Interactive' }); Approval = { param($Target, $Operation) $true } }

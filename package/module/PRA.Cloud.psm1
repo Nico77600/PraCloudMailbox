@@ -563,7 +563,7 @@ function Assert-PcmNoExoSession {
     <# The tool never uses or closes an Exchange Online session that it did not open: one that already exists in this PowerShell stops the sign-in. #>
     [CmdletBinding()]
     param()
-    if (@(Get-ConnectionInformation -ErrorAction Stop).Count) { throw 'An Exchange Online session already exists in this PowerShell window: run the tool in a new PowerShell 7 window (nothing was signed out).' }
+    if (@(Get-ConnectionInformation -ErrorAction Stop).Count) { throw 'An Exchange Online session already exists in this PowerShell window: run the tool in a new PowerShell 7 window, started with -NoProfile if your profile signs in to Exchange Online (nothing was signed out).' }
     if (-not (Get-Command -Name Disconnect-ExchangeOnline -ErrorAction Stop).Parameters.ContainsKey('ConnectionId')) {
         throw 'This version of the ExchangeOnlineManagement module cannot sign out one connection (-ConnectionId): update the module, then run the command again.'
     }
@@ -578,24 +578,41 @@ function Save-PcmExoConnectionId {
     $Context['ExoConnectionIds'] = @($known + @($now | Where-Object { $id = $_; -not ($known | Where-Object { Test-PcmSameText $_ $id }) }))
 }
 
+function Assert-PcmSessionTenant {
+    <# One session that a sign-in opened belongs to the tenant of the configuration (a certificate sign-in reports the organisation domain). #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][object]$Connection, [Parameter(Mandatory)][string]$Name)
+    $cloud = $Context.Config.Cloud
+    $tenant = [string](Get-PcmValue $cloud 'TenantId' '')
+    $organization = [string](Get-PcmValue $cloud 'Organization' '')
+    $sessionTenant = [string](Get-PcmValue $Connection 'TenantID' '')
+    if ((Test-PcmSameText $sessionTenant $tenant) -or ($organization -and (Test-PcmSameText $sessionTenant $organization))) { return }
+    $action = if (Test-PcmSameText (Get-PcmValue $cloud 'SignIn' 'Certificate') 'Interactive') { 'Sign in with an account of tenant {0}' -f $tenant } else { 'Check Cloud.Organization and Cloud.TenantId in the configuration file' }
+    throw ('The {0} session is in tenant {1}, and Cloud.TenantId is {2}. Nothing was changed. {3}, then run the command again.' -f $Name, $(if ($sessionTenant) { $sessionTenant } else { 'unknown' }), $tenant, $action)
+}
+
 function Confirm-PcmExoSession {
-    <# The Exchange Online session that the sign-in opened is the only one of this PowerShell and belongs to the tenant of the configuration (a certificate sign-in reports the organisation domain). #>
+    <# The Exchange Online session that the sign-in opened is the only one of this PowerShell and belongs to the tenant of the configuration. #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context)
     $cloud = $Context.Config.Cloud
     $connections = @(Get-ConnectionInformation -ErrorAction Stop)
+    if (-not $connections.Count) { throw 'No Exchange Online connection was found in this PowerShell window after the sign-in. Nothing was changed. Run the command again.' }
     if ($connections.Count -ne 1) { throw 'Exactly one Exchange Online connection is expected in this PowerShell window after the sign-in. Close the other sessions, then run the command again.' }
-    $tenant = [string](Get-PcmValue $cloud 'TenantId' '')
-    $organization = [string](Get-PcmValue $cloud 'Organization' '')
-    $sessionTenant = [string](Get-PcmValue $connections[0] 'TenantID' '')
-    if (-not ((Test-PcmSameText $sessionTenant $tenant) -or ($organization -and (Test-PcmSameText $sessionTenant $organization)))) {
-        throw ('The Exchange Online session is in tenant {0}, and Cloud.TenantId is {1}. Nothing was changed. Sign in with an account of tenant {1}, then run the command again.' -f $(if ($sessionTenant) { $sessionTenant } else { 'unknown' }), $tenant)
-    }
+    Assert-PcmSessionTenant -Context $Context -Connection $connections[0] -Name 'Exchange Online'
     $appId = [string](Get-PcmValue $cloud 'AppId' '')
     $sessionApp = [string](Get-PcmValue $connections[0] 'AppId' '')
     if ($appId -and -not (Test-PcmSameText (Get-PcmValue $cloud 'SignIn' 'Certificate') 'Interactive') -and -not (Test-PcmSameText $sessionApp $appId)) {
         throw ('The Exchange Online session was opened by application {0}, and Cloud.AppId is {1}. Nothing was changed. Check Cloud.AppId and Cloud.CertificateThumbprint, then run the command again.' -f $(if ($sessionApp) { $sessionApp } else { 'unknown' }), $appId)
     }
+}
+
+function Confirm-PcmComplianceSession {
+    <# The Security & Compliance session that the sign-in opened (the connections that did not exist before it) belongs to the tenant of the configuration. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context, [AllowEmptyCollection()][string[]]$Before = @())
+    $opened = @(Get-ConnectionInformation -ErrorAction Stop | Where-Object { $id = [string]$_.ConnectionId; -not ($Before | Where-Object { Test-PcmSameText $_ $id }) })
+    foreach ($connection in $opened) { Assert-PcmSessionTenant -Context $Context -Connection $connection -Name 'Security & Compliance' }
 }
 
 function Disconnect-PcmCloudAfterFailure {
@@ -707,7 +724,11 @@ function Invoke-PcmGraph {
             $code = 0
             try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = 0 }
             if ($code -eq 404 -and $AllowNotFound) { return $null }
-            if (-not $NoRetry -and $code -in @(429, 502, 503, 504) -and $attempt -lt 5) { Start-Sleep -Seconds ([Math]::Max((5 * $attempt), (Get-PcmErrorRetryAfterSecond -Exception $_.Exception))); continue }
+            if (-not $NoRetry -and $code -in @(429, 502, 503, 504) -and $attempt -lt 5) {
+                $wait = [Math]::Max((5 * $attempt), (Get-PcmErrorRetryAfterSecond -Exception $_.Exception))
+                if ($wait -gt (5 * $attempt) -and $script:GraphRequestOwner) { Write-PcmLog -Context $script:GraphRequestOwner -Message ('Microsoft Graph asks to wait {0} s' -f $wait) -Level Detail }
+                Start-Sleep -Seconds $wait; continue
+            }
             if (-not $NoRetry -and $code -eq 0 -and $attempt -lt 5 -and (Test-PcmNetworkFailure $_.Exception)) { Start-Sleep -Seconds (10 * $attempt); continue }
             # The Graph message (error.code: error.message) says what is wrong; the exception alone only says "BadRequest".
             $detail = ''
@@ -1318,7 +1339,7 @@ function ConvertTo-PcmRetryAfterSecond {
 }
 
 function Get-PcmRetryAfterSecond {
-    <# The Retry-After (seconds or HTTP date) that Microsoft Graph gave in an answer: the headers of one request of a batch, or the headers of the response of a failed direct request. 0 when there is none, never more than two minutes. #>
+    <# The Retry-After (seconds or HTTP date) that Microsoft Graph gave in the answer of one request of a batch: 0 when there is none, never more than two minutes. #>
     [CmdletBinding()]
     [OutputType([int])]
     param([AllowNull()][object]$Response)
@@ -2874,6 +2895,7 @@ function Connect-PcmCompliance {
     param([Parameter(Mandatory)][hashtable]$Context)
     if ($Context.ContainsKey('ComplianceConnected') -and $Context['ComplianceConnected']) { return }
     $cloud = $Context.Config.Cloud
+    $before = @(if ($Context.ContainsKey('ExoConnectionIds')) { $Context['ExoConnectionIds'] })
     # -CommandName is required: the full session also loads Get-Recipient and Get-User, which hide the Exchange
     # Online cmdlets and return a stale view (a rolled back user still seen as UserMailbox).
     if (Test-PcmSameText (Get-PcmValue $cloud 'SignIn' 'Certificate') 'Interactive') {
@@ -2891,6 +2913,7 @@ function Connect-PcmCompliance {
                 -CommandName Get-CaseHoldPolicy, Set-CaseHoldPolicy, New-CaseHoldPolicy, New-CaseHoldRule -ErrorAction Stop
         } finally { Exit-PcmCall; Save-PcmExoConnectionId -Context $Context -Add }
     }
+    Confirm-PcmComplianceSession -Context $Context -Before $before
     $Context['ComplianceConnected'] = $true
     Install-PcmCallGuard
 }

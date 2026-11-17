@@ -103,7 +103,7 @@ Describe 'Graph transport lifecycle (offline context model)' {
     }
     It 'refuses an Exchange Online session that already exists, and signs nothing out' {
         $null = Add-PraFakeExoConnection -TenantId 'contoso.onmicrosoft.com' -ConnectionId 'foreign'
-        { Connect-PcmCloud -Context $context } | Should -Throw '*An Exchange Online session already exists in this PowerShell window*nothing was signed out*'
+        { Connect-PcmCloud -Context $context } | Should -Throw '*An Exchange Online session already exists in this PowerShell window*started with -NoProfile if your profile signs in to Exchange Online (nothing was signed out).'
         Should -Invoke Connect-ExchangeOnline -ModuleName PRA.Cloud -Times 0 -Exactly
         $global:PraFakeExo.Disconnects.Count | Should -Be 0
         @(Get-ConnectionInformation).Count | Should -Be 1
@@ -117,8 +117,23 @@ Describe 'Graph transport lifecycle (offline context model)' {
     It 'refuses an Exchange Online session of another tenant, and signs out only its own connection' {
         $context.Config.Cloud.TenantId = '33333333-3333-3333-3333-333333333333'
         Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { $null = Add-PraFakeExoConnection -TenantId 'other.onmicrosoft.com' -AppId $AppId -ConnectionId 'own' }
-        { Connect-PcmCloud -Context $context } | Should -Throw "*The Exchange Online session is in tenant other.onmicrosoft.com, and Cloud.TenantId is 33333333-3333-3333-3333-333333333333. Nothing was changed.*"
+        { Connect-PcmCloud -Context $context } | Should -Throw "*The Exchange Online session is in tenant other.onmicrosoft.com, and Cloud.TenantId is 33333333-3333-3333-3333-333333333333. Nothing was changed. Check Cloud.Organization and Cloud.TenantId in the configuration file, then run the command again."
         @($global:PraFakeExo.Disconnects) | Should -Be @('own')
+    }
+    It 'says that no connection was found, and does not tell to close sessions' {
+        Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { }
+        $failure = try { Connect-PcmCloud -Context $context; '' } catch { $_.Exception.Message }
+        $failure | Should -BeLike 'No Exchange Online connection was found in this PowerShell window after the sign-in.*'
+        $failure | Should -Not -BeLike '*Close the other sessions*'
+    }
+    It 'refuses a Security and Compliance session of another tenant, and signs it out with the others' {
+        Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { $null = Add-PraFakeExoConnection -TenantId $Organization -AppId $AppId -ConnectionId 'exchange' }
+        Mock Connect-IPPSSession -ModuleName PRA.Cloud { $null = Add-PraFakeExoConnection -TenantId 'other.onmicrosoft.com' -AppId $AppId -ConnectionId 'compliance' }
+        Connect-PcmCloud -Context $context | Out-Null
+        { Connect-PcmCompliance -Context $context } | Should -Throw '*The Security & Compliance session is in tenant other.onmicrosoft.com, and Cloud.TenantId is synthetic. Nothing was changed.*'
+        $context.ContainsKey('ComplianceConnected') | Should -BeFalse
+        Disconnect-PcmCloud -Context $context
+        @($global:PraFakeExo.Disconnects) | Should -Be @('exchange', 'compliance')
     }
     It 'accepts the tenant GUID or the organisation domain, in any letter case' -TestCases @(
         @{ Tenant = 'AAAAAAAA-0000-0000-0000-000000000001' }, @{ Tenant = 'aaaaaaaa-0000-0000-0000-000000000001' }, @{ Tenant = 'CONTOSO.onmicrosoft.com' }) {
@@ -186,16 +201,13 @@ Describe 'Graph transport lifecycle (offline context model)' {
 Describe 'Entra Connect check (authenticated, read-only)' {
     BeforeAll { Import-Module (Join-Path $script:Package 'module\PRA.Cloud.psm1') -Force }
 
-    It 'answers Ok when the server answers, and sends no credential unless one is given' {
-        Mock Invoke-Command -ModuleName PRA.Cloud { [pscustomobject]@{ Computer = 'AADC'; CycleEnabled = $true } }
+    It 'answers Ok when the remote job answers, with a session that has a time limit' {
+        Mock Invoke-Command -ModuleName PRA.Cloud { Start-Job -ScriptBlock { [pscustomobject]@{ Computer = 'AADC'; CycleEnabled = $true } } }
         $answer = Test-PcmSyncServer -Server 'aadc'
         $answer.Ok | Should -BeTrue
         $answer.Kind | Should -BeExactly 'Ok'
-        Should -Invoke Invoke-Command -ModuleName PRA.Cloud -Times 1 -Exactly -ParameterFilter { $ComputerName -eq 'aadc' -and -not $Credential -and $null -ne $SessionOption }
-        $secret = [System.Security.SecureString]::new(); foreach ($character in 'not a secret'.ToCharArray()) { $secret.AppendChar($character) }
-        $account = [pscredential]::new('CONTOSO\svc', $secret)
-        $null = Test-PcmSyncServer -Server 'aadc' -Credential $account
-        Should -Invoke Invoke-Command -ModuleName PRA.Cloud -Times 1 -Exactly -ParameterFilter { $Credential.UserName -eq 'CONTOSO\svc' }
+        Should -Invoke Invoke-Command -ModuleName PRA.Cloud -Times 1 -Exactly -ParameterFilter { $ComputerName -eq 'aadc' -and $AsJob -and $null -ne $SessionOption }
+        @(Get-Job).Count | Should -Be 0
     }
 
     It 'says in plain words what is wrong (<Kind>)' -TestCases @(
@@ -215,11 +227,44 @@ Describe 'Entra Connect check (authenticated, read-only)' {
         Remove-Variable -Name PcmProbeMessage -Scope Global
     }
 
+    It 'says in plain words what is wrong when the remote job fails (<Kind>)' -TestCases @(
+        @{ Kind = 'Denied'; Body = { throw 'Access is denied.' }; Text = '*no right on aadc*' }
+        @{ Kind = 'Failed'; Body = { throw 'Something else happened.' }; Text = '*could not be checked on aadc: Something else happened*' }) {
+        param($Kind, $Body, $Text)
+        $global:PcmProbeJob = $Body
+        Mock Invoke-Command -ModuleName PRA.Cloud { Start-Job -ScriptBlock $global:PcmProbeJob }
+        $answer = Test-PcmSyncServer -Server 'aadc'
+        Remove-Variable -Name PcmProbeJob -Scope Global
+        $answer.Ok | Should -BeFalse
+        $answer.Kind | Should -BeExactly $Kind
+        $answer.Reason | Should -BeLike $Text
+        @(Get-Job).Count | Should -Be 0
+    }
+
     It 'treats an empty answer as a failure' {
-        Mock Invoke-Command -ModuleName PRA.Cloud { $null }
+        Mock Invoke-Command -ModuleName PRA.Cloud { Start-Job -ScriptBlock { } }
         $answer = Test-PcmSyncServer -Server 'aadc'
         $answer.Ok | Should -BeFalse
         $answer.Kind | Should -BeExactly 'Failed'
+    }
+
+    It 'stops a remote job that does not answer in time, and says so in plain words' {
+        Mock Invoke-Command -ModuleName PRA.Cloud { Start-Job -ScriptBlock { Start-Sleep -Seconds 120 } }
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $answer = Test-PcmSyncServer -Server 'aadc' -TimeoutSeconds 5
+        $watch.Stop()
+        $answer.Ok | Should -BeFalse
+        $answer.Kind | Should -BeExactly 'Unreachable'
+        $answer.Reason | Should -BeLike 'aadc does not answer to PowerShell remoting (WinRM, port 5985) within 5 seconds*'
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 60
+        @(Get-Job).Count | Should -Be 0
+    }
+
+    It 'only reads: the probe holds no command that changes or starts anything' {
+        $probe = & (Get-Module PRA.Cloud) { $script:PcmSyncProbe.ToString() }
+        $probe | Should -Match 'Get-ADSyncScheduler'
+        $probe | Should -Not -Match '(?i)\b(Set|Start|Invoke|Add|Remove|New|Stop|Suspend|Resume|Disable|Enable)-ADSync'
+        $probe | Should -Not -Match '(?i)\b(Set|Start|Stop|Remove|New|Restart)-(Service|Item|Content)\b'
     }
 }
 
@@ -286,6 +331,19 @@ Describe 'Retry-After of a direct Graph request' {
         $global:PcmGraphFailures.Enqueue((New-PcmThrottleFailure -Code 429 -RetryAfter '900'))
         $null = Invoke-PcmGraph -Uri 'v1.0/users/x'
         @($global:PcmSlept) | Should -Be @(120)
+    }
+
+    It 'says in the log that Microsoft Graph asks to wait, when the answer makes the tool wait longer than the usual pause' {
+        $global:PcmLogged = [System.Collections.Generic.List[string]]::new()
+        Mock Write-PcmLog -ModuleName PRA.Cloud { $global:PcmLogged.Add([string]$Message) }
+        & (Get-Module PRA.Cloud) { $script:GraphRequestOwner = @{} }
+        try {
+            $global:PcmGraphFailures.Enqueue((New-PcmThrottleFailure -Code 429 -RetryAfter '17'))
+            $global:PcmGraphFailures.Enqueue((New-PcmThrottleFailure -Code 429 -RetryAfter '2'))
+            $null = Invoke-PcmGraph -Uri 'v1.0/users/x'
+        } finally { & (Get-Module PRA.Cloud) { $script:GraphRequestOwner = $null } }
+        @($global:PcmLogged) | Should -Be @('Microsoft Graph asks to wait 17 s')
+        Remove-Variable -Name PcmLogged -Scope Global
     }
 
     It 'does not send a request again that must not be resent' {
