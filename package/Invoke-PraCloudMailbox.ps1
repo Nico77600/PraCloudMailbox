@@ -1293,19 +1293,19 @@ function Confirm-PcmSnapshotHash {
 
 function Assert-PcmSameEnvironment {
     <# Refuses a snapshot or a batch made for another Environment than the one of the configuration (letter case ignored). A record that holds no Environment is accepted. #>
-    param([Parameter(Mandatory)][string]$What, [AllowNull()][object]$Recorded)
-    $recorded = [string]$Recorded
+    param([Parameter(Mandatory)][string]$What, [AllowNull()][object]$Found)
+    $madeFor = [string]$Found
     $expected = [string]$context.Config.Environment
-    if (-not $recorded -or (Test-PcmSameText $recorded $expected)) { return }
+    if (-not $madeFor -or (Test-PcmSameText $madeFor $expected)) { return }
     $context.NoChangeMade = $true; $context.CurrentIdentity = ''
-    throw ("{0} was made for Environment '{1}' and the configuration says '{2}'. Nothing was changed. Run the command with the configuration of Environment '{1}'{3}." -f $What, $recorded, $expected, $(if ($What -like 'Snapshot*') { ', or run Collect again with this configuration' } else { '' }))
+    throw ("{0} was made for Environment '{1}' and the configuration says '{2}'. Nothing was changed. Run the command with the configuration of Environment '{1}'{3}." -f $What, $madeFor, $expected, $(if ($What -like 'Snapshot*') { ', or run Collect again with this configuration' } else { '' }))
 }
 
 function Assert-PcmBatchOwner {
     <# Refuses a batch made for another Environment or in another tenant than the ones of the configuration. A batch of an earlier version holds no tenant: it is accepted. #>
     param([Parameter(Mandatory)][object]$Row)
     $what = 'Batch {0}' -f (Get-PcmValue $Row 'id' '')
-    Assert-PcmSameEnvironment -What $what -Recorded (Get-PcmValue $Row 'environment' '')
+    Assert-PcmSameEnvironment -What $what -Found (Get-PcmValue $Row 'environment' '')
     $tenant = [string](Get-PcmValue $Row 'tenant_id' '')
     $expected = [string](Get-PcmValue (Get-PcmValue $context.Config 'Cloud' @{}) 'TenantId' '')
     if (-not $tenant) { Write-PcmLog -Context $context -Message ('{0} was made before batches kept their tenant: the tenant of the batch is not checked.' -f $what) -Level Detail; return }
@@ -1339,7 +1339,7 @@ function Read-PcmSnapshotData {
                 else { "No complete snapshot in $($config.Store.Path): run Collect -Mode Apply (it reads Exchange.Server) or copy the snapshot database here." })
         }
         if ($snap.status -ne 'Complete') { throw "Snapshot $($snap.id) is $($snap.status), not Complete." }
-        Assert-PcmSameEnvironment -What ('Snapshot {0}' -f $snap.id) -Recorded (Get-PcmValue $snap 'environment' '')
+        if (-not $Batch) { Assert-PcmSameEnvironment -What ('Snapshot {0}' -f $snap.id) -Found (Get-PcmValue $snap 'environment' '') }
         $records = @(Read-PcmTable $connection mailbox $snap.id)
         $permissions = @(Read-PcmTable $connection permission $snap.id)
         $members = @(Read-PcmTable $connection group_member $snap.id)
