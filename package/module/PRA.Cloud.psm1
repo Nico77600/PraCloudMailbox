@@ -2425,6 +2425,39 @@ function Enable-PcmResourceBooking {
     Assert-PcmResourceCalendar -Parameters $Calendar -Fields @($Calendar.Keys | Where-Object { $_ -notin @('Identity','ErrorAction') })
 }
 
+function ConvertTo-PcmExoDateText {
+    <#
+    Exchange Online reads a text in the form of an ISO 8601 date and time with seconds (2025-01-31T00:00:00Z, with or without a fraction, a Z or an offset) as a date, and stores it as
+    month/day/year hours:minutes:seconds in UTC. Answers the text that Exchange Online keeps for such a value, or $null for any other text, which it keeps as it is.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    if ($Text -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})?$') { return $null }
+    $parsed = [datetimeoffset]::MinValue
+    if (-not [datetimeoffset]::TryParse($Text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) { return $null }
+    return $parsed.UtcDateTime.ToString('MM/dd/yyyy HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Test-PcmResourceTextRestored {
+    <# Is the text that Exchange Online reads back the text that was written? A date and time in the ISO 8601 form is read back in the form that Exchange Online keeps for it. #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([AllowNull()][AllowEmptyString()][string]$Wanted, [AllowNull()][AllowEmptyString()][string]$Actual)
+    if ($Actual -ieq $Wanted) { return $true }
+    $kept = ConvertTo-PcmExoDateText -Text $Wanted
+    return ($null -ne $kept -and $Actual -ieq $kept)
+}
+
+function Add-PcmExoDateWarning {
+    <# Tells the operator that Exchange Online keeps a date-like text of the resource in its own form. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Name, [AllowNull()][AllowEmptyString()][string]$Text)
+    $kept = ConvertTo-PcmExoDateText -Text $Text
+    if ($null -eq $kept) { return }
+    Add-PcmModuleWarning -Warning @(('Exchange Online keeps {0} of a resource, written as {1}, in the form of a date: {2} (UTC). It reads every text of the form of an ISO 8601 date and time that way.' -f $Name, $Text, $kept))
+}
+
 function Set-PcmResourceConfiguration {
     param([object]$Record, [object]$Owned, [object]$Intent)
     $settings = Read-PcmResourceSettings $Record
@@ -2435,7 +2468,10 @@ function Set-PcmResourceConfiguration {
     if ($attributes) {
         $custom = $attributes | ConvertFrom-PcmJson
         foreach ($property in $custom.PSObject.Properties) {
-            if ($property.Name -match '^CustomAttribute([1-9]|1[0-5])$' -and $property.Name -ne [string]$Intent.markerAttribute) { $parameters[$property.Name] = [string]$property.Value }
+            if ($property.Name -match '^CustomAttribute([1-9]|1[0-5])$' -and $property.Name -ne [string]$Intent.markerAttribute) {
+                $parameters[$property.Name] = [string]$property.Value
+                Add-PcmExoDateWarning -Name $property.Name -Text ([string]$property.Value)
+            }
         }
     }
     foreach ($field in $script:ResourceDeliveryFields) {
@@ -2453,9 +2489,10 @@ function Set-PcmResourceConfiguration {
     Set-User @directory
     $actualUser = Get-User -Identity $Owned.Id -ErrorAction Stop
     foreach ($field in $script:ResourceDirectoryFields) {
-        if (-not $actualUser.PSObject.Properties[$field] -or [string]$actualUser.$field -ine [string]$settings.Directory.$field) {
+        if (-not $actualUser.PSObject.Properties[$field] -or -not (Test-PcmResourceTextRestored -Wanted ([string]$settings.Directory.$field) -Actual ([string]$actualUser.$field))) {
             throw "Resource descriptive property verification failed: $field."
         }
+        if ([string]$actualUser.$field -ne [string]$settings.Directory.$field) { Add-PcmExoDateWarning -Name $field -Text ([string]$settings.Directory.$field) }
     }
     $calendar = @{ Identity = $Owned.Id; ErrorAction = 'Stop' }
     $fields = @($script:ResourceCalendarFields | Where-Object { $settings.Calendar.PSObject.Properties[$_] })
