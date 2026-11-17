@@ -135,10 +135,15 @@ function ConvertTo-PcmGuiNativeArgument {
 }
 
 function ConvertTo-PcmGuiShownArgument {
-    <# A value as an operator would type it: bare when it is plain, between double quotes otherwise. #>
+    <#
+    A value as an operator would type it: bare when it is plain, otherwise a single-quoted PowerShell literal, which PowerShell never expands (no sub-expression, no variable, no
+    escape): the apostrophe AND the typographic quotes that PowerShell also reads as quotes are doubled.
+    #>
     param([AllowEmptyString()][string]$Value)
-    if ($Value -match '^[A-Za-z0-9_.:@\\/-]+$') { return $Value }
-    return '"' + $Value.Replace('"', '""') + '"'
+    if ($Value -match '^[A-Za-z0-9_.:\\/][A-Za-z0-9_.:@\\/-]*\z') { return $Value }
+    $escaped = $Value.Replace("'", "''")
+    foreach ($code in @(0x2018, 0x2019, 0x201A, 0x201B)) { $quote = [string][char]$code; $escaped = $escaped.Replace($quote, $quote + $quote) }
+    return "'" + $escaped + "'"
 }
 
 function Get-PcmGuiEngine {
@@ -176,15 +181,18 @@ function Get-PcmGuiCommand {
     if (-not $Engine) { $Engine = (Get-PcmGuiEngine).Path }
     $mode = if ($Request.Contains('Mode') -and $Request.Mode) { [string]$Request.Mode } else { 'Preview' }
     $options = [Collections.Generic.List[string]]::new()
-    $options.Add('-Action'); $options.Add($action)
-    if ($action -ne 'Check') { $options.Add('-Mode'); $options.Add($mode) }
-    if ($Request.Contains('Scope') -and $Request.Scope -and -not (Test-PcmGuiOrdinal $Request.Scope 'All')) { $options.Add('-Scope'); $options.Add([string]$Request.Scope) }
-    foreach ($name in @('Batch', 'Identity', 'CsvPath', 'SearchBase', 'Group')) { if ($Request.Contains($name) -and $Request[$name]) { $options.Add('-' + $name); $options.Add([string]$Request[$name]) } }
-    if ($Request.Contains('MaxObjects') -and [int]$Request.MaxObjects -gt 0) { $options.Add('-MaxObjects'); $options.Add([string][int]$Request.MaxObjects) }
-    if ($Request.Contains('Snapshot') -and [long]$Request.Snapshot -gt 0) { $options.Add('-Snapshot'); $options.Add([string][long]$Request.Snapshot) }
-    if ($Request.Contains('Expect') -and $Request.Expect) { $options.Add('-Expect'); $options.Add([string]$Request.Expect) }
-    if ($Request.Contains('Once') -and [bool]$Request.Once) { $options.Add('-Once') }
-    if ($Request.Contains('ResolveOnly') -and [bool]$Request.ResolveOnly) { $options.Add('-ResolveOnly') }
+    # The names of the options are shown as they are; every value goes through ConvertTo-PcmGuiShownArgument.
+    $optionNames = [Collections.Generic.HashSet[int]]::new()
+    $addName = { param([string]$Text) [void]$optionNames.Add($options.Count); $options.Add($Text) }
+    & $addName '-Action'; $options.Add($action)
+    if ($action -ne 'Check') { & $addName '-Mode'; $options.Add($mode) }
+    if ($Request.Contains('Scope') -and $Request.Scope -and -not (Test-PcmGuiOrdinal $Request.Scope 'All')) { & $addName '-Scope'; $options.Add([string]$Request.Scope) }
+    foreach ($name in @('Batch', 'Identity', 'CsvPath', 'SearchBase', 'Group')) { if ($Request.Contains($name) -and $Request[$name]) { & $addName ('-' + $name); $options.Add([string]$Request[$name]) } }
+    if ($Request.Contains('MaxObjects') -and [int]$Request.MaxObjects -gt 0) { & $addName '-MaxObjects'; $options.Add([string][int]$Request.MaxObjects) }
+    if ($Request.Contains('Snapshot') -and [long]$Request.Snapshot -gt 0) { & $addName '-Snapshot'; $options.Add([string][long]$Request.Snapshot) }
+    if ($Request.Contains('Expect') -and $Request.Expect) { & $addName '-Expect'; $options.Add([string]$Request.Expect) }
+    if ($Request.Contains('Once') -and [bool]$Request.Once) { & $addName '-Once' }
+    if ($Request.Contains('ResolveOnly') -and [bool]$Request.ResolveOnly) { & $addName '-ResolveOnly' }
     $tokens = [Collections.Generic.List[string]]::new()
     foreach ($token in @('-NoProfile', '-STA', '-File', $ScriptPath)) { $tokens.Add($token) }
     foreach ($token in $options) { $tokens.Add($token) }
@@ -194,7 +202,7 @@ function Get-PcmGuiCommand {
     # As an operator would type it in the package folder: the script as .\Invoke-PraCloudMailbox.ps1, the original configuration file only when it is not the default one.
     $shown = [Collections.Generic.List[string]]::new()
     $shown.Add('.\Invoke-PraCloudMailbox.ps1')
-    foreach ($token in $options) { $shown.Add((ConvertTo-PcmGuiShownArgument $token)) }
+    for ($i = 0; $i -lt $options.Count; $i++) { $shown.Add($(if ($optionNames.Contains($i)) { $options[$i] } else { ConvertTo-PcmGuiShownArgument $options[$i] })) }
     $shownConfig = if ($BaseConfigPath) { $BaseConfigPath } else { $ConfigPath }
     $defaultConfig = Join-Path $Root 'config\PraCloudMailbox.config.psd1'
     if (-not (Test-PcmGuiSamePath $shownConfig $defaultConfig)) { $shown.Add('-ConfigPath'); $shown.Add((ConvertTo-PcmGuiShownArgument $shownConfig)) }
@@ -235,7 +243,7 @@ function Read-PcmGuiEvents {
     $events = [Collections.Generic.List[object]]::new()
     foreach ($line in $text.Split([char]10)) {
         if (-not $line.Trim()) { continue }
-        try { $events.Add(($line | ConvertFrom-Json)) } catch { $events.Add([pscustomobject]@{ kind = 'item'; status = 'Info'; text = $line.Trim(); identity = '' }) }
+        try { $events.Add(($line | ConvertFrom-PcmJson)) } catch { $events.Add([pscustomobject]@{ kind = 'item'; status = 'Info'; text = $line.Trim(); identity = '' }) }
     }
     return [pscustomobject]@{ Events = $events.ToArray(); Position = $Position + $last + 1; HasPartial = $partial }
 }
@@ -458,7 +466,7 @@ function Write-PcmGuiWave {
     <# The objects ticked for a wave, as the CSV given to -CsvPath: a column Identity (the object ID) and a column Name for the reader. #>
     param([Parameter(Mandatory)][string]$Folder, [Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][object[]]$Rows)
     $null = New-Item -ItemType Directory -Path $Folder -Force
-    $path = Join-Path $Folder ('wave-{0}-{1}.csv' -f $Name, (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+    $path = Join-Path $Folder ('wave-{0}-{1}.csv' -f $Name, (Get-Date).ToString('yyyyMMdd-HHmmss-fff', [Globalization.CultureInfo]::InvariantCulture))
     $lines = [Collections.Generic.List[string]]::new()
     $lines.Add('Identity,Name')
     foreach ($row in $Rows) { $lines.Add(('{0},"{1}"' -f $row.Guid, ([string]$row.Name).Replace('"', "'"))) }
@@ -603,7 +611,7 @@ function Get-PcmGuiSnapshotFact {
         $connection = Open-PcmStore -Path $State.Config.Store.Path -Root $State.Root -ReadOnly
         try {
             $row = @(Invoke-PcmSql $connection 'SELECT email_addresses_json, recipient_type_details, organizational_unit FROM mailbox WHERE snapshot_id = @id AND object_guid = @g COLLATE NOCASE' @{ id = [long]$State.Snapshot.id; g = [string]$match.object_guid } -As Rows) | Select-Object -First 1
-            if ($row -and $row.email_addresses_json) { foreach ($address in @($row.email_addresses_json | ConvertFrom-Json)) { foreach ($one in @($address)) { $lines.Add(([string]$one -replace '^smtp:', 'SMTP ')) } } }
+            if ($row -and $row.email_addresses_json) { foreach ($address in @($row.email_addresses_json | ConvertFrom-PcmJson)) { foreach ($one in @($address)) { $lines.Add(([string]$one -replace '^smtp:', 'SMTP ')) } } }
             else { $lines.Add('SMTP ' + [string]$match.primary_smtp_address) }
             $lines.Add('Mailbox type: ' + $(if ($row -and $row.recipient_type_details) { [string]$row.recipient_type_details } else { ([string]$match.kind).ToLowerInvariant() }))
             if ($row -and $row.organizational_unit) { $lines.Add('OU: ' + [string]$row.organizational_unit) }
@@ -614,10 +622,10 @@ function Get-PcmGuiSnapshotFact {
 #endregion
 
 # SIG # Begin signature block
-# MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDcPZ3mZUXkoFFL
-# 71+CWtw87dfnMYZN6rYCV6GyfCahxaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDMEebhLj0OzHLx
+# yFyTZUQ5KGM2EQpLrYi4jPIqySaS+6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -689,28 +697,28 @@ function Get-PcmGuiSnapshotFact {
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYEjCCGA4CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBKTOWXKq/p
-# tXDaRsUJhMuX8M2pRQ2IBeKMH1AwfuTSoTANBgkqhkiG9w0BAQEFAASCAgCCfE9j
-# Ly5YNEoko02AIsIEfxUbAJKOuftL62HZXkOznB4bNACqGjNH0pC9uKRNySVDC84X
-# bAPRkasMBrnF6oWGBugP5vxwTUgIxOHkop/eWdAGWkZr5Xdvi60Q74/Dy8u817yw
-# bV/Yqi64yeoLfw9crsEWmzJdwtyjwRWdMSxmu5ZkDVFwOGUvSCPiWGVnM/Z24g4o
-# 6MBJsV9FxUL38aInloD5+dlmzNqSMmx7U9Z6k/OZ+yLV8u4fobKf5NZJcQGgdoBf
-# cQUtBKGzmDALtk0GmPdNFwlkILaIgkrBmuAxTuwFmTC/zcuvapBmtfpd4Nfu9ldT
-# NzASkN8fLNonaow7OFOOZYHx+h4EDmKgV1ACfhB5JJHF2lZnLBRhhq4OuegdKRfP
-# zuz6R6WRXerHoroFi+k4R7mhy8ZyY9qQU1OkYRHaTvg76oRmu7d9J/+OQRRxZOWN
-# 6JEd/ePmOTyeLPhu87JRW0lRwfUODUmGDZRt8sP2Z1Yd1kmfGu58ZxisMYjdyWYR
-# /vpBTvFuGYqM68/qJUOmNtF/X/WJnS6rXBViyz7aEhZWvQMTWGxdqZmzvlHNTsft
-# Ws17+7ELStFNr2U16unZF93KnWr3GLbgmVoBsaQWzaLFAB1Uv/9Wbv0M051+KSNn
-# rbpDpXjojFlSiRzSNfAxrFQt+tkbciy1NkHI/qGCFM8wghTLBgorBgEEAYI3AwMB
-# MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDApUC2kuMq
+# W9oxTeIp87+sLCt/T6TZ3AxrHKWSCagbIDANBgkqhkiG9w0BAQEFAASCAgB8SXRk
+# H7EoSdnWqRZUcucS0ZknP7+TiZX4TY+LtDV/LiQFFYMSjJLNrSc5tcY/J2zS/2Bj
+# x/jdtrXDas2k3hjfcCjlpb//XvasrO+3freEbYjdIu70l9EkkkLB2hjxwGApxgtp
+# h+sDGQ6f0XNg5x/HRe5hbf5PnFULKdqg6aSpGgQ7D4/nqOdymdEdOIqyCNy8Bsgc
+# u/tVepYtTZa7Z8Zz+yTiMIiqGmGLT/0tgiU+Qd2E7+z7CjrLmkR6UeagVlrO7YQU
+# hcRayHg1feAYh6Nnf9DNcQEsesvmFfU/OcyQNUl7rey2sEXQ8ghUJADK9aFb55Du
+# 6AqoSqbY2hndr8cj1+C4SqF9l+XMyuKKA1ivgIcrg5ZsWaZ5mloACSoR/tZo23NI
+# 2hc6PthhfK9EtJowNjuA7MkiX4Me9jhXrgTOWmmpfX/fJ8Y8IwIacg2Phk/Y0tR4
+# 99G5cuFfRGtVCtaPkbxhXtHaL71HJdpJPRv372OjDoCjbOlbv16vQi00qMG12tBY
+# +ewz/qgZoUbkZ1B5BxFoJ6VCpM4Nlm4wwKxmw7VvrrFo+bktiD73Q1lrQEG05UZW
+# THm5zECcq31IGQMoE2R3XvUyPT8ZdC6YrWPcK5Kw1CoghIjC6tXbgv7svP0XL4G6
+# 9SSungs9FZMJyZ6U+b4oxxGZNLnPFRPcGlJw0qGCFM4wghTKBgorBgEEAYI3AwMB
+# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIDvT2LxdrV5HVNBgG23xULfjQiAeKeMbUj9sQulE0LxPAggcmoNm/anW
-# bhgPMjAyNjExMTUyMDA2MjhaMAMCAQECEGcpTryD/RksDIfp8citrzygghGnMIIE
+# BAIBBQAEIEVQBLJXCcaXKKAUk0pPm5CAejcFfOXhZ4/8dNiS3VQcAghXHHUQsMPD
+# JBgPMjAyNjExMTcxODM5MjNaMAMCAQECEDE0579c6PzwLq68uTCe1C2gghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -805,17 +813,17 @@ function Get-PcmGuiSnapshotFact {
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlcwggJTAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNTIwMDYyOFowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIGzB
-# RlSM4bPft519lvavyP2SKiDuS/57HQkDX+YH2QCsMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNzE4MzkyM1owKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEINOg
+# ktoRnZl8td5/q3qz5uR1Qcwvm+DeV3B4bxYw+mYHMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIESDBGAiEAqxTVvaimhc/HhObmZTxYRcZ4qrnlYGhU3GVcrurIz4QCIQDI
-# opuLWBHMo09ldrDUJxku53Pr1W9MD8/81YGMHyY+gQ==
+# zj0EAwIERzBFAiEA2QdqJmIXgDBWGgxxMqIMQvVS41oblnzikuTC72/QbYQCIDXN
+# 5BdpnYsR1rL/UzjTjYcJKeylkSKarCSh4/lTc/7U
 # SIG # End signature block

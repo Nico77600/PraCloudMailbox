@@ -21,7 +21,8 @@
     "tests/PraLegacyFixtures.Tests.ps1",
     "tests/PraCloudMailbox.Coexistence.Tests.ps1",
     "tests/PraCloudMailbox.Documentation.Tests.ps1",
-    "tests/PraCloudMailbox.Console.Tests.ps1"
+    "tests/PraCloudMailbox.Console.Tests.ps1",
+    "tests/PraCloudMailbox.Invariants.Tests.ps1"
   ],
   "packageBuilder": "tools/New-PraCloudPackage.ps1",
   "packageEntry": "Invoke-PraCloudMailbox.ps1"

@@ -16,7 +16,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.1.0
+    Version : 2.1.1
 #>
 #Requires -Version 7.5
 Set-StrictMode -Version Latest
@@ -126,6 +126,7 @@ $script:Tables = @('mailbox','permission','group_member','contact','distribution
 # a run interrupted (session cut, reboot) is resumed with the same -Batch.
 $script:JournalSchemaVersion = 3
 # Journal schema 3 adds snapshot_run_id and snapshot_hash to batch (the snapshot a batch was made from, by its run and by its content) and an index on batch_item (object_guid); older journals stay readable.
+# The column tenant_id of batch (the tenant a batch was made in) is added to a journal that lacks it, without a change of the schema version: a journal without it is read as a batch of no known tenant.
 $script:JournalSchema = @(
     'CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)'
     @'
@@ -133,7 +134,7 @@ CREATE TABLE IF NOT EXISTS batch (
     id TEXT PRIMARY KEY, action TEXT NOT NULL CHECK (action IN ('Convert','Recover')), convert_batch TEXT,
     status TEXT NOT NULL CHECK (status IN ('Running','Complete','Partial','Failed')),
     created_utc TEXT NOT NULL, updated_utc TEXT, snapshot_id INTEGER, environment TEXT, computer TEXT, account TEXT,
-    tool_version TEXT, scope_json TEXT, counts_json TEXT, note TEXT, snapshot_run_id TEXT, snapshot_hash TEXT)
+    tool_version TEXT, scope_json TEXT, counts_json TEXT, note TEXT, snapshot_run_id TEXT, snapshot_hash TEXT, tenant_id TEXT)
 '@
     @'
 CREATE TABLE IF NOT EXISTS batch_item (
@@ -229,7 +230,7 @@ function Open-PcmStore {
                 }
             } else {
                 $columns = @(Invoke-PcmSql $connection 'PRAGMA table_info(batch)' -As Rows | ForEach-Object { [string]$_.name })
-                foreach ($column in @('snapshot_run_id', 'snapshot_hash')) {
+                foreach ($column in @('snapshot_run_id', 'snapshot_hash', 'tenant_id')) {
                     if ($column -notin $columns) { $null = Invoke-PcmSql $connection ('ALTER TABLE batch ADD COLUMN {0} TEXT' -f $column) }
                 }
             }
@@ -689,11 +690,11 @@ function New-PcmBatch {
     $id = New-PcmBatchId
     if (-not $PSCmdlet.ShouldProcess("batch $id", "New $Action batch")) { return '' }
     $null = Invoke-PcmSql $Connection @'
-INSERT INTO batch (id, action, convert_batch, status, created_utc, updated_utc, snapshot_id, environment, computer, account, tool_version, scope_json, snapshot_run_id, snapshot_hash)
-VALUES (@id, @action, @convert, 'Running', @now, @now, @snapshot, @environment, @computer, @account, @tool, @scope, @run, @hash)
+INSERT INTO batch (id, action, convert_batch, status, created_utc, updated_utc, snapshot_id, environment, computer, account, tool_version, scope_json, snapshot_run_id, snapshot_hash, tenant_id)
+VALUES (@id, @action, @convert, 'Running', @now, @now, @snapshot, @environment, @computer, @account, @tool, @scope, @run, @hash, @tenant)
 '@ @{ id = $id; action = $Action; convert = [string]$Info['ConvertBatch']; now = [datetime]::UtcNow; snapshot = $Info['SnapshotId']
         environment = [string]$Info['Environment']; computer = $env:COMPUTERNAME; account = [string]$Info['Account']; tool = [string]$Info['ToolVersion']
-        scope = [string]$Info['ScopeJson']; run = [string]$Info['SnapshotRunId']; hash = [string]$Info['SnapshotHash'] }
+        scope = [string]$Info['ScopeJson']; run = [string]$Info['SnapshotRunId']; hash = [string]$Info['SnapshotHash']; tenant = [string]$Info['TenantId'] }
     return $id
 }
 
@@ -830,10 +831,10 @@ Export-ModuleMember -Function Import-PcmSqlite, Open-PcmStore, Close-PcmStore, I
     New-PcmBatch, Set-PcmBatch, Get-PcmBatch, Set-PcmBatchItem, Get-PcmBatchItem, Add-PcmBatchEvent, Set-PcmTenantChange, Get-PcmTenantChange, Add-PcmBatchRun, Get-PcmBatchHistory
 
 # SIG # Begin signature block
-# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDX2WGjsxrXj08p
-# 0dsmyY66hhgVo2wcZt9V2dY9m21xZaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDhqMo/2CXRuF71
+# P4C85LYlauaBWQ7cfXHKFhXJOlcfOKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -905,28 +906,28 @@ Export-ModuleMember -Function Import-PcmSqlite, Open-PcmStore, Close-PcmStore, I
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYEjCCGA4CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCC5wIEk2kIy
-# JRYSL2JqnAhFJnbwFVdQAAlScPi8K4A0DzANBgkqhkiG9w0BAQEFAASCAgCXB5f1
-# 2lwRDBJpm0kCq20KGC8rHcdpEXPTIjduf456c/9cWTZUYNw+jxqFUSF+/DfJt14/
-# Uf0ElRJsnbCX3FFFdrFR23Ynm4NiGHvs1O32gCr5hVl9CNx0cUr37P3701SRFlND
-# f9Lykv4Uq0O40q9S4jtKtRsQyBJfYJ1nU68iqqNkw4rv9aujT5pgUNrqEKYpnJe9
-# eBuYAjA8/7iJDFH98T83rqU6xYkz8S8ddc1X0N1yASiJIgkzb4nbgbXFYcR1hT3L
-# LNNYXe13uUf47ZPO8BER7X8DxVZ2XEtNHefrJ5jrq3re5fXNn39G7lJl15T+FQtr
-# 8o7jqgik1/LoRF5AsbUyB+RjP8cWRH9dmhIc7SGeW6NEEhkqy5rnus/NYg02QsnR
-# 3y8tEIGXsDgh9R+mKRZhjVmpL5bqQH7OBejyBFgs1/JNib210s5h4O1mtVqBpBkn
-# UuAlaYUjtcD5Fp3K9FRawYpy/Cc7qX3GeWRNT31Ue7IdGNnkrZL2LOQCN2/7fqBw
-# mLyuE+1wpscc1i3jH89rIIXJ6d6tqxsRVUnpJ5627MydfsUQEemB4gSTEYNaVw70
-# dmjF8sgJIUiQ/rhQQlb3wVtCUkPwyNGJXKIUpFGGLUyqEpD+UGjueaeuV/OdM28j
-# gRw9BfaHj0ARoaEp9PZAwcK/kgqm01qNpWNEt6GCFM4wghTKBgorBgEEAYI3AwMB
-# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDdP2/1mvZq
+# 8Cu/EJ6tQCacaqXtJzxBkR6s8UBqFsdF1zANBgkqhkiG9w0BAQEFAASCAgBkxIAJ
+# aXnA8NcyUKQzHMuk2MzBTOXh2edGZrvoeGKrSJ4Dw0Fv/7NPDWnCVJjAwPPqGuis
+# 6hd0nSKrj00Wc6HtPyQ5QlvZJIDkComjTen6iAzXppiac1glFxEmFOlZIj/bthoZ
+# 4r5IlNFl8VGj2n6vufeVCBTVBATdGGawhhMhTlfs+M1ueZ8hba0Yfqjz+SmXNkr/
+# m832dzuFuUyKyFEq80nQgEBExRgZn2Ois+qmUnacFkk8LRkAkilIkmmmDik3bpiL
+# Y2ycc/QE/wZckzJ266uxE3XejlggZ1vGBlJPNF1moGhBSpHMz+UQI6JnB5BVbvx3
+# zCZzejoFHMK1z/ya3paNKq3FWBFAgJTODo6FpLdc7jxC2alefliNX+RFx0zWiG+6
+# icj8D/qesCYm7rUgle4U/pYdbg/43gvz7Yms8W0PY7PcVzsL7GjMpDQ1plt8VmWP
+# fqlscRwheO5ASYmIqPITrGYID5BKbAoc2SVYrCLg00hHVtHYVFCNt6rLQ1y7reOH
+# O4+jjJQ9es8ZZPM8R7YTZaacSPHeuOn+LtIwWrV1DvXO6JWsJPIu5EHKMaYE5zJh
+# PTxu2AFyInSiLlqHEJeaiYAKGx1dgPhWMMpXXez9FqEfU0MWu0UBIBLs5NteGgYP
+# d+AS6f3HhWGns4N/QudtYFoLBiJhEoR4pF+djKGCFM8wghTLBgorBgEEAYI3AwMB
+# MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEICDfaTrkwVMmqeeA+pCAOaNdDZnK5bYqBemUX5qloUMdAggap78/SksI
-# JBgPMjAyNjExMTUyMDA2NDJaMAMCAQECEDMFP+ie/TKRkbNfaPa23u2gghGnMIIE
+# BAIBBQAEIM+ZorqVX/7AMiMMVRedjgazZ97rEAbVsY25Nhe7izMoAggKzd0j1gtX
+# ABgPMjAyNjExMTcxODM5MzVaMAMCAQECEGkQxCbH4Q9PtY+seUSsxLqgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -1021,17 +1022,17 @@ Export-ModuleMember -Function Import-PcmSqlite, Open-PcmStore, Close-PcmStore, I
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlcwggJTAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNTIwMDY0MlowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIKJ8
-# jGR5D1hsLQvof9U+ZGE/yr7x3QE9hyQYKzZCEY2gMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNzE4MzkzNVowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIPm2
+# Z1ZV7eyKMZRn2SniMSuWCnidr7w/7cKShFKkBJ5cMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiEAgjblT769UokVphf80VA6+REJqQIab06UVHx63Nk/h6kCIHLz
-# khA/0PdVEY3y46gppgwdTFMWdE5iRtM7Wu1KDpD/
+# zj0EAwIESDBGAiEAj+geOgQ8PytyXv6mwMYbv+r1lyuyzXgVU8IsIwWDvkkCIQDO
+# XT10h5gwDdzsc5D/iRaeYeHAxXP0A1tzzZX+wOTclw==
 # SIG # End signature block

@@ -120,12 +120,12 @@ Describe 'Call time limit: Microsoft Graph' {
     BeforeAll {
         function global:Connect-MgGraph { [CmdletBinding()] param($ClientId, $TenantId, $CertificateThumbprint, $ContextScope, [switch]$NoWelcome, $Scopes) }
         function global:Disconnect-MgGraph { [CmdletBinding()] param() }
-        function global:Connect-ExchangeOnline { [CmdletBinding()] param($AppId, $CertificateThumbprint, $Organization, $ShowBanner, $CommandName, $UserPrincipalName, [switch]$DisableWAM) }
-        function global:Disconnect-ExchangeOnline { [CmdletBinding(SupportsShouldProcess)] param() }
+        . (Join-Path $PSScriptRoot 'ExoSession.Fake.ps1')
         function global:Invoke-MgGraphRequest { [CmdletBinding()] param([string]$Method = 'GET', [string]$Uri, [object]$Body, [string]$ContentType, [string]$OutputType, [System.Collections.IDictionary]$Headers) }
     }
     AfterAll {
-        foreach ($name in 'Connect-MgGraph', 'Disconnect-MgGraph', 'Invoke-MgGraphRequest', 'Connect-ExchangeOnline', 'Disconnect-ExchangeOnline') { Remove-Item -Path "Function:\$name" -ErrorAction SilentlyContinue }
+        Remove-PraFakeExoSession
+        foreach ($name in 'Connect-MgGraph', 'Disconnect-MgGraph', 'Invoke-MgGraphRequest') { Remove-Item -Path "Function:\$name" -ErrorAction SilentlyContinue }
     }
     BeforeEach {
         Reset-PraFakeGraphTransport
@@ -139,7 +139,8 @@ Describe 'Call time limit: Microsoft Graph' {
             Approval = { param($Target, $Operation) $true } }
         Mock Import-Module -ModuleName PRA.Cloud { }
         Mock Get-ChildItem -ModuleName PRA.Cloud { [pscustomobject]@{ HasPrivateKey = $true; NotAfter = (Get-Date).AddYears(1) } }
-        Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { }
+        Reset-PraFakeExoSession
+        Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { $null = Add-PraFakeExoConnection -TenantId $Organization -AppId $AppId }
         Mock Connect-MgGraph -ModuleName PRA.Cloud { $global:PraFakeGraphAuth = [pscustomobject]@{ ClientId = $ClientId } }
         Mock Disconnect-MgGraph -ModuleName PRA.Cloud { $global:PraFakeGraphAuth = $null }
         & (Get-Module PRA.Cloud) { $script:GraphRequestOwner = $null; $script:GraphTransportReady = $false }

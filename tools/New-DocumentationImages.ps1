@@ -33,7 +33,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.1.0  (from Web Services Client for Exchange 1.0.0)
+    Version : 2.1.1  (from Web Services Client for Exchange 1.0.0)
     Part of : PRA Cloud Mailbox (repository tool, not in the package)
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '', Justification = 'The in-memory tenant of the tests lives in global variables.')]
@@ -127,6 +127,10 @@ function Invoke-PcmEntraConnect {
     param([hashtable]$Context, [string]$Operation, [object]$Caller)
     $null = Invoke-PraFakeEntraConnect -Operation $Operation
     @{ Pause = 'SyncCycleEnabled=False InProgress=False'; Resume = 'SyncCycleEnabled=True InProgress=False'; Delta = 'SyncCycleEnabled=True InProgress=False' }[$Operation]
+}
+function Test-PcmSyncServer {
+    param([string]$Server)
+    [pscustomobject]@{ Ok = $true; Kind = 'Ok'; Server = $Server; Reason = "$Server accepts this account and Entra Connect answers"; Technical = '' }
 }
 function Wait-PcmCondition { param([scriptblock]$Test, [int]$TimeoutSeconds, [int]$IntervalSeconds) Invoke-PraFakeWait -Test $Test -TimeoutSeconds $TimeoutSeconds -IntervalSeconds $IntervalSeconds }
 & (Get-Module PRA.Cloud) {

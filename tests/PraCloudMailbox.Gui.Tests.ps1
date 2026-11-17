@@ -7,7 +7,7 @@
     observations as one JSON line.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.1.0
+    Version : 2.1.1
 #>
 #Requires -Version 7.5
 
@@ -160,6 +160,59 @@ Describe 'Console: the request and the command line of a run' {
         $command.Arguments | Should -BeLike '*-File "C:\Program Files\PRA\Invoke-PraCloudMailbox.ps1"*-SearchBase "contoso.com/Paris \"North\""*'
         ConvertTo-PcmGuiNativeArgument 'C:\dir\' | Should -BeExactly '"C:\dir\\"'
         { ConvertTo-PcmGuiNativeArgument ('a' + [char]0 + 'b') } | Should -Throw
+    }
+    Context 'The command that is shown and copied holds no expansion' {
+        BeforeAll {
+            function script:Get-ShownParse {
+                param([string]$Command)
+                $tokens = $null; $errors = $null
+                $ast = [System.Management.Automation.Language.Parser]::ParseInput($Command, [ref]$tokens, [ref]$errors)
+                $expanding = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.SubExpressionAst] -or $node -is [System.Management.Automation.Language.VariableExpressionAst] -or
+                            $node -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -or $node -is [System.Management.Automation.Language.ArrayExpressionAst] -or
+                            $node -is [System.Management.Automation.Language.ParenExpressionAst] -or $node -is [System.Management.Automation.Language.ScriptBlockExpressionAst] }, $true))
+                [pscustomobject]@{ Ast = $ast; Errors = @($errors); Expanding = $expanding; Commands = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true)) }
+            }
+        }
+        It 'shows a plain value bare, and any other value as a single-quoted literal that reads back as the same text (<Value>)' -Tag 'ShownCommand' -TestCases @(
+            @{ Value = 'alice@contoso.com'; Bare = $true }, @{ Value = 'D:\PRA\lab.config.psd1'; Bare = $true }, @{ Value = 'contoso.com/Paris'; Bare = $true }
+            @{ Value = 'Sales $(Get-Date) team'; Bare = $false }, @{ Value = '$env:USERNAME'; Bare = $false }, @{ Value = 'ends with a backtick`'; Bare = $false }, @{ Value = "it's"; Bare = $false }
+            @{ Value = 'a "b" ${c} @(1) ; & calc'; Bare = $false }, @{ Value = "smart $([char]0x2019) and $([char]0x2018) quotes"; Bare = $false }, @{ Value = ''; Bare = $false }
+            @{ Value = '@splat'; Bare = $false }, @{ Value = '-Force'; Bare = $false }, @{ Value = 'a b'; Bare = $false }, @{ Value = '$1'; Bare = $false }
+            @{ Value = "abc`n"; Bare = $false }, @{ Value = "abc`r`n"; Bare = $false }, @{ Value = "abc`n--"; Bare = $false }) {
+            param($Value, $Bare)
+            $shown = & $script:Gui { param($v) ConvertTo-PcmGuiShownArgument $v } $Value
+            $parse = Get-ShownParse "Get-X -Group $shown"
+            $parse.Errors.Count | Should -Be 0 -Because $shown
+            $parse.Expanding.Count | Should -Be 0 -Because $shown
+            $element = $parse.Commands[0].CommandElements[2]
+            $element | Should -BeOfType ([System.Management.Automation.Language.StringConstantExpressionAst])
+            $element.Value | Should -BeExactly $Value
+            if ($Bare) { $shown | Should -BeExactly $Value } else { $shown | Should -BeLike "'*'" }
+        }
+        It 'reads the events of the engine with a date-like text and the time of an event as text' -Tag 'ShownCommand' {
+            $path = Join-Path $TestDrive 'events.jsonl'
+            [IO.File]::WriteAllText($path, ('{"kind":"item","status":"Ok","time":"2026-11-16T10:20:30Z","text":"2025-01-31T00:00:00Z","identity":"a@contoso.com"}' + "`n"), [Text.UTF8Encoding]::new($false))
+            $read = Read-PcmGuiEvents -Path $path
+            @($read.Events).Count | Should -Be 1
+            $read.Events[0].text | Should -BeOfType [string]
+            $read.Events[0].text | Should -BeExactly '2025-01-31T00:00:00Z'
+            $read.Events[0].time | Should -BeOfType [string]
+            $read.Events[0].time | Should -BeExactly '2026-11-16T10:20:30Z'
+        }
+        It 'shows every value of the command of a run as a literal: Continue, Copy, the next step and the Started line all take this text' -Tag 'ShownCommand' {
+            $request = New-PcmGuiRequest -Action Convert -Mode Apply -Group 'Sales $(Get-Date) team' -Scope SharedOnly
+            $command = Get-PcmGuiCommand -Root 'C:\PRA' -ConfigPath 'C:\PRA\config\PraCloudMailbox.config.psd1' -Request $request -Engine 'pwsh.exe'
+            $command.Display | Should -BeExactly ".\Invoke-PraCloudMailbox.ps1 -Action Convert -Mode Apply -Scope SharedOnly -Group 'Sales `$(Get-Date) team' -Force"
+            $parse = Get-ShownParse $command.Display
+            $parse.Errors.Count | Should -Be 0
+            $parse.Expanding.Count | Should -Be 0
+            $command.Tokens | Should -Contain 'Sales $(Get-Date) team'
+            $continue = Get-PcmGuiCommand -Root 'C:\PRA' -ConfigPath 'C:\PRA\c.psd1' -Request (New-PcmGuiRequest -Action Recover -Batch 'c0c0c0c0' -CsvPath 'C:\wave $env:USERNAME`.csv') -Engine 'pwsh.exe'
+            $continue.Display | Should -Match ([regex]::Escape("-CsvPath 'C:\wave `$env:USERNAME``.csv'"))
+            (Get-ShownParse $continue.Display).Expanding.Count | Should -Be 0
+            $next = & $script:Gui { $old = $script:Gui; $script:Gui = [pscustomobject]@{ Root = 'C:\PRA'; ConfigPath = 'C:\PRA\config\PraCloudMailbox.config.psd1' }; try { Get-PcmGuiNextCommand -Result ([pscustomobject]@{ nextSteps = @() }) -Action Recover -BatchId 'c0c0c0c0' -Mode Preview } finally { $script:Gui = $old } }
+            $next | Should -BeExactly '.\Invoke-PraCloudMailbox.ps1 -Action Recover -Mode Preview -Batch c0c0c0c0'
+        }
     }
 }
 
@@ -680,6 +733,11 @@ $o.batches = @($g.BatchRows | ForEach-Object { '{0}|{1}|{2}' -f $_.BatchId, $_.S
 $o.readyNoBatch = [bool](Mod { Test-PcmGuiTaskReady })
 $c.BatchList.SelectedItem = $g.BatchRows[0]; Pump 50
 $o.envLock = $c.EnvLock.Visibility.ToString(); $o.fEnvEnabled = $c.F_Env.IsEnabled
+$lock = [string](Mod { $script:Gui.EnvLock })
+Mod { $script:Gui.EnvLock = 'dr-eu'; Set-PcmGuiField 'Env' 'dr-eu' }
+$o.overrideLocked = [string](Mod { (Get-PcmGuiOverride).Environment })
+$o.changedLocked = @(Mod { Get-PcmGuiChangedSetting })
+Mod ([scriptblock]::Create("Set-PcmGuiField 'Env' '$lock'; `$script:Gui.EnvLock = '$lock'"))
 $o.waveRows = $g.WaveRows.Count; $o.readyWhole = [bool](Mod { Test-PcmGuiTaskReady })
 Check 'S_Wave_Wave'
 $o.readyNoTick = [bool](Mod { Test-PcmGuiTaskReady })
@@ -721,6 +779,8 @@ Done $o
     It 'locks the environment to the one of the batch and lists the mailboxes in the cloud for a wave' {
         $script:Wave.envLock | Should -Be 'Visible'
         $script:Wave.fEnvEnabled | Should -BeFalse
+        $script:Wave.overrideLocked | Should -BeExactly 'dr-eu'
+        $script:Wave.changedLocked | Should -Contain 'Environment'
         $script:Wave.waveRows | Should -Be 24
         $script:Wave.readyWhole | Should -BeTrue
         $script:Wave.readyNoTick | Should -BeFalse

@@ -19,7 +19,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.1.0
+    Version : 2.1.1
     History : see CHANGELOG.md
 #>
 #Requires -Version 7.5
@@ -61,6 +61,21 @@ $script:RowFields = @('Identity','Kind','PrimarySmtpAddress','ObjectGuid','Excha
     'TeamsStorage','Licence','Holds','Permissions','FinalStatus','Detail','Warnings')
 # Final statuses a row can have. 'AlreadyDone' is counted as a success.
 $script:FinalStatuses = @('Planned','AlreadyDone','Success','Error','Pending','Skipped')
+
+function ConvertFrom-PcmJson {
+    <#
+    .SYNOPSIS
+        The only way the tool reads JSON (the snapshot and journal columns, the events, the answers of the reports).
+    .DESCRIPTION
+        ConvertFrom-Json of PowerShell 7 turns a text that looks like an ISO 8601 date and time into a [DateTime]; written back, it is another text.
+        -DateKind String keeps every date as the text that was written. A test refuses any other ConvertFrom-Json call in the package.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory, ValueFromPipeline)][AllowEmptyString()][string]$InputObject)
+    begin { $parts = New-Object 'Collections.Generic.List[string]' }
+    process { $parts.Add($InputObject) }
+    end { ($parts -join "`n") | ConvertFrom-Json -DateKind String -ErrorAction Stop }
+}
 
 #region 1. Console theme ----------------------------------------------------------------------
 # The classic console (conhost) is the reference: colours are console
@@ -458,7 +473,7 @@ function Add-PcmWarning {
     param([hashtable]$Context, [string]$Message)
     if (-not $Context.ContainsKey('WarningList')) { $Context['WarningList'] = New-Object 'Collections.Generic.List[object]' }
     [void]$Context['WarningList'].Add([pscustomobject]@{
-        Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); Phase = [string](Get-PcmValue $Context 'CurrentPhase' ''); Message = $Message
+        Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture); Phase = [string](Get-PcmValue $Context 'CurrentPhase' ''); Message = $Message
     })
 }
 
@@ -521,7 +536,7 @@ function Write-PcmLogFile {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost','',Justification='Last-resort console message when the log is broken.')]
     param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$Level, [AllowEmptyString()][string]$Message)
     if (-not $Context.LogFile) { return }
-    $line = '{0} [{1,-6}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $Level, ($Message -replace '[\r\n]+', ' | ')
+    $line = '{0} [{1,-6}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture), $Level, ($Message -replace '[\r\n]+', ' | ')
     try { [IO.File]::AppendAllText($Context.LogFile, $line + "`r`n", (New-Object Text.UTF8Encoding($false))) }
     catch {
         $failure = 'The log file cannot be written: {0}' -f $_.Exception.Message
@@ -1556,7 +1571,7 @@ function Write-PcmReportHtml {
         'Exchange server' = [string](Get-PcmValue $Context 'Server' '')
         'Tenant' = [string](Get-PcmValue (Get-PcmValue $Context.Config 'Cloud' @{}) 'Organization' '')
         'Computer / account' = ('{0} · {1}\{2}' -f $env:COMPUTERNAME, $env:USERDOMAIN, $env:USERNAME)
-        'Started' = ([datetime]$Context.StartTime).ToString('yyyy-MM-dd HH:mm:ss')
+        'Started' = ([datetime]$Context.StartTime).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
         'Duration' = (Format-PcmDuration ((Get-Date) - [datetime]$Context.StartTime).TotalSeconds)
         'Run ID' = [string]$Context.RunId
         'Run settings changed' = ($overrides -join '; ')
@@ -1569,7 +1584,7 @@ function Write-PcmReportHtml {
     $notice = '{0} object row(s), {1} run error(s) and {2} warning(s) are stored in this file.' -f $Outcome.Rows.Count, $issueList.Count, $warningList.Count
     $values = @{
         '{{TITLE}}' = ConvertTo-PcmHtmlText ('PRA Cloud Mailbox - {0}' -f $Context.Action)
-        '{{SUBTITLE}}' = ConvertTo-PcmHtmlText ('{0} · {1}' -f $modeText, ([datetime]$Context.StartTime).ToString('yyyy-MM-dd HH:mm'))
+        '{{SUBTITLE}}' = ConvertTo-PcmHtmlText ('{0} · {1}' -f $modeText, ([datetime]$Context.StartTime).ToString('yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture))
         '{{VERSION}}' = ConvertTo-PcmHtmlText $Context.Version
         '{{META}}' = $metaHtml.ToString(); '{{TILES}}' = $tiles.ToString(); '{{NEXT}}' = $nextHtml
         '{{DATA_NOTICE}}' = ConvertTo-PcmHtmlText $notice
@@ -1623,7 +1638,7 @@ function Read-PcmReportChunk {
     param([Parameter(Mandatory)][string]$Html)
     $meta = [regex]::Match($Html, '<script type="application/json" id="pra-meta">(.*?)</script>', [Text.RegularExpressions.RegexOptions]::Singleline)
     if (-not $meta.Success) { throw 'The report holds no data header.' }
-    $header = $meta.Groups[1].Value | ConvertFrom-Json
+    $header = $meta.Groups[1].Value | ConvertFrom-PcmJson
     $result = @{}
     foreach ($kind in @($header.chunks.PSObject.Properties.Name)) { $result[$kind] = [System.Collections.Generic.List[object]]::new() }
     $dictionaries = @{}
@@ -1631,7 +1646,7 @@ function Read-PcmReportChunk {
         $kind = $chunk.Groups[1].Value
         $bytes = [Convert]::FromBase64String($chunk.Groups[3].Value)
         $reader = New-Object IO.StreamReader((New-Object IO.Compression.GZipStream((New-Object IO.MemoryStream(, $bytes)), [IO.Compression.CompressionMode]::Decompress)), [Text.Encoding]::UTF8)
-        try { $data = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+        try { $data = $reader.ReadToEnd() | ConvertFrom-PcmJson } finally { $reader.Dispose() }
         $fields = @($header.$kind.fields)
         if (-not $dictionaries.ContainsKey($kind)) { $dictionaries[$kind] = @(for ($f = 0; $f -lt $fields.Count; $f++) { , (New-Object 'Collections.Generic.List[object]') }) }
         for ($f = 0; $f -lt $fields.Count; $f++) { foreach ($value in @($data.d[$f])) { $dictionaries[$kind][$f].Add($value) } }
@@ -1946,10 +1961,17 @@ function Get-PcmStatusClass {
 
 function Format-PcmUtcText {
     param([AllowNull()][object]$Value)
+    if ($Value -is [datetime]) {
+        $moment = [datetime]$Value
+        $utc = if ($moment.Kind -eq [DateTimeKind]::Unspecified) { [datetime]::SpecifyKind($moment, [DateTimeKind]::Utc) } else { $moment.ToUniversalTime() }
+        return $utc.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ' UTC'
+    }
     $text = [string]$Value
     if (-not $text) { return '' }
-    $parsed = [datetime]::MinValue
-    if ([datetime]::TryParse($text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) { return ($parsed.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC') }
+    $parsed = [datetimeoffset]::MinValue
+    if ([datetimeoffset]::TryParse($text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
+        return $parsed.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ' UTC'
+    }
     return $text
 }
 
@@ -2238,7 +2260,7 @@ function Get-PcmConfigurationDifference {
 }
 #endregion
 
-Export-ModuleMember -Function Get-PcmValue, Format-PcmDuration, Add-PcmIssue, Write-PcmLog, Write-PcmItem, Write-PcmProgress, Get-PcmDurationEstimate, Get-PcmRecoverWaveSize,
+Export-ModuleMember -Function ConvertFrom-PcmJson, Get-PcmValue, Format-PcmDuration, Add-PcmIssue, Write-PcmLog, Write-PcmItem, Write-PcmProgress, Get-PcmDurationEstimate, Get-PcmRecoverWaveSize,
     Write-PcmBanner, Write-PcmStep, Write-PcmPlan, Write-PcmStepState, Write-PcmStepCount, Write-PcmSummary, Write-PcmHost, Resolve-PcmPath, Import-PcmConfiguration, Initialize-PcmAudit, Get-PcmOutcome, Complete-PcmRun,
     Write-PcmEvent, Test-PcmStopRequest, Request-PcmOperator, Get-PcmToolVersion, Test-PcmSameText, Get-PcmDistinctText, Resolve-PcmOfficialValue, Get-PcmCloudModuleReport,
     Get-PcmReportHtml, Write-PcmReportHtml, Read-PcmReportData, Read-PcmGlobalReportData, ConvertTo-PcmHtmlText, Get-PcmGlobalModel, Write-PcmGlobalReport, Write-PcmGlobalReportHtml, Write-PcmGlobalReportCsv, Write-PcmGlobalEventsCsv, Format-PcmUtcText,
@@ -2247,10 +2269,10 @@ Export-ModuleMember -Function Get-PcmValue, Format-PcmDuration, Add-PcmIssue, Wr
     Test-PcmSystemMailboxName, ConvertTo-PcmDnKey, ConvertFrom-PcmDnToCanonical, Test-PcmInSearchBase, ConvertTo-PcmGuidKey, New-PcmRecordIndex, Find-PcmRecord
 
 # SIG # Begin signature block
-# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBlSJgmCj/luCtI
-# c2WFS2JOqhc77vI2TmQfsYn53jC3XaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAX6f8TRuNICzRo
+# LBgpbjsDuw8ywcvBjPLdXdJm9iumg6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -2322,28 +2344,28 @@ Export-ModuleMember -Function Get-PcmValue, Format-PcmDuration, Add-PcmIssue, Wr
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYEjCCGA4CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDmCa+98Zxa
-# WIehm+0I9m1xbDOiR4IsDzmQcwxyuajwAzANBgkqhkiG9w0BAQEFAASCAgBkrTWt
-# 0um2KywEQSeSYR72s5TM0vMpphUE9csKR6WCnGjz1Aa34ybGyD2kQVRjUgrHVOXS
-# sQtxoU0D7Sn5rfRVSLSDzWGI9oMO7/ApBcjpLHsSqoW5zM80r2N/xELYIMLpkpjJ
-# R8JBpNbApNeHUO6M3InlKSmJJL5cQASmTQzZtjjrRrhjPtvSBtqb1ke1QNHGcPwM
-# 4XeR9p5QDZZqVYwnkaaGkb0qwT+/evoRolEc0NQMX8aQBtgdVZwUeonoaF03L/E0
-# c/qEwASb1tjeVM1amfeiA9YD8TqIrEUWbWh7iSsr3D2WNlfc5yS7hjV2/bfGHBUz
-# Giz2Bh8GDEBGaJlb1kZn/cWiyPE8f13gwTUxa+3hui9jsLM7H5O2QUwC8weIsmV8
-# PkE0erljsuaVpl8dUksrs9c4HfX3Dp3+1fw3BlpoU5mlkzna99BxGrOz4iN9+xKi
-# ME8VHgRABId+AHNaXsI3HaFKkI2MjHaSRcTVhQhmCphGGN4tVgRLY5vpB8ojSIaL
-# SmCrgcfaxYP67Vp0WE+Yu1Ni5KNx/nedGxUtikoz6vuEsohvpWV6o/vu/LQsIpqF
-# 8TlOqxuvbkiS6hJG46HAUW8dkGn8hdP1Mug3LEZtgRc9sBeKJjUaOEYP2gYuLHHz
-# 49CXPbGxYVlgZE/Ch8zOwhFjZCuBWDJ6KrrawqGCFM4wghTKBgorBgEEAYI3AwMB
-# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAvhtYwFGKg
+# A2M7bTDs42K4MmNwu6bDYO92LLW/3xdD1DANBgkqhkiG9w0BAQEFAASCAgCFhrIW
+# sFXrAYwQ9eZIAdL2qf01mBcN/q17dVYFm5NZe8kkignaCZS7vNLYmHsy5z/FBwZg
+# +yI4Hb4lvXKAGq69q7dH+4AGbGDQ0bvQbT6b8hOPkDnhRcl9dPhkLD6J2yg7hHNv
+# 7QaI6OZb5685EjX89duSxgwpk34dnMQftFp5skZN5CCo3p9+eRHTGPH265AR0wr4
+# PAiMoU+23JqgVX4/3KGNjlBHEmamimzXeGbEoC6YUGD9pIC4bjYWG+bvA3uCD4s6
+# aJgL5ufSusxMHy+J3w/PbiXnw0dBH3LCHisF+NPlSulDKi7b3sanCUZ1VOgHa2t8
+# NmztVQZEFa+CGgt7jYeOqSFzbhtyEeEocficsFhd4HqAv9bu+qhFaz5kZaggmruN
+# NGjyfCtXmeEXrlNRnnbHxSp6quP0b5TpZ2e0ajUKvaIEwMWTpPdgRCCKkKGqs88z
+# LykzknAIPFAZEU+Dfmph1YBw/5rAEkYlam9/5JSr5UjlbxneggIwh1IXm81cKlbB
+# P1zFyNUWAuNDzVUdo6xS6Dbi15c9av5SKzeSnaBEgf+JZozlxtzo1EPKneHxdKTg
+# WGCySkPa5Np30U6WfC9J1p2Ozo+5ZEMBUvhEXTSr7ywdoIsAVrs/YjDq71Xz3tCP
+# mBvORib3oRPRdqD1hA6/JKweGGFGiOUwsKGrKaGCFM8wghTLBgorBgEEAYI3AwMB
+# MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIMT5fsHCLutdscaPFYseNFAfI9IOmqTHA52QjPyLAB32AggKyXcEe7+4
-# 2xgPMjAyNjExMTUyMDA2MjVaMAMCAQECEG8lET9HYfnkMS+OO4PjvtugghGnMIIE
+# BAIBBQAEIJOWmx/U4K7cwRnevMzFR+CaPD/o7JGVqFQ6r+d44SFfAggXz0ySWkj3
+# AhgPMjAyNjExMTcxODM5MjBaMAMCAQECECl4nUGpaFRDvflNzkuCizagghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -2438,17 +2460,17 @@ Export-ModuleMember -Function Get-PcmValue, Format-PcmDuration, Add-PcmIssue, Wr
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlcwggJTAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNTIwMDYyNVowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIJQ5
-# xKe9jnYi7NboTjutQCTK4px0rKGd6uKJOEqCsPSyMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNzE4MzkyMFowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIE0W
+# XCUZdT6DkUUh3BJZAPpaoyepSAh06uEf7rEB7r1qMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiEA+lHft7RH3nsvIjQphFORETnVaTPMHuoQ+S4UWxY5BMECIHM6
-# Bo2KfY8jy11CV8fKgFieZH2mpMTKU8+GCpXJN4Jm
+# zj0EAwIESDBGAiEAjRM3Ta30nCSYe6l5RwEdyOQNJX/QQgG/2LCVao0tiR4CIQCi
+# ID0FOEtib/NrmUdvHThDmNXOJUsVAqeTHdfNo8RgvQ==
 # SIG # End signature block

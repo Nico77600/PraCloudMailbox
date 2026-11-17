@@ -19,8 +19,7 @@ BeforeAll {
     . (Join-Path $PSScriptRoot 'GraphRequestContext.Fake.ps1')
     function global:Connect-MgGraph { [CmdletBinding()] param($ClientId, $TenantId, $CertificateThumbprint, $ContextScope, [switch]$NoWelcome, $Scopes) }
     function global:Disconnect-MgGraph { [CmdletBinding()] param() }
-    function global:Connect-ExchangeOnline { [CmdletBinding()] param($AppId, $CertificateThumbprint, $Organization, $ShowBanner, $CommandName, $UserPrincipalName, [switch]$DisableWAM) }
-    function global:Disconnect-ExchangeOnline { [CmdletBinding(SupportsShouldProcess)] param() Write-Host 'Disconnected successfully !' }
+    . (Join-Path $PSScriptRoot 'ExoSession.Fake.ps1')
     function global:Connect-IPPSSession { [CmdletBinding()] param($AppId, $CertificateThumbprint, $Organization, $ShowBanner, $CommandName, $UserPrincipalName, [switch]$EnableSearchOnlySession) }
     function script:New-FollowConfig {
         param([hashtable]$Cloud = @{}, [hashtable]$Licensing = @{ Users = @{ Mode = 'Group' } }, [hashtable]$Scope = @{ ResourceMode = 'SynchronizedShared' })
@@ -31,9 +30,10 @@ BeforeAll {
 }
 
 AfterAll {
-    foreach ($name in @('Get-MgContext', 'Get-MgRequestContext', 'Set-MgRequestContext', 'Reset-PraFakeGraphTransport', 'Connect-MgGraph', 'Disconnect-MgGraph', 'Connect-ExchangeOnline', 'Disconnect-ExchangeOnline', 'Connect-IPPSSession')) {
+    foreach ($name in @('Get-MgContext', 'Get-MgRequestContext', 'Set-MgRequestContext', 'Reset-PraFakeGraphTransport', 'Connect-MgGraph', 'Disconnect-MgGraph', 'Connect-IPPSSession')) {
         Remove-Item -Path "function:$name" -ErrorAction SilentlyContinue
     }
+    Remove-PraFakeExoSession
     Restore-PcmGlobalState $script:GlobalBefore
 }
 
@@ -312,7 +312,9 @@ Describe 'Interactive sign-in of an administrator' {
             $global:PraFakeGraphAuth = [pscustomobject]@{ Account = 'admin@contoso.com'; Scopes = @($Scopes) }
         }
         Mock Disconnect-MgGraph -ModuleName PRA.Cloud { $global:PraFakeGraphAuth = $null }
+        Reset-PraFakeExoSession
         Mock Connect-ExchangeOnline -ModuleName PRA.Cloud {
+            $null = Add-PraFakeExoConnection
             $value = { param($name) Get-Variable -Name $name -ValueOnly -ErrorAction SilentlyContinue }
             $script:captured.Exo = @{ UserPrincipalName = (& $value 'UserPrincipalName'); AppId = (& $value 'AppId'); CertificateThumbprint = (& $value 'CertificateThumbprint'); DisableWAM = [bool](& $value 'DisableWAM') }
             $script:captured.ExoCommands = @($CommandName)
@@ -360,6 +362,12 @@ Describe 'Interactive sign-in of an administrator' {
         $printed = @(Disconnect-PcmCloud -Context $context 6>&1)
         $printed.Count | Should -Be 0
         $context['ExoConnected'] | Should -BeFalse
+    }
+    It 'refuses an Exchange Online session of another tenant after an interactive sign-in, and tells to sign in with an account of the right tenant' {
+        $context = @{ Config = (New-FollowConfig -Cloud @{ SignIn = 'Interactive' }); Approval = { param($Target, $Operation) $true } }
+        Mock Connect-ExchangeOnline -ModuleName PRA.Cloud { $null = Add-PraFakeExoConnection -TenantId 'dddddddd-0000-0000-0000-000000000004' -ConnectionId 'own' }
+        { Connect-PcmCloud -Context $context } | Should -Throw '*The Exchange Online session is in tenant dddddddd-0000-0000-0000-000000000004, and Cloud.TenantId is 33333333-3333-3333-3333-333333333333. Nothing was changed. Sign in with an account of tenant 33333333-3333-3333-3333-333333333333, then run the command again.'
+        @($global:PraFakeExo.Disconnects) | Should -Be @('own')
     }
     It 'refuses, in plain words, to sign in when PowerShell was started with -NonInteractive' {
         Mock Test-PcmNonInteractiveProcess -ModuleName PRA.Cloud { $true }

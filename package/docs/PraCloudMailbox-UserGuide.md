@@ -1,7 +1,7 @@
 ﻿---
 title: PRA Cloud Mailbox
 subtitle: User guide
-version: 2.1.0
+version: 2.1.1
 author: Nicolas Fabert
 updated: 2026-11-15
 runtime: PowerShell 7.5+ (engine and console)
@@ -150,12 +150,12 @@ You do this part **one time**. It is best to do it **before** the disaster, as a
 
 **Do:**
 
-1. Download `PraCloudMailbox-2.1.0.zip` and its `.sha256` file from the release page of the project. Take the two files named in the **Assets** list. Do **not** take the "Source code" archives: they are not the tool.
+1. Download `PraCloudMailbox-2.1.1.zip` and its `.sha256` file from the release page of the project. Take the two files named in the **Assets** list. Do **not** take the "Source code" archives: they are not the tool.
 2. Check the checksum. Open **PowerShell 7** (Start button, type `PowerShell 7`). Run these two lines in the folder of the download:
 
 ```powershell
-(Get-FileHash .\PraCloudMailbox-2.1.0.zip -Algorithm SHA256).Hash
-Get-Content .\PraCloudMailbox-2.1.0.zip.sha256
+(Get-FileHash .\PraCloudMailbox-2.1.1.zip -Algorithm SHA256).Hash
+Get-Content .\PraCloudMailbox-2.1.1.zip.sha256
 ```
 
 3. Compare the two values. The text file holds the hash, two spaces, and the file name. The letters can be capital or small. The hash must be the same.
@@ -259,7 +259,8 @@ This is the most important part of the preparation. Read it twice.
 5. **If the check says the file changed, restore it from the external backup.** The message says *Nothing was changed.* and *Restore the file from your external backup*. Use `-AcceptUnverifiedSnapshot` **only** when you know why the file changed and you accept it as it is. A snapshot with **no** `.sha256` file gives a warning in a Preview and in a Check. A **Convert or a Recover in Apply mode stops** and changes nothing: copy the `.sha256` file with the snapshot, or add `-AcceptUnverifiedSnapshot` when you know the file is the right one.
 6. **A Collect that lost its mailboxes is refused.** Collect refuses to write a snapshot that has no mailbox. It also refuses one that has far fewer than the last good snapshot (`Collect.MaxDropPercent`, 50 by default). It writes nothing and ends with `RESULT: FAIL`. The last good snapshot stays. Find out why Exchange returned fewer mailboxes. Raise the setting only if the drop is expected.
 7. **A batch keeps its snapshot.** Convert remembers which snapshot it was made from. Recover and the follow-up of a batch use **that** snapshot, and stop, changing nothing, if it is missing or not the same. Collect never deletes the snapshot of a batch that is not rolled back yet. If the tool says the snapshot of a batch is missing, copy that file from `data\backup` over `data\PraCloudMailbox.db`, with its `.sha256` file.
-8. **Back up the journal too.** The journal is `data\PraCloudMailbox-journal.db`. It is written by Convert and Recover themselves, so the checksum does **not** cover it. It is the record of every change and the only input of the rollback. Copy it off-site **during** the operations, not only after.
+8. **A snapshot and a batch stay in their environment.** The tool refuses, changing nothing, a snapshot or a batch made for another environment (the `Environment` name) or, for a batch, another tenant. The message names both. Use the settings file of the right environment.
+9. **Back up the journal too.** The journal is `data\PraCloudMailbox-journal.db`. It is written by Convert and Recover themselves, so the checksum does **not** cover it. It is the record of every change and the only input of the rollback. Copy it off-site **during** the operations, not only after.
 
 The cloud admin server needs the snapshot. If Collect does not run on it, copy `data\PraCloudMailbox.db` **and** `data\PraCloudMailbox.db.sha256` there after each Collect. A second scheduled task can do it.
 
@@ -299,7 +300,7 @@ A red light is **not always a problem**. The Collect computer has no cloud progr
 
 #### Settings for this run only
 
-Press **Change…** to open **Settings for this run only (the file is never written)**. You can change the environment, the scope, the snapshot, the sign-in, the tenant, the app, and the number of temporary licences. A changed field is marked **modified**. Press **Reset everything** to go back to the file.
+Press **Change…** to open **Settings for this run only (the file is never written)**. You can change the environment, the scope, the snapshot, the sign-in, the tenant, the app, and the number of temporary licences. Take care with the environment and the tenant: Check, Convert and Recover refuse a snapshot made for another environment, and every batch refuses another environment or another tenant than its own. When you choose a batch, the console locks the environment to the one of the batch and uses it for the run. A changed field is marked **modified**. Press **Reset everything** to go back to the file.
 
 ![Settings for this run only: Scope and Snapshot to use, the sign-in choice, the tenant and the licences](images/console-setup-settings-light.png)
 
@@ -762,6 +763,11 @@ Find what you **see** in the left column. The middle column says what it **means
 | **Part of the conversion remains** or *Some objects or lists are not finished. Fix what is named above, then resume them (nothing is converted twice):* | Some objects are not finished. It is **not** an error. | Run the command given after the message. It continues the batch. |
 | **Part of the rollback remains** or *Some objects are not back yet. Fix what is named above, then resume them (nothing is rolled back twice):* | Some objects are not back yet. | Run the command given after the message. |
 | *no cloud mailbox yet after …: run Convert -Batch … again later* | Exchange Online is still creating the mailbox. | Wait a few minutes. Run the same command with `-Batch`. |
+| *… was made for Environment '…' and the configuration says '…'* or *… was made in tenant … and Cloud.TenantId is …* | The snapshot or the batch belongs to another environment or tenant. Nothing was changed. | Run the command with the settings file of that environment or tenant. |
+| *An Exchange Online session already exists in this PowerShell window* | The tool does not use or close a session that it did not open. | Open a new PowerShell 7 window. If your PowerShell profile signs in to Exchange Online, start it with `-NoProfile`. Run the command again. |
+| *… session is in tenant …, and Cloud.TenantId is …*, for Exchange Online or for Security & Compliance | The sign-in went to another tenant than the one of the settings file. Nothing was changed. | With the certificate sign-in, check `Cloud.Organization` and `Cloud.TenantId`. With the interactive sign-in, sign in with an account of the tenant named in the message. Run the command again. |
+| *Signing out of Microsoft 365 failed (…). This does not change the result of the run.* | The work of the run is done, and the sign-out did not work. This is a warning, not an error. | Close this PowerShell window before you run another tool. |
+| *Entra Connect cannot be used from this tool: …* | The rollback could not reach Entra Connect with the account of the run. Nothing was changed. In a Preview it is a warning, and the first next step says to fix it. | Do what the message says (account, server name, firewall), or ask the administrator to set `EntraConnect.Mode = 'Manual'`. Then run the same command again. |
 | *not synchronised from AD yet: run Entra Connect, then Recover -Batch again* | Entra Connect has not yet sent the object back. | Run a synchronisation on Entra Connect. Then run again. |
 | *Entra Connect did not recreate it … run a full synchronisation on the Entra Connect server* | The tool tried a synchronisation of the object alone and it did not come back. | Run the command of the Next steps on the Entra Connect server and wait for it to end. Then run the Recover command of the Next steps again. |
 | *back on-premises; case hold not stamped yet* | The user is back. The hold is still being applied. | Run Recover again later to check it. The hold is never removed from an object that is back. |

@@ -15,7 +15,7 @@
     Root of the repository (default: two folders above this script).
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.1.0
+    Version : 2.1.1
     Part of : PRA Cloud Mailbox (repository tool, not in the package)
 #>
 #Requires -Version 7.5
@@ -72,7 +72,7 @@ try {
             return $d
         } $Request $isCloud $fakeModules $fakeCertificate
     }.GetNewClosure()
-    $g = New-PcmGuiWindow -Root $root -ConfigPath $fixture.Config -Version '2.1.0' -Theme $Theme -PrerequisiteProbe $probe -Hooks @{ NoConsole = $true }
+    $g = New-PcmGuiWindow -Root $root -ConfigPath $fixture.Config -Version '2.1.1' -Theme $Theme -PrerequisiteProbe $probe -Hooks @{ NoConsole = $true }
     function Pump($ms = 120) { $f = New-Object Windows.Threading.DispatcherFrame; $t = New-Object Windows.Threading.DispatcherTimer; $t.Interval = [timespan]::FromMilliseconds($ms); $t.Tag = $f; $t.Add_Tick({ param($s) $s.Tag.Continue = $false; $s.Stop() }); $t.Start(); [Windows.Threading.Dispatcher]::PushFrame($f) }
     function Walk($element, [scriptblock]$visit) { & $visit $element; $n = [Windows.Media.VisualTreeHelper]::GetChildrenCount($element); for ($i = 0; $i -lt $n; $i++) { Walk ([Windows.Media.VisualTreeHelper]::GetChild($element, $i)) $visit } }
     function Mask($text) { if (-not $text) { return $text }; ([string]$text).Replace($root, $syntheticRoot).Replace([string]$PSVersionTable.PSVersion, '7.5.1') }

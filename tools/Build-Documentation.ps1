@@ -27,7 +27,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.1.0 (from the Purview DLP Report builder)
+    Version : 2.1.1 (from the Purview DLP Report builder)
     PowerShell pitfall: never name a variable $matches — every -match overwrites the automatic
     $Matches, and variable names are case-insensitive.
 #>

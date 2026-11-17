@@ -1,7 +1,7 @@
 ﻿---
 title: PRA Cloud Mailbox
 subtitle: Administrator guide
-version: 2.1.0
+version: 2.1.1
 author: Nicolas Fabert
 updated: 2026-11-15
 ---
@@ -197,6 +197,8 @@ Add-RoleGroupMember -Identity eDiscoveryManager -Member <enterprise-application-
 
 **Interactive sign-in.** Set `Cloud.SignIn = 'Interactive'` (any letter case) and `Cloud.TenantId`; `Cloud.UserPrincipalName` is the administrator proposed at the sign-in. The tool then connects to Microsoft Graph with **delegated permissions** (`Connect-MgGraph -Scopes`, the same names as the application permissions above), to Exchange Online and, for the case hold, to Security & Compliance, all with the administrator's account and the Windows account broker (WAM). An administrator of the tenant consents once. The PowerShell process must have a window where someone can answer: it must **not** be started with `-NonInteractive` (the tool says so in plain words), so it cannot run in a scheduled task. `Cloud.AppId` and `Cloud.CertificateThumbprint` are not used.
 
+**One Exchange Online session.** The sign-in stops, in plain words, when an Exchange Online session already exists in the PowerShell window (open a new PowerShell 7 window, started with `-NoProfile` if your profile signs in to Exchange Online: the tool never uses or closes a session that it did not open), and when the session that it opens, or the Security & Compliance session of a rollback with the case hold, is not in the tenant of `Cloud.TenantId` (a certificate sign-in is also checked against `Cloud.AppId`). For a wrong tenant the message gives the action that fits the sign-in: check `Cloud.Organization` and `Cloud.TenantId` for the certificate, sign in with an account of the tenant for the interactive sign-in. At the end of the run the tool signs out only its own connections. A sign-out that fails, for Exchange Online, Security & Compliance or Microsoft Graph, is a warning that says to close the PowerShell window: the result and the exit code of the run stay the ones of its work.
+
 ### 4.4 Case hold and retention
 
 Created once, before the disaster, by a compliance administrator:
@@ -272,8 +274,8 @@ The tool creates the `data`, `logs` and `reports` folders itself when they are m
 1. Download `PraCloudMailbox-<version>.zip` and its `.sha256` file from the release page. Compare the hash of the zip with the one in the `.sha256` file (the file holds `<hash>  <file name>`; the letters can be capital or small):
 
 ```powershell
-(Get-FileHash .\PraCloudMailbox-2.1.0.zip -Algorithm SHA256).Hash
-Get-Content .\PraCloudMailbox-2.1.0.zip.sha256
+(Get-FileHash .\PraCloudMailbox-2.1.1.zip -Algorithm SHA256).Hash
+Get-Content .\PraCloudMailbox-2.1.1.zip.sha256
 ```
 
 2. Extract it, copy the folder to `C:\PRA\PraCloudMailbox` on the cloud admin server and on any other server that runs Collect, and unblock the files.
@@ -324,7 +326,7 @@ There is no unsigned mode, switch or environment bypass. **Not covered, by desig
 
 | Section | Settings |
 |---|---|
-| `Environment` | Label used in the backup file names; a batch only continues in its own environment |
+| `Environment` | Label used in the backup file names; a snapshot or a batch made for another environment is refused (letter case ignored) |
 | `Exchange` | `Server` (host name of an Exchange server, **required by Collect**), `DomainController` (the same DC for every read of a run). `ConnectionMode` of 1.x is gone: `Local` is refused with a migration message, `Remote` is ignored |
 | `Scope` | `Mode` (`Auto`, `OU`, `Group`, `Csv`), `SearchBase`, `GroupDN`, `CsvPath` (column `Identity`: UPN, SMTP, sAMAccountName, DN or GUID), `IncludeUsers`, `IncludeShared`, `IncludeRoom`, `IncludeEquipment`, `ExcludeSamAccountNames`, `ConvertRooms` (default `$false`), `ResourceMode` (`SynchronizedShared`, default, or `CloudResource` for unsynchronised native resources) |
 | `Collect` | `SharedPermissions`, `ExpandGroupTrustees` (groups used as trustees: members stored and granted one by one), `ExcludeTrustees` (wildcards), `MailboxStatistics`, `Contacts`, `ContactsSearchBase`, `DistributionGroups`, `DistributionGroupsSearchBase`, `DynamicDistributionGroups`, `TargetGroups` (groups kept **with all their members**, nested groups, computers and contacts included, so that `-Group` works after the disaster; `Scope.GroupDN` is always kept too; a group that is not found is a warning), `MaxDropPercent` (0 to 100, default 50: a Collect that finds no mailbox, or more than this percentage fewer than the last complete snapshot of the same scope, writes nothing and fails; 100 accepts any size) |
@@ -378,6 +380,8 @@ EntraConnect = @{
 
 Create the credential file once, with the account that runs the tool: `Get-Credential CONTOSO\svc-pra-sync | Export-Clixml .\config\EntraConnect.cred.xml` (only that Windows account, on that computer, can read it back). A script of your own, outside the package, receives `-Server` and `-CredentialPath` only when it declares them; one that does not declare them is called with `-Operation` alone, as before.
 
+**The Entra Connect server is checked before the first change.** When `EntraConnect.Mode` is `Remoting` and the rollback has users or shared mailboxes to bring back, Recover makes an authenticated, read-only call to the ADSync module of `EntraConnect.Server` with the account of the run (a remote job that is waited for 30 seconds at most) before the confirmation. A Recover in Apply mode that cannot reach it stops with *Nothing was changed.* and says what to fix (the account, the server name, the firewall) or to set `EntraConnect.Mode = 'Manual'`; a Preview shows the same message as a warning, and its first next step says to fix it before the Apply command. In `Script` mode nothing is checked before the run: the script of the administrator is how the server is reached (a jump host, Azure Run Command), and the log says so. `Manual` mode is not checked either.
+
 ### 6.2 Unsynchronised native resource lifecycle
 
 This lifecycle is new in 2.0.0 and is **off by default**: the synchronised shared-mailbox path is unchanged.
@@ -408,7 +412,7 @@ Native mailbox creation similarly pins the returned directory ID and independent
 
 `New-DistributionGroup`, `Set-DistributionGroup`, room-list membership cmdlets and `Set-User` must be exposed to the app with appropriate Exchange RBAC (including naming-policy and group-manager bypass parameters). Check and Convert preview remain read-only: a missing non-conflicting list is a planned creation rather than a manual prerequisite; unsupported commands, conflicting groups and unresolved controls remain blocking.
 
-The location fields above are native Exchange `Get-User` properties. Cloud-only Places building/floor hierarchies are not inferred from arbitrary custom attributes. Resource `ResourceCustom` and CustomAttribute1-15 retain their existing treatment; the ownership marker reserves one custom attribute.
+The location fields above are native Exchange `Get-User` properties. Cloud-only Places building/floor hierarchies are not inferred from arbitrary custom attributes. Resource `ResourceCustom` and CustomAttribute1-15 retain their existing treatment; the ownership marker reserves one custom attribute. Exchange Online reads a text in the ISO 8601 form of a date and time with seconds (for example `2025-01-31T00:00:00Z`) as a date and keeps it as month/day/year in UTC (`01/31/2025 00:00:00`). That happens to the location fields and to CustomAttribute1-15 of a resource: Convert accepts the date form that Exchange Online gives back for a location field, and names each such value in a warning. Any other text is restored as it is.
 
 **New native journals persist `protectionMode = 'None'`.** Microsoft states that standard resource mailboxes [up to 50 GB require no licence](https://learn.microsoft.com/en-us/office365/servicedescriptions/exchange-online-service-description/exchange-online-limits#mailbox-storage-limits). No licence is assigned, no licensing group is joined, and usageLocation is not set for licensing. Native-only Check/Preview/Convert/Recover skip subscribed-SKU/group/capacity prerequisites and do not connect to Security & Compliance. Mixed scopes retain all user/shared prerequisites. The app still needs `User.ReadWrite.All` for disabled sign-in, cloud/deleted identity inspection and owned account deletion, plus the Exchange resource/directory/RoomList RBAC. Unreadable organisation holds fail closed; active organisation holds block new unprotected provisioning. Larger mailboxes, archives and other licensed features are outside this lifecycle.
 
@@ -514,6 +518,8 @@ What the verification does:
 With `-AcceptUnverifiedSnapshot` (Check, Convert, Recover) the run goes on although the snapshot changed or has no `.sha256`. Use it only when you know why and accept the file as it is. The run says so in the banner, the log, the summary and the report, and the next steps keep the switch. The console shows the light **Snapshot** as Verified, Not verifiable or Changed (red). Collect keeps the previous `.sha256` until the new one is written, and writes it again for the database as it is when a Collect fails after it opened the database, so a failed Collect does not leave the good snapshot without its hash.
 
 **A batch is tied to its snapshot.** Convert records, in the journal, the run of Collect and a digest of the content (mailboxes, permissions, group members) of the snapshot it was made from; Recover and `Check -Batch` use the same snapshot, found by its run and not by its number, and **stop, nothing changed**, when the snapshot is missing or its content is not the one the batch was made from (`-AcceptUnverifiedSnapshot` accepts a different content). When it is missing, the message points to `Store.BackupFolder`: every Collect writes a copy named `PraCloudMailbox_<Environment>_snapshot<number>_<date>.db` there, which is never deleted; copy it over `Store.Path` with its `.sha256` and run the command again. A batch made before this version has no record: the tool uses the number written in the journal and warns that it cannot prove the snapshot.
+
+**A snapshot and a batch are tied to their environment and their tenant.** Check, Convert, Recover and `Check -Batch` refuse, changing nothing, a snapshot or a batch made for another `Environment` than the one of the configuration (letter case ignored): the message names both. Convert also records `Cloud.TenantId` in the batch, and a batch made in another tenant is refused the same way. A batch made by an earlier version holds no tenant and is accepted.
 
 <!-- icon: check -->
 ## 8. Check

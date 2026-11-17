@@ -201,7 +201,7 @@
 
 .NOTES
     Author     : Nicolas Fabert
-    Version    : 2.1.0
+    Version    : 2.1.1
     Requires   : PowerShell 7.5 or later for every action and for the window.
                  Collect: a domain-joined computer that reaches Exchange.Server with Kerberos.
                  Schedule: the same computer, in an elevated window.
@@ -336,7 +336,7 @@ function New-PcmApprovalCallback {
     }.GetNewClosure()
 }
 $context = @{
-    Root = $PSScriptRoot; Version = $toolVersion; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
+    Root = $PSScriptRoot; Version = $toolVersion; RunId = ((Get-Date).ToString('yyyyMMdd_HHmmss', [Globalization.CultureInfo]::InvariantCulture) + '-' + [guid]::NewGuid().ToString('N'))
     StartTime = Get-Date; Action = $Action; Mode = $effectiveMode; Phase = ''
     CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; StepTotal = 0; Warnings = 0
     Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
@@ -897,17 +897,17 @@ function Get-PcmCollectSizeProblem {
         $connection = $null
         try {
             $connection = Open-PcmStore -Path $config.Store.Path -Root $context.Root -ReadOnly
-            $now = $ScopeJson | ConvertFrom-Json
+            $now = $ScopeJson | ConvertFrom-PcmJson
             $oneObject = [bool][string](Get-PcmValue $now 'Identity' '')
             foreach ($row in @(if (-not $oneObject) { Invoke-PcmSql $connection "SELECT id, scope_json, counts_json FROM snapshot WHERE status = 'Complete' ORDER BY id DESC LIMIT 50" -As Rows })) {
-                $then = $null; try { $then = [string]$row.scope_json | ConvertFrom-Json } catch { $then = $null }
+                $then = $null; try { $then = [string]$row.scope_json | ConvertFrom-PcmJson } catch { $then = $null }
                 if (-not $then -or [string](Get-PcmValue $then 'Identity' '')) { continue }
                 $same = $true
                 foreach ($name in @('Mode', 'SearchBase', 'GroupDN', 'CsvPath', 'Filter', 'IncludeUsers', 'IncludeShared', 'IncludeRoom', 'IncludeEquipment')) {
                     if (-not (Test-PcmSameText ([string](Get-PcmValue $then $name '')) ([string](Get-PcmValue $now $name '')))) { $same = $false; break }
                 }
                 if (-not $same) { continue }
-                $mailboxes = [int](Get-PcmValue ([string]$row.counts_json | ConvertFrom-Json) 'mailbox' 0)
+                $mailboxes = [int](Get-PcmValue ([string]$row.counts_json | ConvertFrom-PcmJson) 'mailbox' 0)
                 $previous = [pscustomobject]@{ Id = [long]$row.id; Count = $mailboxes }
                 break
             }
@@ -1036,7 +1036,7 @@ function Invoke-PcmCollect {
     foreach ($record in $records) {
         $row = New-PcmRow ([pscustomobject]$record)
         $row.Permissions = [string]$permissionText[[string]$record.object_guid]
-        $row.Detail = 'X500 {0} {1} {2} address(es)' -f $(if ($record.legacy_exchange_dn) { 'kept' } else { 'missing' }), $dot, @(($record.email_addresses_json | ConvertFrom-Json) | ForEach-Object { $_ }).Count
+        $row.Detail = 'X500 {0} {1} {2} address(es)' -f $(if ($record.legacy_exchange_dn) { 'kept' } else { 'missing' }), $dot, @(($record.email_addresses_json | ConvertFrom-PcmJson) | ForEach-Object { $_ }).Count
         [void]$context.Rows.Add($row)
     }
 
@@ -1093,7 +1093,7 @@ function Invoke-PcmCollect {
             try { Set-PcmSnapshotStatus $connection $id Failed $counts $_.Exception.Message } catch { $null = $_ }
             throw
         }
-        $context.SnapshotLabel = '{0} {1} {2}' -f $id, $dot, (Get-Date -Format 'yyyy-MM-dd HH:mm')
+        $context.SnapshotLabel = '{0} {1} {2}' -f $id, $dot, (Get-Date).ToString('yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture)
         Write-PcmItem -Context $context -Status Ok -Icon Batch -Text ('Snapshot {0} written to {1}' -f $id, $config.Store.Path)
         $inUse = Get-PcmSnapshotInUse -JournalPath $config.Store.JournalPath -Root $context.Root
         $pruned = 0
@@ -1105,7 +1105,7 @@ function Invoke-PcmCollect {
             Write-PcmLog -Context $context -Message ('The journal {0} could not be read ({1}): no old snapshot is deleted in this run, because a batch may still need it.' -f $config.Store.JournalPath, $inUse.Message) -Level Warning
         }
         if ($pruned) { Write-PcmItem -Context $context -Status Info -Text ('{0} old snapshot(s) deleted (Store.KeepSnapshots = {1})' -f $pruned, $config.Store.KeepSnapshots) }
-        $backup = Backup-PcmStore $connection $config.Store.BackupFolder ('PraCloudMailbox_{0}_snapshot{1}_{2}.db' -f $config.Environment, $id, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        $backup = Backup-PcmStore $connection $config.Store.BackupFolder ('PraCloudMailbox_{0}_snapshot{1}_{2}.db' -f $config.Environment, $id, (Get-Date).ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture))
         [void]$context.BackupFiles.Add($backup)
         Write-PcmItem -Context $context -Status Ok -Icon Backup -Text "Copy of the database: $backup"
         $finished = $true
@@ -1291,6 +1291,29 @@ function Confirm-PcmSnapshotHash {
     }
 }
 
+function Assert-PcmSameEnvironment {
+    <# Refuses a snapshot or a batch made for another Environment than the one of the configuration (letter case ignored). A record that holds no Environment is accepted. #>
+    param([Parameter(Mandatory)][string]$What, [AllowNull()][object]$Found)
+    $madeFor = [string]$Found
+    $expected = [string]$context.Config.Environment
+    if (-not $madeFor -or (Test-PcmSameText $madeFor $expected)) { return }
+    $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+    throw ("{0} was made for Environment '{1}' and the configuration says '{2}'. Nothing was changed. Run the command with the configuration of Environment '{1}'{3}." -f $What, $madeFor, $expected, $(if ($What -like 'Snapshot*') { ', or run Collect again with this configuration' } else { '' }))
+}
+
+function Assert-PcmBatchOwner {
+    <# Refuses a batch made for another Environment or in another tenant than the ones of the configuration. A batch of an earlier version holds no tenant: it is accepted. #>
+    param([Parameter(Mandatory)][object]$Row)
+    $what = 'Batch {0}' -f (Get-PcmValue $Row 'id' '')
+    Assert-PcmSameEnvironment -What $what -Found (Get-PcmValue $Row 'environment' '')
+    $tenant = [string](Get-PcmValue $Row 'tenant_id' '')
+    $expected = [string](Get-PcmValue (Get-PcmValue $context.Config 'Cloud' @{}) 'TenantId' '')
+    if (-not $tenant) { Write-PcmLog -Context $context -Message ('{0} was made before batches kept their tenant: the tenant of the batch is not checked.' -f $what) -Level Detail; return }
+    if (-not $expected -or (Test-PcmSameText $tenant $expected)) { return }
+    $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+    throw ("{0} was made in tenant {1} and Cloud.TenantId is {2}. Nothing was changed. Run the command with the configuration of tenant {1}: a batch cannot be continued, checked or rolled back in another tenant." -f $what, $tenant, $expected)
+}
+
 function Read-PcmSnapshotData {
     <#
     Loads one snapshot (default: the last complete one), resolves -Group, applies the source of the run (-Identity, -CsvPath, -SearchBase, -Group), -Scope and -MaxObjects
@@ -1316,6 +1339,7 @@ function Read-PcmSnapshotData {
                 else { "No complete snapshot in $($config.Store.Path): run Collect -Mode Apply (it reads Exchange.Server) or copy the snapshot database here." })
         }
         if ($snap.status -ne 'Complete') { throw "Snapshot $($snap.id) is $($snap.status), not Complete." }
+        if (-not $Batch) { Assert-PcmSameEnvironment -What ('Snapshot {0}' -f $snap.id) -Found (Get-PcmValue $snap 'environment' '') }
         $records = @(Read-PcmTable $connection mailbox $snap.id)
         $permissions = @(Read-PcmTable $connection permission $snap.id)
         $members = @(Read-PcmTable $connection group_member $snap.id)
@@ -1341,11 +1365,11 @@ function Read-PcmSnapshotData {
     }
     $taken = [datetime]::Parse([string]$snap.finished_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
     $age = (Get-Date).ToUniversalTime() - $taken.ToUniversalTime()
-    $context.SnapshotLabel = '{0} {1} {2:yyyy-MM-dd HH:mm} UTC {1} {3}' -f $snap.id, $dot, $taken.ToUniversalTime(), $snap.exchange_server
+    $context.SnapshotLabel = '{0} {1} {2} UTC {1} {3}' -f $snap.id, $dot, $taken.ToUniversalTime().ToString('yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture), $snap.exchange_server
     $context.Server = [string]$snap.exchange_server
-    $scopeInfo = $null; try { $scopeInfo = [string]$snap.scope_json | ConvertFrom-Json } catch { $scopeInfo = $null }
+    $scopeInfo = $null; try { $scopeInfo = [string]$snap.scope_json | ConvertFrom-PcmJson } catch { $scopeInfo = $null }
     $partial = $scopeInfo -and [string](Get-PcmValue $scopeInfo 'Identity' '')
-    Write-PcmItem -Context $context -Status Ok -Text ('Snapshot {0} of {1:yyyy-MM-dd HH:mm} UTC from {2} ({3} mailbox(es), {4} permission(s))' -f $snap.id, $taken.ToUniversalTime(), $snap.exchange_server, $records.Count, $permissions.Count)
+    Write-PcmItem -Context $context -Status Ok -Text ('Snapshot {0} of {1} UTC from {2} ({3} mailbox(es), {4} permission(s))' -f $snap.id, $taken.ToUniversalTime().ToString('yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture), $snap.exchange_server, $records.Count, $permissions.Count)
     if ($partial) { Write-PcmLog -Context $context -Message ('Snapshot {0} holds one object only ({1}): not a full Collect.' -f $snap.id, $scopeInfo.Identity) -Level Warning }
     if ($age.TotalDays -gt $config.Store.MaxSnapshotAgeDays) { Write-PcmLog -Context $context -Message ('Snapshot {0:0} day(s) old (Store.MaxSnapshotAgeDays = {1}): permissions and addresses may have changed since.' -f $age.TotalDays, $config.Store.MaxSnapshotAgeDays) -Level Warning }
     if ($Group) { $context.GroupTarget = Resolve-PcmGroupTarget -Snapshot $snap -Found $found -CapturedMembers $capturedMembers -Records $records }
@@ -1480,7 +1504,7 @@ function Get-PcmJsonField {
     if (-not $Item) { return $null }
     $text = [string](Get-PcmValue $Item 'result_json' '')
     if (-not $text) { return $null }
-    try { $value = $text | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
+    try { $value = $text | ConvertFrom-PcmJson } catch { return $null }
     if ($null -eq $value -or -not $value.PSObject.Properties[$Name]) { return $null }
     return $value.$Name
 }
@@ -1498,9 +1522,11 @@ function Invoke-PcmCheckBatch {
     $context.Journal = Open-PcmStore -Path $config.Store.JournalPath -Root $context.Root -Kind Journal -ReadOnly
     $given = Get-PcmBatch $context.Journal -Id $Batch
     if (-not $given) { throw "Batch $Batch not found in $($config.Store.JournalPath)." }
+    Assert-PcmBatchOwner -Row $given
     $isRecover = Test-PcmSameText $given.action 'Recover'
     $convert = if ($isRecover) { Get-PcmBatch $context.Journal -Id ([string]$given.convert_batch) } else { $given }
     if (-not $convert) { throw ('The Convert batch {0} of Recover batch {1} is not in the journal.' -f $given.convert_batch, $given.id) }
+    if ($isRecover) { Assert-PcmBatchOwner -Row $convert }
     $expect = if ($Expect) { $Expect } elseif ($isRecover) { 'Deprovisioned' } else { 'Provisioned' }
     if ($isRecover -and $expect -eq 'Provisioned') { throw ('Batch {0} is a Recover batch: its objects are rolled back, not converted. Use -Expect Deprovisioned or -Expect Retained.' -f $given.id) }
     $context.BatchId = [string]$given.id
@@ -1602,6 +1628,7 @@ function Invoke-PcmCheckBatch {
                         $facts.HoldStamped = if ($holdSet) { Test-PcmToolHold -Set $holdSet -Holds @($holds) } else { [bool]@($holds | Where-Object { ([string]$_).StartsWith('UniH', [StringComparison]::OrdinalIgnoreCase) }).Count }
                     } else {
                         $inactive = Get-PcmJsonField $recoverByGuid[$guid] 'inactiveGuid'
+                        if (-not $inactive) { $inactive = Get-PcmJsonField $recoverByGuid[$guid] 'cloudGuid' }
                         if ($inactive) { $facts.InactiveFound = [bool](Get-Mailbox -InactiveMailboxOnly -Identity ([string]$inactive) -ErrorAction SilentlyContinue) }
                     }
                 }
@@ -1717,7 +1744,7 @@ function Get-PcmOriginalLicence {
     <# Direct licences recorded by Convert in original_json (none when the batch did not record them). #>
     param([AllowNull()][object]$Item)
     if (-not $Item -or -not $Item.original_json) { return @() }
-    try { $original = [string]$Item.original_json | ConvertFrom-Json } catch { return @() }
+    try { $original = [string]$Item.original_json | ConvertFrom-PcmJson } catch { return @() }
     if (-not $original.PSObject.Properties['licences']) { return @() }
     return @($original.licences | ForEach-Object { $_ } | Where-Object { $_ })
 }
@@ -2435,6 +2462,7 @@ function Invoke-PcmConvert {
         $context.CurrentOperation = 'Read-Batch'
         $resume = Get-PcmBatch $context.Journal -Id $Batch
         if (-not $resume -or $resume.action -ne 'Convert') { throw "Convert batch $Batch not found in $($config.Store.JournalPath)." }
+        Assert-PcmBatchOwner -Row $resume
         $rollbacks = @(Invoke-PcmSql $context.Journal "SELECT id, status FROM batch WHERE action = 'Recover' AND convert_batch = @c COLLATE NOCASE ORDER BY created_utc" @{ c = [string]$resume.id } -As Rows)
         if ($rollbacks.Count) {
             $context.NoChangeMade = $true; $context.NextOnFailure = $true; $context.CurrentIdentity = ''
@@ -2458,7 +2486,7 @@ function Invoke-PcmConvert {
     $context.RoomListIntents = @{}
     if ($resume) {
         foreach ($change in @(Get-PcmTenantChange $context.Journal $resume.id | Where-Object kind -eq 'NativeRoomList')) {
-            $intent = [string]$change.original_json | ConvertFrom-Json -ErrorAction Stop
+            $intent = [string]$change.original_json | ConvertFrom-PcmJson
             if ([string]$intent.lifecycle -ne 'CloudRoomList' -or [string]$intent.sourceGuid -ne [string]$change.target_id) { throw 'Invalid room-list creation journal.' }
             $context.RoomListIntents[[string]$change.target_id] = $intent
         }
@@ -2552,7 +2580,7 @@ function Invoke-PcmConvert {
     if (-not $plan.Count) { throw 'No object can be converted (see the reasons above).' }
     Confirm-PcmApply ('Convert {0} object(s) to Exchange Online ({1} user(s), {2} shared, {3} native resources)?' -f $plan.Count, $planUsers.Count, $planShared.Count, $planResources.Count)
     if (-not $resume) {
-        $context.BatchId = New-PcmBatch $context.Journal Convert @{ SnapshotId = [long]$data.Snapshot.id; SnapshotRunId = [string]$data.Snapshot.run_id; SnapshotHash = [string]$context.SnapshotHash; Environment = $config.Environment; Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $context.BatchId = New-PcmBatch $context.Journal Convert @{ SnapshotId = [long]$data.Snapshot.id; SnapshotRunId = [string]$data.Snapshot.run_id; SnapshotHash = [string]$context.SnapshotHash; Environment = $config.Environment; TenantId = [string]$config.Cloud.TenantId; Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
             ToolVersion = $toolVersion; ScopeJson = (@{ Identity = $Identity; CsvPath = $CsvPath; SearchBase = $SearchBase; Group = $Group; MaxObjects = $MaxObjects; Identities = @(Get-PcmIdentityList).Count; Scope = $Scope; UsersMode = $config.Licensing.Users.Mode } | ConvertTo-Json -Compress) }
         foreach ($entry in $plan) {
             if ($entry -in $planResources) {
@@ -3224,8 +3252,33 @@ function Get-PcmBatchUsersMode {
     param([AllowNull()][object]$Row)
     $text = [string](Get-PcmValue $Row 'scope_json' '')
     if (-not $text) { return '' }
-    try { $scope = $text | ConvertFrom-Json -ErrorAction Stop } catch { return '' }
+    try { $scope = $text | ConvertFrom-PcmJson } catch { return '' }
     return [string](Get-PcmValue $scope 'UsersMode' '')
+}
+
+function Test-PcmEntraConnectAvailable {
+    <#
+    Before the first change of a Recover: proves, with the account of the run, that the Entra Connect server answers (an authenticated read-only call to its ADSync module). It is asked only
+    when the tool runs the cycles by remoting itself (EntraConnect.Mode = Remoting): a script of the administrator is how the server is reached in Script mode, and Manual mode asks the operator.
+    Apply: a server that does not answer stops the run before any change. Preview: the same answer, as a warning, and the first next step says to fix it.
+    #>
+    $entra = $context.Config.EntraConnect
+    if (Test-PcmSameText $entra.Mode 'Manual') { return }
+    $context.CurrentOperation = 'Check-EntraConnect'
+    if (-not (Test-PcmSameText $entra.Mode 'Remoting')) {
+        Write-PcmLog -Context $context -Message ('EntraConnect.Mode = {0}: the script of EntraConnect.ScriptPath is how the Entra Connect server is reached, so the server is not checked before the run.' -f $entra.Mode) -Level Detail
+        return
+    }
+    $answer = Test-PcmSyncServer -Server ([string]$entra.Server)
+    if ($answer.Ok) {
+        Write-PcmItem -Context $context -Status Ok -Icon Sync -Text ('Entra Connect: {0}; the delta cycles run from this tool ({1})' -f $answer.Reason, $entra.Mode)
+        return
+    }
+    Write-PcmLog -Context $context -Message ('Entra Connect check, technical message: {0}' -f $answer.Technical) -Level Detail
+    $message = 'Entra Connect cannot be used from this tool: {0}. Fix that, or set EntraConnect.Mode = Manual in the configuration file and run the Entra Connect steps yourself when the tool asks.' -f $answer.Reason
+    if (Test-PcmSameText $context.Mode 'Apply') { $context.NoChangeMade = $true; $context.CurrentIdentity = ''; throw ('{0} Nothing was changed.' -f $message) }
+    $context.EntraProbeFailure = [string]$answer.Reason
+    Write-PcmLog -Context $context -Message $message -Level Warning
 }
 
 function Invoke-PcmRecover {
@@ -3236,10 +3289,12 @@ function Invoke-PcmRecover {
     $convert = Get-PcmBatch $context.Journal -Id $Batch
     if ($convert -and $convert.action -eq 'Recover' -and $convert.convert_batch) {
         $given = $convert
+        Assert-PcmBatchOwner -Row $given
         $convert = Get-PcmBatch $context.Journal -Id ([string]$given.convert_batch)
         if ($convert) { Write-PcmItem -Context $context -Status Info -Icon Batch -Text ('Batch {0} is a rollback of Convert batch {1}: the rollback goes on with Convert batch {1}.' -f $given.id, $convert.id) }
     }
     if (-not $convert -or $convert.action -ne 'Convert') { throw "Convert batch $Batch not found in $($config.Store.JournalPath)." }
+    Assert-PcmBatchOwner -Row $convert
     $existing = @(Invoke-PcmSql $context.Journal "SELECT * FROM batch WHERE action = 'Recover' AND convert_batch = @c COLLATE NOCASE ORDER BY created_utc DESC" @{ c = $convert.id } -As Rows)
     $resume = $existing | Where-Object { $_.status -in @('Running','Partial') } | Select-Object -First 1
     $context.ConvertBatchId = [string]$convert.id
@@ -3360,7 +3415,7 @@ function Invoke-PcmRecover {
         $row.ExchangeOnline = $exo.Type; $row.Holds = ($exo.Holds -join ', ')
         $lastStep = if ($previous.ContainsKey($guid)) { [string](Get-PcmValue $previous[$guid] 'step' '') } else { '' }
         if ($item.kind -ne 'User' -and $lastStep -in @('Deleting', 'Deleted', 'Inactive', 'Purged', 'TargetedSync') -and -not $exo.Type) {
-            $result = $null; try { $result = [string](Get-PcmValue $previous[$guid] 'result_json' '') | ConvertFrom-Json } catch { $result = $null }
+            $result = $null; try { $result = [string](Get-PcmValue $previous[$guid] 'result_json' '') | ConvertFrom-PcmJson } catch { $result = $null }
             $entry.Path = 'SharedDeleted'
             $entry.CloudGuid = [string](Get-PcmValue $result 'inactiveGuid' '')
             if (-not $entry.CloudGuid) { $entry.CloudGuid = [string](Get-PcmValue $result 'cloudGuid' '') }
@@ -3393,9 +3448,12 @@ function Invoke-PcmRecover {
     $recoverEstimate = Get-PcmDurationEstimate -UserWaves ([Math]::Ceiling(@($planUsers + $planBack).Count / [Math]::Max(1, [int](Get-PcmValue $context 'UserWaveSize' 500)))) -SharedRounds ([Math]::Ceiling($planShared.Count / (Get-PcmRecoverWaveSize $config)))
     if ($recoverEstimate.Text) { Write-PcmItem -Context $context -Status Info -Icon Clock -Text ('Rough estimate: about {0} (typical tenant; a slow Microsoft 365 evening can take much longer)' -f $recoverEstimate.Text) }
     foreach ($entry in $plan) { $entry.Row.FinalStatus = 'Planned'; Write-PcmLog -Context $context -Message ('Planned: {0} ({1})' -f $entry.Row.Identity, $entry.Path) -Level Sub }
+    if ($planUsers.Count -or $planShared.Count) { Test-PcmEntraConnectAvailable }
     if ($context.Mode -ne 'Apply') {
         foreach ($title in @('Users: back on-premises', 'Shared mailboxes', 'Licence group')) { Skip-PcmStep -Title $title -Reason 'Preview: not run.' -Icon Write }
-        $context.NextSteps = @('To make the changes, run the same command in Apply mode (the confirmation is asked once):', (Get-PcmCommandLine -ActionName 'Recover' -ModeName 'Apply' -BatchId ([string]$convert.id) -KeepFilters))
+        $probeFailure = [string](Get-PcmValue $context 'EntraProbeFailure' '')
+        $context.NextSteps = @($(if ($probeFailure) { 'Fix the Entra Connect access first ({0}), or set EntraConnect.Mode = Manual in the configuration file. Then run the same command in Apply mode (the confirmation is asked once):' -f $probeFailure } else { 'To make the changes, run the same command in Apply mode (the confirmation is asked once):' }),
+            (Get-PcmCommandLine -ActionName 'Recover' -ModeName 'Apply' -BatchId ([string]$convert.id) -KeepFilters))
         return
     }
     if (-not $plan.Count) { throw 'Nothing to roll back (see above).' }
@@ -3403,7 +3461,7 @@ function Invoke-PcmRecover {
     Confirm-PcmApply (('Roll back {0} object(s) of Convert batch {1}?' -f $plan.Count, $convert.id) + $lossWarning)
     if ($resume) { $context.BatchId = [string]$resume.id }
     else {
-        $context.BatchId = New-PcmBatch $context.Journal Recover @{ ConvertBatch = $convert.id; SnapshotId = [long]$convert.snapshot_id; SnapshotRunId = [string]$context.SnapshotRunId; SnapshotHash = [string]$context.SnapshotHash; Environment = $config.Environment
+        $context.BatchId = New-PcmBatch $context.Journal Recover @{ ConvertBatch = $convert.id; SnapshotId = [long]$convert.snapshot_id; SnapshotRunId = [string]$context.SnapshotRunId; SnapshotHash = [string]$context.SnapshotHash; Environment = $config.Environment; TenantId = [string]$config.Cloud.TenantId
             Account = [Security.Principal.WindowsIdentity]::GetCurrent().Name; ToolVersion = $toolVersion; ScopeJson = (@{ Identity = $Identity; CsvPath = $CsvPath; SearchBase = $SearchBase; Group = $Group; MaxObjects = $MaxObjects; Identities = @(Get-PcmIdentityList).Count; Scope = $Scope } | ConvertTo-Json -Compress) }
     }
     foreach ($entry in $plan) {
@@ -3489,7 +3547,7 @@ WHERE cb.action = 'Convert' AND ci.kind = 'User' AND ci.step IS NOT NULL
             (Get-PcmCommandLine -ActionName 'Recover' -ModeName 'Apply' -BatchId ([string]$convert.id) -KeepFilters)
         })
     $createdLists = @(Get-PcmTenantChange $context.Journal $convert.id | Where-Object kind -eq 'NativeRoomList' |
-        ForEach-Object { [string]$_.original_json | ConvertFrom-Json -ErrorAction Stop } | Where-Object { $_.operation -eq 'Create' -and $_.creationAttempted })
+        ForEach-Object { [string]$_.original_json | ConvertFrom-PcmJson } | Where-Object { $_.operation -eq 'Create' -and $_.creationAttempted })
     if ($createdLists.Count) {
         Write-PcmItem -Context $context -Status Info -Text "$($createdLists.Count) journaled cloud room list(s) retained: Recover never deletes groups or inserts routing contacts into RoomLists; review room discovery separately."
     }
@@ -3651,7 +3709,7 @@ finally {
         try { Disconnect-PcmExchange -Context $context } catch { $context.Issues.Add([pscustomobject]@{ Message = "Exchange session: $($_.Exception.Message)"; Source = 'Exchange' }) }
     }
     if ($Action -notin @('Collect', 'Schedule') -and (Get-Command Disconnect-PcmCloud -ErrorAction SilentlyContinue)) {
-        try { Add-PcmModuleWarning -Warning @($PcmEntryModuleWarnings); $PcmEntryModuleWarnings.Clear(); Disconnect-PcmCloud -Context $context } catch { $context.Issues.Add([pscustomobject]@{ Message = "Cloud sign-out: $($_.Exception.Message)"; Source = 'Cloud' }) }
+        try { Add-PcmModuleWarning -Warning @($PcmEntryModuleWarnings); $PcmEntryModuleWarnings.Clear(); Disconnect-PcmCloud -Context $context } catch { Write-PcmLog -Context $context -Message ('Signing out of Microsoft 365 failed ({0}). This does not change the result of the run. Close this PowerShell window before you run another tool.' -f (ConvertTo-PcmPlainMessage $_.Exception.Message)) -Level Warning }
     }
     # The time limit of the calls goes with the run, whatever stopped it.
     if ($Action -ne 'Collect' -and (Get-Command Stop-PcmCallGuard -ErrorAction SilentlyContinue)) { try { Stop-PcmCallGuard } catch { $null = $_ } }
@@ -3668,10 +3726,10 @@ finally {
 }
 
 # SIG # Begin signature block
-# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKQYJKoZIhvcNAQcCoIImGjCCJhYCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCZdz/RZH/IxXkp
-# wWhRD8uPM1aE61BNUMuHT2C2Wv/CwqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDa812qC8ZOkhCf
+# Gh6lYmAbzFWqhL41GZWoc44Fx1hmVaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -3743,28 +3801,28 @@ finally {
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYEDCCGAwCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDrJF1Py9/y
-# FR1Y1+9/JPHtNcxiuM1InAYec5GI0NiiXDANBgkqhkiG9w0BAQEFAASCAgBgNc2a
-# Zf3XXa0D/tUP+QfkaW0dEIIaYKrQFV0swbvGVD06M4IGniv6wXsMS8MxNJiK8gmi
-# gq0UWlmvs1IC5ORxSrBEvSpCQdTg/G+i7sEAtD3vGZpyIZz4hxmypoFAtN+lUOrB
-# 5Zrawl1Bvnz6UM+PankJBtUHP9I0P6SBSWwWIy0pzxfqwqe26tvW9NxSryfUt5ac
-# ZHgtqjkpaF+78ByVZ2K2SaANFpznV+XsCVBFwX1MJqPmUy0QwhnKpP4FVYr9vshk
-# Epj1fSNOXhrmTO7/1mZAxdsl1w5PvlYDlzosZPZBWOrLCsW+B1niIk6JX/YJ79G7
-# rYVI+YtEEoE+jTWstiZBpBhQn9q3inz1F3vmcNmMiSGNhaOC0RshdG3dSOJ3YNg6
-# mQq6Hpg9Yno0Vi6haUpPckveEASdDya1xkJ6ig71B2lzMjB3XBeEan2ZuSlLiOHY
-# XnpVoR8x/KHdVJJ90ztGbj/6NakcwkA+GIaGv/88RVv+8NSiawxjXLLKvvcBFGZc
-# VQnhYLa8lC78Kw1LwFyS7uVVllqIqE0itwSuNEDF1ag8W1x+3dNbymG/fF7QE3wc
-# 3cVbpBoXktWnhwsjf6jVmL+brQ0EAWPSnVtMuq5ICxmrJmqvfvqTTZLbyb+pzWyG
-# X/hk6c3uL4QraKtGTxoT+ShD5WKSTbNWqqbK+KGCFM4wghTKBgorBgEEAYI3AwMB
-# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCjl8IH2CLW
+# d4kxLss/nZHAvvDCpGLsMCUqy0HS1d/3OzANBgkqhkiG9w0BAQEFAASCAgABrrRE
+# Jd5SQbKnn33uX8sFkbWYGvtuy2nZcEmqJYbFg6QUngbZb9Sh2z1zHbcwXKMtN6BX
+# jJ7Hfr64+xKdCbohH0UzxUUUVA/5BKBtFN+Xxu1xp0dq7ZaKg1heBNBKJDX1S4PU
+# garpvkVjr0i2XdrE7gMnmeXGzjSR3s2LDu/kX5UJ5jFQCADDcjKhfBeu26V6eSQ5
+# 1zMXwT6HR6K2z3Ar/Ehs7eBoXLKwJJ3qT9Y9n7JG16+0UBNn4FOZgCBj5SNFCMbJ
+# AgyUiqMoSVE1VfwFjcw4cYoVzWBNKA4honhJNx78W77TYLmrfd97SYEh/OofGzby
+# xbV6OYc8oFKgOUNx+PiMd19yqAG+u8GqSaokRe9xxrmMB5hKpyCnI47YcOYX/Gx5
+# mnWvBw0CyWSwgTLRarzExOKMY3EY13F0n0SbO6T0ixMv70mcJ1ct4CPDVn7gj1dB
+# 6Adj1A8CGOO8eBXEB2RN8EhvRCC3MzxVA0sqYfq9L+0py+oXhAac21vJIUluoJfO
+# 86JY5sbvqEl/3er1jGjpe7/jRNm1Un0Ou8pRFTrLbxFKt0zBIOsgCyRh46bK6/wX
+# 28RaRrdhm+S4w+hEN5ij4xSFyN3RtuyG8hUifaruede5BDdj5yMLhATRjpMeIy9a
+# LZlCnj6UUBcoKv2EfFJiU8T16RoMjIk+4CFF0KGCFM0wghTJBgorBgEEAYI3AwMB
+# MYIUuTCCFLUGCSqGSIb3DQEHAqCCFKYwghSiAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIO019iMMwVkiXRyKrq2X6qCoZgR5Rl7ldu6SAWra2ku6AggvrXRzIh/v
-# 2hgPMjAyNjExMTUyMDA2MDZaMAMCAQECECeseSyF5mrejzdhaAdnfGKgghGnMIIE
+# BAIBBQAEINyhLZgudDyrMyjU70Sa1chNaZ0ZngeeSpct6CEp2Ue+Agg4OFGpjJGm
+# VxgPMjAyNjExMTcxODM4NDVaMAMCAQECEBuPMOSAWurRJ4UAJDK0Kv6gghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -3859,17 +3917,17 @@ finally {
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlUwggJRAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNTIwMDYwNlowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIGSm
-# jtOhtq3OV+OIlbeiQnpCYSXhnFGu06Fxa7UnmG0xMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNzE4Mzg0NVowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIJER
+# 1ckN/8kfeFQqa1riEYahQ3DVl9zad5lF3pEcaNL1MIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiEAkYUaLkkUgmmEzV1vWUGy0u0xzZCEJPN0Rk5zYgpnR6ICIGNX
-# M5bRw+Tx/A915nIIsOpI8R2fxH0jMgggB1KZP1MT
+# zj0EAwIERjBEAiBFIqv3xBIiKCc4UFlW9KcwbJMq066zOg0Ozc61TrwwJAIgSgtR
+# hZmGoW57oyEW1hNeZuMkozEVag0GrehFP9SxW6k=
 # SIG # End signature block

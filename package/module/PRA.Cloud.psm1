@@ -24,7 +24,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.1.0
+    Version : 2.1.1
 #>
 #Requires -Version 7.5
 Set-StrictMode -Version Latest
@@ -470,7 +470,7 @@ function Connect-PcmCloud {
     $certificate = Get-ChildItem -Path "Cert:\CurrentUser\My\$($cloud.CertificateThumbprint)", "Cert:\LocalMachine\My\$($cloud.CertificateThumbprint)" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $certificate) { throw "Certificate $($cloud.CertificateThumbprint) not found in Cert:\CurrentUser\My nor Cert:\LocalMachine\My." }
     if (-not $certificate.HasPrivateKey) { throw "Certificate $($cloud.CertificateThumbprint) has no private key on this computer." }
-    if ($certificate.NotAfter -lt (Get-Date).AddDays(30)) { $Context['CertificateWarning'] = "The certificate expires on $($certificate.NotAfter.ToString('yyyy-MM-dd'))." }
+    if ($certificate.NotAfter -lt (Get-Date).AddDays(30)) { $Context['CertificateWarning'] = "The certificate expires on $($certificate.NotAfter.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture))." }
     if ($Context['Approval'] -isnot [scriptblock]) { throw 'The run gives no approval for its changes: it cannot sign in to the cloud. Nothing was done.' }
     Import-Module Microsoft.Graph.Authentication -MinimumVersion $script:MinGraphVersion -ErrorAction Stop
     try {
@@ -482,17 +482,20 @@ function Connect-PcmCloud {
         try { Connect-MgGraph -ClientId $cloud.AppId -TenantId $cloud.TenantId -CertificateThumbprint $cloud.CertificateThumbprint -ContextScope Process -NoWelcome -ErrorAction Stop } finally { Exit-PcmCall }
         Assert-PcmGraphTransport
         Import-Module ExchangeOnlineManagement -MinimumVersion ([string](Get-PcmValue (Get-PcmValue $Context.Config 'Exo' @{}) 'MinModuleVersion' $script:MinExoVersion)) -ErrorAction Stop
+        Assert-PcmNoExoSession
         Enter-PcmCall -Call 'Connect-ExchangeOnline'
         try {
             Connect-ExchangeOnline -AppId $cloud.AppId -CertificateThumbprint $cloud.CertificateThumbprint -Organization $cloud.Organization -ShowBanner:$false `
                 -CommandName @(Get-PcmExoCommandName -Context $Context) -ErrorAction Stop
-        } finally { Exit-PcmCall }
+        } finally { Exit-PcmCall; Save-PcmExoConnectionId -Context $Context }
         $Context['ExoConnected'] = $true
+        Confirm-PcmExoSession -Context $Context
         Install-PcmCallGuard
-        return ('Microsoft Graph and Exchange Online, app {0}, certificate {1} (valid until {2})' -f $cloud.AppId, $cloud.CertificateThumbprint.Substring(0, 8), $certificate.NotAfter.ToString('yyyy-MM-dd'))
+        return ('Microsoft Graph and Exchange Online, app {0}, certificate {1} (valid until {2})' -f $cloud.AppId, $cloud.CertificateThumbprint.Substring(0, 8), $certificate.NotAfter.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture))
     } catch {
-        Disconnect-PcmCloud -Context $Context
-        throw
+        $failure = $_
+        Disconnect-PcmCloudAfterFailure -Context $Context
+        throw $failure
     }
 }
 
@@ -542,25 +545,101 @@ function Connect-PcmCloudInteractive {
         $connect = @{ ShowBanner = $false; CommandName = @(Get-PcmExoCommandName -Context $Context); ErrorAction = 'Stop' }
         $hint = if ([string]$cloud['UserPrincipalName']) { [string]$cloud['UserPrincipalName'] } else { $account }
         if ($hint) { $connect.UserPrincipalName = $hint }
+        Assert-PcmNoExoSession
         Enter-PcmCall -Call 'Connect-ExchangeOnline' -Seconds $signInSeconds
-        try { Connect-ExchangeOnline @connect } finally { Exit-PcmCall }
+        try { Connect-ExchangeOnline @connect } finally { Exit-PcmCall; Save-PcmExoConnectionId -Context $Context }
         $Context['ExoConnected'] = $true
+        Confirm-PcmExoSession -Context $Context
         Install-PcmCallGuard
         return ('Microsoft Graph and Exchange Online, interactive sign-in{0} (delegated permissions: {1})' -f $(if ($account) { " as $account" } else { '' }), ($scopes -join ', '))
     } catch {
-        Disconnect-PcmCloud -Context $Context
-        throw
+        $failure = $_
+        Disconnect-PcmCloudAfterFailure -Context $Context
+        throw $failure
     }
+}
+
+function Assert-PcmNoExoSession {
+    <# The tool never uses or closes an Exchange Online session that it did not open: one that already exists in this PowerShell stops the sign-in. #>
+    [CmdletBinding()]
+    param()
+    if (@(Get-ConnectionInformation -ErrorAction Stop).Count) { throw 'An Exchange Online session already exists in this PowerShell window: run the tool in a new PowerShell 7 window, started with -NoProfile if your profile signs in to Exchange Online (nothing was signed out).' }
+    if (-not (Get-Command -Name Disconnect-ExchangeOnline -ErrorAction Stop).Parameters.ContainsKey('ConnectionId')) {
+        throw 'This version of the ExchangeOnlineManagement module cannot sign out one connection (-ConnectionId): update the module, then run the command again.'
+    }
+}
+
+function Save-PcmExoConnectionId {
+    <# Keeps the IDs of the Exchange Online connections that exist after a sign-in: they are the only ones that the tool signs out. -Add keeps the ones of earlier sign-ins of the run too. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context, [switch]$Add)
+    $known = @(if ($Add -and $Context.ContainsKey('ExoConnectionIds')) { $Context['ExoConnectionIds'] })
+    try { $now = @(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { [string]$_.ConnectionId } | Where-Object { $_ }) } catch { $now = @() }
+    $Context['ExoConnectionIds'] = @($known + @($now | Where-Object { $id = $_; -not ($known | Where-Object { Test-PcmSameText $_ $id }) }))
+}
+
+function Assert-PcmSessionTenant {
+    <# One session that a sign-in opened belongs to the tenant of the configuration (a certificate sign-in reports the organisation domain). #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][object]$Connection, [Parameter(Mandatory)][string]$Name)
+    $cloud = $Context.Config.Cloud
+    $tenant = [string](Get-PcmValue $cloud 'TenantId' '')
+    $organization = [string](Get-PcmValue $cloud 'Organization' '')
+    $sessionTenant = [string](Get-PcmValue $Connection 'TenantID' '')
+    if ((Test-PcmSameText $sessionTenant $tenant) -or ($organization -and (Test-PcmSameText $sessionTenant $organization))) { return }
+    $action = if (Test-PcmSameText (Get-PcmValue $cloud 'SignIn' 'Certificate') 'Interactive') { 'Sign in with an account of tenant {0}' -f $tenant } else { 'Check Cloud.Organization and Cloud.TenantId in the configuration file' }
+    throw ('The {0} session is in tenant {1}, and Cloud.TenantId is {2}. Nothing was changed. {3}, then run the command again.' -f $Name, $(if ($sessionTenant) { $sessionTenant } else { 'unknown' }), $tenant, $action)
+}
+
+function Confirm-PcmExoSession {
+    <# The Exchange Online session that the sign-in opened is the only one of this PowerShell and belongs to the tenant of the configuration. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context)
+    $cloud = $Context.Config.Cloud
+    $connections = @(Get-ConnectionInformation -ErrorAction Stop)
+    if (-not $connections.Count) { throw 'No Exchange Online connection was found in this PowerShell window after the sign-in. Nothing was changed. Run the command again.' }
+    if ($connections.Count -ne 1) { throw 'Exactly one Exchange Online connection is expected in this PowerShell window after the sign-in. Close the other sessions, then run the command again.' }
+    Assert-PcmSessionTenant -Context $Context -Connection $connections[0] -Name 'Exchange Online'
+    $appId = [string](Get-PcmValue $cloud 'AppId' '')
+    $sessionApp = [string](Get-PcmValue $connections[0] 'AppId' '')
+    if ($appId -and -not (Test-PcmSameText (Get-PcmValue $cloud 'SignIn' 'Certificate') 'Interactive') -and -not (Test-PcmSameText $sessionApp $appId)) {
+        throw ('The Exchange Online session was opened by application {0}, and Cloud.AppId is {1}. Nothing was changed. Check Cloud.AppId and Cloud.CertificateThumbprint, then run the command again.' -f $(if ($sessionApp) { $sessionApp } else { 'unknown' }), $appId)
+    }
+}
+
+function Confirm-PcmComplianceSession {
+    <# The Security & Compliance session that the sign-in opened (the connections that did not exist before it) belongs to the tenant of the configuration. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context, [AllowEmptyCollection()][string[]]$Before = @())
+    $opened = @(Get-ConnectionInformation -ErrorAction Stop | Where-Object { $id = [string]$_.ConnectionId; -not ($Before | Where-Object { Test-PcmSameText $_ $id }) })
+    foreach ($connection in $opened) { Assert-PcmSessionTenant -Context $Context -Connection $connection -Name 'Security & Compliance' }
+}
+
+function Disconnect-PcmCloudAfterFailure {
+    <# Signs out after a sign-in that failed. A sign-out that fails too is logged: the error of the sign-in is the one that stops the run. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context)
+    try { Disconnect-PcmCloud -Context $Context }
+    catch { try { Write-PcmLog -Context $Context -Message ('Sign-out after the failed sign-in: {0}' -f $_.Exception.Message) -Level Warning } catch { $null = $_ } }
 }
 
 function Disconnect-PcmCloud {
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context)
+    $signOutErrors = [System.Collections.Generic.List[string]]::new()
     Uninstall-PcmCallGuard
-    if ($Context.ContainsKey('ExoConnected') -and $Context['ExoConnected']) {
+    $owned = @(if ($Context.ContainsKey('ExoConnectionIds')) { $Context['ExoConnectionIds'] })
+    if (($Context.ContainsKey('ExoConnected') -and $Context['ExoConnected']) -or $owned.Count) {
         Enter-PcmCall -Call 'Disconnect-ExchangeOnline' -Seconds $script:CallGuardCleanupSeconds -Cleanup
-        try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction Stop 6>$null | Out-Null } catch { $null = $_ } finally { Exit-PcmCall }
-        $Context['ExoConnected'] = $false
+        try {
+            if (-not $owned.Count) { throw 'the Exchange Online connections of this run are not known, so none is closed' }
+            $current = @(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { [string]$_.ConnectionId })
+            foreach ($id in $owned) {
+                if ($current | Where-Object { Test-PcmSameText $_ $id }) { Disconnect-ExchangeOnline -ConnectionId $id -Confirm:$false -ErrorAction Stop 6>$null | Out-Null }
+            }
+            $Context['ExoConnected'] = $false
+            $Context['ExoConnectionIds'] = @()
+        } catch { $signOutErrors.Add('Exchange Online sign-out: ' + $_.Exception.Message) } finally { Exit-PcmCall }
     }
     foreach ($text in @(Read-PcmModuleWarning)) { try { Write-PcmLog $Context ('Microsoft 365 module warning: ' + $text) -Level Detail } catch { $null = $_ } }
     if ([object]::ReferenceEquals($script:GraphRequestOwner, $Context)) {
@@ -568,8 +647,7 @@ function Disconnect-PcmCloud {
         Set-PcmWriteApproval -Approval $null
         if ($Context.ContainsKey('GraphConnected') -and $Context['GraphConnected']) {
             Enter-PcmCall -Call 'Disconnect-MgGraph' -Seconds $script:CallGuardCleanupSeconds -Cleanup
-            try { $null = Disconnect-MgGraph -ErrorAction Stop } catch { $null = $_ } finally { Exit-PcmCall }
-            $Context['GraphConnected'] = $false
+            try { $null = Disconnect-MgGraph -ErrorAction Stop; $Context['GraphConnected'] = $false } catch { $signOutErrors.Add('Microsoft Graph sign-out: ' + $_.Exception.Message) } finally { Exit-PcmCall }
         }
         try {
             # Never reset a cached authenticated client just to restore request settings.
@@ -590,6 +668,7 @@ function Disconnect-PcmCloud {
         } catch { Write-Warning $_.Exception.Message }
     }
     if ($null -ne $script:CallGuard -and [object]::ReferenceEquals($script:CallGuard.Context, $Context)) { Stop-PcmCallGuard }
+    if ($signOutErrors.Count) { throw ($signOutErrors -join ' | ') }
 }
 
 function Test-PcmNetworkFailure {
@@ -645,11 +724,15 @@ function Invoke-PcmGraph {
             $code = 0
             try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = 0 }
             if ($code -eq 404 -and $AllowNotFound) { return $null }
-            if (-not $NoRetry -and $code -in @(429, 502, 503, 504) -and $attempt -lt 5) { Start-Sleep -Seconds (5 * $attempt); continue }
+            if (-not $NoRetry -and $code -in @(429, 502, 503, 504) -and $attempt -lt 5) {
+                $wait = [Math]::Max((5 * $attempt), (Get-PcmErrorRetryAfterSecond -Exception $_.Exception))
+                if ($wait -gt (5 * $attempt) -and $script:GraphRequestOwner) { Write-PcmLog -Context $script:GraphRequestOwner -Message ('Microsoft Graph asks to wait {0} s' -f $wait) -Level Detail }
+                Start-Sleep -Seconds $wait; continue
+            }
             if (-not $NoRetry -and $code -eq 0 -and $attempt -lt 5 -and (Test-PcmNetworkFailure $_.Exception)) { Start-Sleep -Seconds (10 * $attempt); continue }
             # The Graph message (error.code: error.message) says what is wrong; the exception alone only says "BadRequest".
             $detail = ''
-            try { $graphError = ([string]$_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop).error; $detail = '{0}: {1}' -f $graphError.code, $graphError.message } catch { $detail = '' }
+            try { $graphError = ([string]$_.ErrorDetails.Message | ConvertFrom-PcmJson).error; $detail = '{0}: {1}' -f $graphError.code, $graphError.message } catch { $detail = '' }
             if ($detail) { throw [System.InvalidOperationException]::new(('{0} {1} failed ({2}): {3}' -f $Method, ($Uri -replace '\?.*$', ''), $code, $detail), $_.Exception) }
             throw
         }
@@ -1132,7 +1215,7 @@ function Test-PcmTenantReadiness {
     $organization = $Tenant.Organization
     if ($organization -and $organization.onPremisesSyncEnabled -and $organization.onPremisesLastSyncDateTime) {
         $last = [datetime]$organization.onPremisesLastSyncDateTime
-        & $add 'Info' 'DIRECTORY_SYNC' ('Last Entra Connect synchronisation: {0:yyyy-MM-dd HH:mm} UTC.' -f $last.ToUniversalTime())
+        & $add 'Info' 'DIRECTORY_SYNC' ('Last Entra Connect synchronisation: {0} UTC.' -f $last.ToUniversalTime().ToString('yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture))
     }
     $orgHolds = @(if ($Tenant.PSObject.Properties['OrgHolds']) { $Tenant.OrgHolds | Where-Object { $_ } })
     if ($orgHolds.Count) {
@@ -1238,8 +1321,25 @@ function Get-PcmExoStateSet {
     return $result
 }
 
+function ConvertTo-PcmRetryAfterSecond {
+    <# The seconds that a Retry-After value asks for: a number of seconds, or an HTTP date (the time left until it). 0 when it is empty, unreadable or past; never more than two minutes. #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return 0 }
+    $value = $Text.Trim()
+    $seconds = 0
+    if ([int]::TryParse($value, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$seconds)) { return [Math]::Min([Math]::Max($seconds, 0), 120) }
+    $date = [datetimeoffset]::MinValue
+    if ([datetimeoffset]::TryParse($value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$date)) {
+        $left = [Math]::Ceiling(($date - [datetimeoffset]::UtcNow).TotalSeconds)
+        return [int][Math]::Min([Math]::Max($left, 0), 120)
+    }
+    return 0
+}
+
 function Get-PcmRetryAfterSecond {
-    <# The Retry-After (seconds) that Microsoft Graph gave in the answer of one request of a batch: 0 when there is none, never more than two minutes. #>
+    <# The Retry-After (seconds or HTTP date) that Microsoft Graph gave in the answer of one request of a batch: 0 when there is none, never more than two minutes. #>
     [CmdletBinding()]
     [OutputType([int])]
     param([AllowNull()][object]$Response)
@@ -1248,9 +1348,23 @@ function Get-PcmRetryAfterSecond {
     $names = if ($headers -is [System.Collections.IDictionary]) { @($headers.Keys) } else { @($headers.PSObject.Properties.Name) }
     foreach ($name in $names) {
         if (-not [string]::Equals([string]$name, 'Retry-After', [StringComparison]::OrdinalIgnoreCase)) { continue }
-        $seconds = 0
-        if ([int]::TryParse([string](Get-PcmValue $headers ([string]$name) ''), [ref]$seconds) -and $seconds -gt 0) { return [Math]::Min($seconds, 120) }
+        $seconds = ConvertTo-PcmRetryAfterSecond -Text ([string](Get-PcmValue $headers ([string]$name) ''))
+        if ($seconds -gt 0) { return $seconds }
     }
+    return 0
+}
+
+function Get-PcmErrorRetryAfterSecond {
+    <# The Retry-After of the answer that a failed direct request got (the response of the exception): 0 when the exception holds no response or the response no such header. #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([AllowNull()][Exception]$Exception)
+    try {
+        $headers = $Exception.Response.Headers
+        if ($null -eq $headers) { return 0 }
+        $values = $null
+        if ($headers.TryGetValues('Retry-After', [ref]$values)) { return (ConvertTo-PcmRetryAfterSecond -Text ([string]($values | Select-Object -First 1))) }
+    } catch { $null = $_ }
     return 0
 }
 
@@ -1449,7 +1563,7 @@ function Test-PcmNativeResource {
 function Get-PcmResourceIntent {
     param([AllowNull()][object]$Item)
     if (-not $Item -or -not (Get-PcmValue $Item 'original_json' '')) { return $null }
-    $value = [string]$Item.original_json | ConvertFrom-Json -ErrorAction Stop
+    $value = [string]$Item.original_json | ConvertFrom-PcmJson
     if ([string](Get-PcmValue $value 'lifecycle' '') -eq 'CloudResource') {
         $token = [string](Get-PcmValue $value 'token' '')
         if ($token -notmatch '^[a-f0-9]{32}$' -or [string](Get-PcmValue $value 'creationName' '') -cnotmatch ("^PRA-R-[a-f0-9]{{8}}-[a-f0-9]{{8}}-{0}$" -f $token) -or
@@ -1595,7 +1709,7 @@ function Get-PcmResourceAddresses {
     if ($primary -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw 'Resource primary SMTP address is invalid.' }
     $values = @("SMTP:$primary")
     $json = [string](Get-PcmValue $Record 'email_addresses_json' '')
-    if ($json) { $values += @(($json | ConvertFrom-Json -ErrorAction Stop) | ForEach-Object { [string]$_ }) }
+    if ($json) { $values += @(($json | ConvertFrom-PcmJson) | ForEach-Object { [string]$_ }) }
     $legacy = [string](Get-PcmValue $Record 'legacy_exchange_dn' '')
     if ($legacy) { $values += "X500:$legacy" }
     # Keep the original primary, not an accidental primary flag on another collected proxy.
@@ -1968,7 +2082,7 @@ function Read-PcmResourceSettings {
     param([object]$Record)
     $json = [string](Get-PcmValue $Record 'resource_settings_json' '')
     if (-not $json) { throw 'Native resource settings are missing (v1 snapshot): Collect is required before CloudResource Convert.' }
-    $settings = $json | ConvertFrom-Json -ErrorAction Stop
+    $settings = $json | ConvertFrom-PcmJson
     if ([int](Get-PcmValue $settings 'SchemaVersion' 0) -ne 2 -or -not $settings.PSObject.Properties['Capacity'] -or
         -not $settings.PSObject.Properties['ResourceCustom'] -or -not $settings.PSObject.Properties['Calendar'] -or
         -not $settings.PSObject.Properties['CalendarConfiguration'] -or -not $settings.PSObject.Properties['Directory'] -or
@@ -2311,6 +2425,39 @@ function Enable-PcmResourceBooking {
     Assert-PcmResourceCalendar -Parameters $Calendar -Fields @($Calendar.Keys | Where-Object { $_ -notin @('Identity','ErrorAction') })
 }
 
+function ConvertTo-PcmExoDateText {
+    <#
+    Exchange Online reads a text in the form of an ISO 8601 date and time with seconds (2025-01-31T00:00:00Z, with or without a fraction, a Z or an offset) as a date, and stores it as
+    month/day/year hours:minutes:seconds in UTC. Answers the text that Exchange Online keeps for such a value, or $null for any other text, which it keeps as it is.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    if ($Text -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})?$') { return $null }
+    $parsed = [datetimeoffset]::MinValue
+    if (-not [datetimeoffset]::TryParse($Text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) { return $null }
+    return $parsed.UtcDateTime.ToString('MM/dd/yyyy HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Test-PcmResourceTextRestored {
+    <# Is the text that Exchange Online reads back the text that was written? A date and time in the ISO 8601 form is read back in the form that Exchange Online keeps for it. #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([AllowNull()][AllowEmptyString()][string]$Wanted, [AllowNull()][AllowEmptyString()][string]$Actual)
+    if ($Actual -ieq $Wanted) { return $true }
+    $kept = ConvertTo-PcmExoDateText -Text $Wanted
+    return ($null -ne $kept -and $Actual -ieq $kept)
+}
+
+function Add-PcmExoDateWarning {
+    <# Tells the operator that Exchange Online keeps a date-like text of the resource in its own form. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Name, [AllowNull()][AllowEmptyString()][string]$Text)
+    $kept = ConvertTo-PcmExoDateText -Text $Text
+    if ($null -eq $kept) { return }
+    Add-PcmModuleWarning -Warning @(('Exchange Online keeps {0} of a resource, written as {1}, in the form of a date: {2} (UTC). It reads every text of the form of an ISO 8601 date and time that way.' -f $Name, $Text, $kept))
+}
+
 function Set-PcmResourceConfiguration {
     param([object]$Record, [object]$Owned, [object]$Intent)
     $settings = Read-PcmResourceSettings $Record
@@ -2319,9 +2466,12 @@ function Set-PcmResourceConfiguration {
     $parameters[[string]$Intent.markerAttribute] = [string]$Intent.token
     $attributes = [string](Get-PcmValue $Record 'custom_attributes_json' '')
     if ($attributes) {
-        $custom = $attributes | ConvertFrom-Json -ErrorAction Stop
+        $custom = $attributes | ConvertFrom-PcmJson
         foreach ($property in $custom.PSObject.Properties) {
-            if ($property.Name -match '^CustomAttribute([1-9]|1[0-5])$' -and $property.Name -ne [string]$Intent.markerAttribute) { $parameters[$property.Name] = [string]$property.Value }
+            if ($property.Name -match '^CustomAttribute([1-9]|1[0-5])$' -and $property.Name -ne [string]$Intent.markerAttribute) {
+                $parameters[$property.Name] = [string]$property.Value
+                Add-PcmExoDateWarning -Name $property.Name -Text ([string]$property.Value)
+            }
         }
     }
     foreach ($field in $script:ResourceDeliveryFields) {
@@ -2339,9 +2489,10 @@ function Set-PcmResourceConfiguration {
     Set-User @directory
     $actualUser = Get-User -Identity $Owned.Id -ErrorAction Stop
     foreach ($field in $script:ResourceDirectoryFields) {
-        if (-not $actualUser.PSObject.Properties[$field] -or [string]$actualUser.$field -ine [string]$settings.Directory.$field) {
+        if (-not $actualUser.PSObject.Properties[$field] -or -not (Test-PcmResourceTextRestored -Wanted ([string]$settings.Directory.$field) -Actual ([string]$actualUser.$field))) {
             throw "Resource descriptive property verification failed: $field."
         }
+        if ([string]$actualUser.$field -ne [string]$settings.Directory.$field) { Add-PcmExoDateWarning -Name $field -Text ([string]$settings.Directory.$field) }
     }
     $calendar = @{ Identity = $Owned.Id; ErrorAction = 'Stop' }
     $fields = @($script:ResourceCalendarFields | Where-Object { $settings.Calendar.PSObject.Properties[$_] })
@@ -2781,6 +2932,7 @@ function Connect-PcmCompliance {
     param([Parameter(Mandatory)][hashtable]$Context)
     if ($Context.ContainsKey('ComplianceConnected') -and $Context['ComplianceConnected']) { return }
     $cloud = $Context.Config.Cloud
+    $before = @(if ($Context.ContainsKey('ExoConnectionIds')) { $Context['ExoConnectionIds'] })
     # -CommandName is required: the full session also loads Get-Recipient and Get-User, which hide the Exchange
     # Online cmdlets and return a stale view (a rolled back user still seen as UserMailbox).
     if (Test-PcmSameText (Get-PcmValue $cloud 'SignIn' 'Certificate') 'Interactive') {
@@ -2790,14 +2942,15 @@ function Connect-PcmCompliance {
             CommandName = @('Get-CaseHoldPolicy', 'Set-CaseHoldPolicy', 'New-CaseHoldPolicy', 'New-CaseHoldRule') }
         if ($hint) { $interactive.UserPrincipalName = $hint }
         Enter-PcmCall -Call 'Connect-IPPSSession' -Seconds ([Math]::Max((Get-PcmCallTimeoutSecond -Config $Context.Config), $script:CallGuardInteractiveSeconds))
-        try { Connect-IPPSSession @interactive } finally { Exit-PcmCall }
+        try { Connect-IPPSSession @interactive } finally { Exit-PcmCall; Save-PcmExoConnectionId -Context $Context -Add }
     } else {
         Enter-PcmCall -Call 'Connect-IPPSSession'
         try {
             Connect-IPPSSession -AppId $cloud.AppId -CertificateThumbprint $cloud.CertificateThumbprint -Organization $cloud.Organization -ShowBanner:$false -EnableSearchOnlySession `
                 -CommandName Get-CaseHoldPolicy, Set-CaseHoldPolicy, New-CaseHoldPolicy, New-CaseHoldRule -ErrorAction Stop
-        } finally { Exit-PcmCall }
+        } finally { Exit-PcmCall; Save-PcmExoConnectionId -Context $Context -Add }
     }
+    Confirm-PcmComplianceSession -Context $Context -Before $before
     $Context['ComplianceConnected'] = $true
     Install-PcmCallGuard
 }
@@ -3087,6 +3240,84 @@ function Invoke-PcmEntraConnect {
     }
 }
 
+# Read-only check of Entra Connect, run on EntraConnect.Server: it proves that the account of the run can use the ADSync module there. A bare WinRM test would not do, it does not authenticate.
+# It is self-contained: it also runs in the Windows PowerShell 5.1 endpoint.
+$script:PcmSyncProbe = {
+    $ErrorActionPreference = 'Stop'
+    $import = @{ Name = 'ADSync'; ErrorAction = 'Stop' }
+    if ([string]$PSVersionTable.PSEdition -eq 'Core') { $import.UseWindowsPowerShell = $true }
+    Import-Module @import
+    $scheduler = Get-ADSyncScheduler -ErrorAction Stop
+    [pscustomobject]@{ Computer = $env:COMPUTERNAME; CycleEnabled = [bool]$scheduler.SyncCycleEnabled }
+}
+
+function New-PcmSyncResult {
+    <# One answer of the Entra Connect check: Ok, Kind (Ok, Denied, Unreachable, NoModule or Failed), Server, Reason (plain words, with what to do) and Technical (the raw message). #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'In-memory constructor, no change to any target or file.')]
+    [CmdletBinding()]
+    param([bool]$Ok, [string]$Kind, [string]$Server = '', [string]$Reason = '', [string]$Technical = '')
+    [pscustomobject]@{ Ok = $Ok; Kind = $Kind; Server = $Server; Reason = $Reason; Technical = $Technical }
+}
+
+function Get-PcmSyncFailure {
+    <#
+    .SYNOPSIS
+        Plain words for a failed Entra Connect check: Kind (Denied, Unreachable, NoModule or Failed), Reason (what happened and what to do) and Technical (the raw message, for the log).
+        The account that is refused is the usual cause, so it is tested first, unless the message says that the server name is unknown (the remoting message of an unknown computer also names the authentication).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Failure, [string]$Server = '')
+    $exception = if ($Failure -is [Management.Automation.ErrorRecord]) { $Failure.Exception } else { [Exception]$Failure }
+    $technical = ([string]$exception.Message -replace '\s+', ' ').Trim()
+    $firstLine = ([string]$exception.Message -split '\r?\n' | Where-Object { $_.Trim() } | Select-Object -First 1)
+    $firstLine = ([regex]::Replace([string]$firstLine, '^\s*(?:[\w.]+Exception:\s*)', '') -replace '\s+at\s+[\w.]+\(.*$', '').Trim().TrimEnd('.')
+    if ($firstLine.Length -gt 200) { $firstLine = $firstLine.Substring(0, 197) + '...' }
+    $errorId = if ($Failure -is [Management.Automation.ErrorRecord]) { [string]$Failure.FullyQualifiedErrorId } else { '' }
+    $where = if ($Server) { $Server } else { 'this server' }
+    $unknownHost = $technical -match '(?i)cannot find the computer|cannot be resolved|no such host|name could not be resolved'
+    if (([int](Get-PcmValue $exception 'ErrorCode' 0) -eq 5) -or (-not $unknownHost -and $technical -match '(?i)access is denied|access denied|acc[eè]s refus|unauthorized|not authorized|logon failure|authentication|permission')) {
+        $reason = if ($Server) { 'the account of the run has no right on {0}: it must be allowed to open a remote session there (member of Remote Management Users or Administrators) and to use Entra Connect (member of ADSyncAdmins)' -f $Server }
+            else { 'the account of the run has no right to use Entra Connect on this server: it must be a member of ADSyncAdmins (or Administrators)' }
+        return New-PcmSyncResult -Ok $false -Kind 'Denied' -Server $Server -Reason $reason -Technical $technical
+    }
+    if ($errorId -match 'ModuleNotFound' -or ($technical -match '(?i)ADSync' -and $technical -match '(?i)not loaded|no valid module|could not be found|not recognized|cannot find|not found|FileNotFound')) {
+        $reason = if ($Server) { '{0} answered but the ADSync module is not installed there: it is not the Entra Connect server (check EntraConnect.Server)' -f $Server } else { 'the ADSync module is not on this server' }
+        return New-PcmSyncResult -Ok $false -Kind 'NoModule' -Server $Server -Reason $reason -Technical $technical
+    }
+    if ($Server -and ($exception.GetType().Name.Contains('PSRemotingTransportException') -or $technical -match '(?i)cannot connect|could not connect|cannot be resolved|cannot find the computer|no such host|network path|network name|timed out|did not respond|unreachable|WinRM|WS-Management|connection (was )?(refused|closed)|actively refused|server is unavailable')) {
+        return New-PcmSyncResult -Ok $false -Kind 'Unreachable' -Server $Server -Reason ('{0} does not answer to PowerShell remoting (WinRM, port 5985): check the server name in EntraConnect.Server, the network and the firewall' -f $Server) -Technical $technical
+    }
+    New-PcmSyncResult -Ok $false -Kind 'Failed' -Server $Server -Reason ('Entra Connect could not be checked on {0}: {1}' -f $where, $firstLine) -Technical $technical
+}
+
+function Test-PcmSyncServer {
+    <#
+    .SYNOPSIS
+        Proves that Entra Connect can be used FOR THIS ACCOUNT: an authenticated, read-only call to the ADSync module of the server (PowerShell remoting). The call is a remote job that is waited for
+        at most TimeoutSeconds, then stopped. Starts nothing, changes nothing.
+    .OUTPUTS
+        Ok, Kind (Ok, Denied, Unreachable, NoModule or Failed), Server, Reason (plain words) and Technical (the raw message).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Server, [ValidateRange(5, 600)][int]$TimeoutSeconds = 30)
+    $option = New-PSSessionOption -OpenTimeout ($TimeoutSeconds * 1000) -OperationTimeout ($TimeoutSeconds * 1000)
+    try { $job = Invoke-Command -ComputerName $Server -ScriptBlock $script:PcmSyncProbe -SessionOption $option -AsJob -ErrorAction Stop }
+    catch { return (Get-PcmSyncFailure $_ $Server) }
+    try {
+        $null = Wait-Job -Job $job -Timeout $TimeoutSeconds
+        if ([string]$job.State -in @('NotStarted', 'Running', 'Suspended', 'Stopping', 'Disconnected')) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            return New-PcmSyncResult -Ok $false -Kind 'Unreachable' -Server $Server -Technical ('no answer within {0} seconds' -f $TimeoutSeconds) `
+                -Reason ('{0} does not answer to PowerShell remoting (WinRM, port 5985) within {1} seconds: check the server name in EntraConnect.Server, the network and the firewall' -f $Server, $TimeoutSeconds)
+        }
+        $answer = Receive-Job -Job $job -ErrorAction Stop
+        if ($null -eq $answer) { return New-PcmSyncResult -Ok $false -Kind 'Failed' -Server $Server -Reason ('{0} answered nothing to the Entra Connect check' -f $Server) -Technical 'empty answer' }
+        New-PcmSyncResult -Ok $true -Kind 'Ok' -Server $Server -Reason ('{0} accepts this account and Entra Connect answers' -f $Server)
+    }
+    catch { Get-PcmSyncFailure $_ $Server }
+    finally { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+}
+
 function Invoke-PcmEntraConnectObject {
     <#
     .SYNOPSIS
@@ -3199,13 +3430,13 @@ Export-ModuleMember -Function Get-PcmRunningPipeline, Get-PcmCallTimeout, Get-Pc
     Wait-PcmCondition, Get-PcmExoState, Set-PcmSourceOfAuthority, Get-PcmSourceOfAuthority, Set-PcmUsageLocation, Set-PcmGroupMember,
     Test-PcmGroupMember, Get-PcmDisabledPlanForExchangeOnly, Set-PcmLicence, Get-PcmUserLicence, Get-PcmDirectLicence, Enable-PcmLicencePlan,
     Restore-PcmLicence, Remove-PcmIdentity, Test-PcmDeletedIdentity,
-    Connect-PcmCompliance, Get-PcmHoldPolicySet, Test-PcmToolHold, Add-PcmHoldLocationSet, Remove-PcmHoldLocationSet, Get-PcmKioskAssignment, Get-PcmSharedGrant, Grant-PcmSharedPermission, Invoke-PcmEntraConnect, Invoke-PcmEntraConnectObject
+    Connect-PcmCompliance, Get-PcmHoldPolicySet, Test-PcmToolHold, Add-PcmHoldLocationSet, Remove-PcmHoldLocationSet, Get-PcmKioskAssignment, Get-PcmSharedGrant, Grant-PcmSharedPermission, Test-PcmSyncServer, Invoke-PcmEntraConnect, Invoke-PcmEntraConnectObject
 
 # SIG # Begin signature block
-# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAAfFVmaISZ1iOT
-# hE4LEVQtKAG/o3tZWGcZgOe03b0KUKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCC4k+pLW2HeAetC
+# vzLqN9enOLywRDTL8wl7OVtCh9gdhqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -3277,28 +3508,28 @@ Export-ModuleMember -Function Get-PcmRunningPipeline, Get-PcmCallTimeout, Get-Pc
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYEjCCGA4CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDah8Fhb89F
-# j/dAWrRw+8ir8O37WcpAr+vtIrMSYlZtazANBgkqhkiG9w0BAQEFAASCAgA+6UHd
-# Uvr0DsK6pBSBLjqAl2SKEcVBwDlk7msHIxeaO5gpd0V6fbFtFAeRLLI4QLV0hnji
-# QLWZojwjwMLAYYx2Qsjq3U0MlVe+S1aZxmZ5J3sr89BIyxp3tSchmGEuge5w/i6r
-# i6BaB+cJz489yd+stjov+AzcQr9YoJuV3YLia8rRsw4dgg8AgC2jbsrVrRPBkcyc
-# kFbM6FXA4OHaShd3zhi7v95FTD/kEzO5vils3JBuiDZHg+AZ3SxEfNQLC13sKF77
-# X44r8oXHcZBYiQsf7+Lf3QQ3wUk8WwIys5Wbg17qWseWKxTfdbq4OVJdzDBqnxWZ
-# KTwlBzGLY7utAoTn+2b8yqSC6hNeAUiLoDqMzhvl9sTXkPVRm8gkNhAPgS6FgYJ0
-# EgdCTAdinSfvPl07/r72gYMydLbTkOxgd9xAcZxyzAv/oxEw0vy7lUQPezeuVSnC
-# NJ+uNFwbe/KsuW+rOzPHnlxd+viJcZ+MW+xhnGtZ65TPMiBWvlCqIerxwaPhGzJq
-# mLHj6P3AayMdWwSXcR3OWRguG66ulIZvZi8gj8chqS4tGC12B3WxmtljzYwZJAGh
-# 7XrGKMtvqS/xfIso2Tn79AcBT+NkgHeIak4eHr0izlmYQmz0HHmYDLZVxsdPpngN
-# 0EoTIqyERKPjSk3U5FLK1AMt9MHPr+cetFCVhqGCFM4wghTKBgorBgEEAYI3AwMB
-# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDoXi8+5V5f
+# jg/PAOiNOhinmF7N7v+KMgUlNavCQATHTTANBgkqhkiG9w0BAQEFAASCAgBt57ck
+# uZtwfBu/84MvMHIHNkSOWtFRKtUOfq9qagW069YDvbtihsbzzXNsjzLIyCH80Yui
+# bFWfL2q4WgSs7YIrCzCHLrO7NgmnknKCchY2zHgpM7vKApCSYzDQQq97qUwTLUBY
+# oeYZpI2/Aa+B4oOumBhT5N6YOpGwyXKs2pNsLGGxFTaTJF/ZcmqnARl6gjVXl0dt
+# 0kr3jnNCEkfHfuryU4m5GDBM5k9gbbeim5tIuR5Jdj8s+Jf+Ft9axLDm/yE/Ym92
+# LcdADg2CRp1fWVz4d06RVJg3k4Q0MvTfXK/xsyijuTpz8B/242piF19RVn5gId8W
+# v5ZFpEs7wExiJM4gjQHDiOYy83/4U76IZ9ZUlihUSKfgp+TsXTXJoJSODzw9Diwi
+# ar8mf1rOo0NTdcxGZUf+Rq8y1dwm/hrF0pCcMu3rgPjI/LyHWJS+LPkTt80ueve5
+# 0ZlatnN9ENunMWO8booq2ldpaDqmsNoja8hwR2rQW/4kNn/H5An2toBunQ8hzVkg
+# 5V5q9rKMx/5LOoOqtSB4HDOoGAo5mM3KEjFtATj2FtrHPjeA55NGiOSpulHNv4n6
+# 209/QGobBIappDYrNf6B0x0LaV71yj6Jxw1Jt92/cdoAk/5HY+FdX7dXFnKmEllz
+# O7PgR0KurcX0bRhTmJZtmTDQwARxCIvlW3N+aqGCFM8wghTLBgorBgEEAYI3AwMB
+# MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIAaQOmNqe+/J+6nc8DWNFORwNfk9LhaNHsIBSRnVl5tpAggipVm4Curx
-# GBgPMjAyNjExMTUyMDA2MjBaMAMCAQECEE3eph2uAR6JllzBtqHTZ6agghGnMIIE
+# BAIBBQAEIKPSvZbj9yy1yKgCA5OCXxJTKHQoXRI9U0QADcs03VozAggGAex7TMRv
+# axgPMjAyNjExMTcxODM5MTJaMAMCAQECEFHIBJi4yHM13V1A0+YJiCKgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -3393,17 +3624,17 @@ Export-ModuleMember -Function Get-PcmRunningPipeline, Get-PcmCallTimeout, Get-Pc
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlcwggJTAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNTIwMDYyMFowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIHxj
-# rSBC0BKADGDDKMihyqzQPiAy7FRTIR1+3LXcAU+tMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNzE4MzkxMlowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIP8L
+# lWdoJKnCS2J6Ej3roM8ur/4IlE9fFRR2x63tZ70hMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiAGEfWMwmZuclUMQbIvbdNJhc68Pynpdqw+XDOWX5IcgwIhAI9O
-# 6i1frtMzL5VAQoeMh+hu2cMLQUzpUf/EYSIlDhkz
+# zj0EAwIESDBGAiEAxE1pVfWhzVNsOj8L97oPC0+SbzwecqwYIDcQsampMDUCIQCL
+# hGiIcoONDm/GU9x1by0qe6GU15SOgH2gshntuJx+dw==
 # SIG # End signature block

@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.1.1 - 2026-11-17
+
+Highlights, in plain words:
+
+- **Values that look like dates.** A custom attribute or an office that looks like a date is written exactly as Collect read it. Exchange Online keeps such a text of a native room or equipment in its own date form: Convert accepts that form and names the value in a warning, instead of stopping.
+- **The right environment and the right tenant.**
+  - Check, Convert and Recover refuse a snapshot of another environment.
+  - A batch keeps the tenant it was made in, and a run on another tenant or another environment refuses it.
+  - A batch made by an earlier version is still accepted.
+- **Your own Exchange Online session is safe.**
+  - The tool refuses to start next to an Exchange Online session that is already open, and checks that its sessions are in `Cloud.TenantId`. This covers Security & Compliance too.
+  - It signs out only its own connections. A failed sign-out is a warning that keeps the result of the run.
+- **Entra Connect is checked before Recover changes anything.** In Remoting mode, Recover stops with nothing changed when the Entra Connect server cannot be reached; a Preview says so first.
+- **Microsoft Graph throttling.** The wait that Microsoft Graph asks for (Retry-After) is honoured on every request, up to two minutes.
+- **Dates the same everywhere.** Reports, CSV files, logs and file names write dates the same way whatever the language of the server.
+- **Console.** A command shown or copied in the window is safe to paste: a value is always quoted literally. A run on a batch uses the batch's environment.
+- **Smaller fixes.** `Check -Batch -Expect Retained` finds the inactive mailbox of a shared mailbox that Recover synchronised on its own. A mistyped Entra Connect server name is reported as such.
+- **Recover, from 2.1.0.** When a delta cycle does not recreate a deleted shared mailbox, room or equipment identity, Recover runs a targeted Entra Connect synchronisation. It never runs an Initial cycle by itself.
+
 ## 2.1.0 - 2026-11-15
 
 Highlights, in plain words:
