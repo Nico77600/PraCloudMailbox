@@ -275,7 +275,6 @@ function Get-PcmGuiChangedSetting {
 
 function Get-PcmGuiOverride {
     <# The configuration settings the operator changed for this run, nested like the configuration (empty when nothing differs from the file). #>
-    $g = $script:Gui
     $override = @{}; $cloud = @{}
     if (Test-PcmGuiModified 'Env') { $override.Environment = Get-PcmGuiField 'Env' }
     if (Test-PcmGuiModified 'Store') { $override.Store = @{ Path = (Get-PcmGuiField 'Store') } }
