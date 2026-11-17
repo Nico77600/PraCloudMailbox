@@ -3263,7 +3263,7 @@ function Get-PcmSyncFailure {
     <#
     .SYNOPSIS
         Plain words for a failed Entra Connect check: Kind (Denied, Unreachable, NoModule or Failed), Reason (what happened and what to do) and Technical (the raw message, for the log).
-        The account that is refused is the usual cause, so it is tested first.
+        The account that is refused is the usual cause, so it is tested first, unless the message says that the server name is unknown (the remoting message of an unknown computer also names the authentication).
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Failure, [string]$Server = '')
@@ -3274,7 +3274,8 @@ function Get-PcmSyncFailure {
     if ($firstLine.Length -gt 200) { $firstLine = $firstLine.Substring(0, 197) + '...' }
     $errorId = if ($Failure -is [Management.Automation.ErrorRecord]) { [string]$Failure.FullyQualifiedErrorId } else { '' }
     $where = if ($Server) { $Server } else { 'this server' }
-    if (([int](Get-PcmValue $exception 'ErrorCode' 0) -eq 5) -or $technical -match '(?i)access is denied|access denied|acc[eè]s refus|unauthorized|not authorized|logon failure|authentication|permission') {
+    $unknownHost = $technical -match '(?i)cannot find the computer|cannot be resolved|no such host|name could not be resolved'
+    if (([int](Get-PcmValue $exception 'ErrorCode' 0) -eq 5) -or (-not $unknownHost -and $technical -match '(?i)access is denied|access denied|acc[eè]s refus|unauthorized|not authorized|logon failure|authentication|permission')) {
         $reason = if ($Server) { 'the account of the run has no right on {0}: it must be allowed to open a remote session there (member of Remote Management Users or Administrators) and to use Entra Connect (member of ADSyncAdmins)' -f $Server }
             else { 'the account of the run has no right to use Entra Connect on this server: it must be a member of ADSyncAdmins (or Administrators)' }
         return New-PcmSyncResult -Ok $false -Kind 'Denied' -Server $Server -Reason $reason -Technical $technical

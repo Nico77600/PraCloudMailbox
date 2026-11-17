@@ -215,6 +215,7 @@ Describe 'Entra Connect check (authenticated, read-only)' {
         @{ Kind = 'Denied'; Message = 'Accès refusé.'; Text = '*no right on aadc*' }
         @{ Kind = 'NoModule'; Message = 'The specified module ADSync was not loaded because no valid module file was found'; Text = '*not installed there*EntraConnect.Server*' }
         @{ Kind = 'Unreachable'; Message = 'Connecting to remote server aadc failed with the following error message: WinRM cannot process the request'; Text = '*does not answer to PowerShell remoting*port 5985*' }
+        @{ Kind = 'Unreachable'; Message = 'Connecting to remote server aadc failed with the following error message : WinRM cannot process the request. The following error occurred while using Kerberos authentication: Cannot find the computer aadc. Verify that the computer exists on the network and that the name provided is spelled correctly.'; Text = '*does not answer to PowerShell remoting*check the server name*' }
         @{ Kind = 'Failed'; Message = 'Something else happened.'; Text = '*could not be checked on aadc: Something else happened*' }) {
         param($Kind, $Message, $Text)
         $global:PcmProbeMessage = $Message
