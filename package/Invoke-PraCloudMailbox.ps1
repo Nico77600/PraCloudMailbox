@@ -3257,31 +3257,18 @@ function Get-PcmBatchUsersMode {
 
 function Test-PcmEntraConnectAvailable {
     <#
-    Before the first change of a Recover: proves, with the account that the Entra Connect operations use, that the server answers (an authenticated read-only call to its ADSync module). It is
-    asked only when the tool itself runs the cycles (EntraConnect.Mode = Remoting or Script). Apply: a server that does not answer stops the run before any change. Preview: the same answer, as a warning.
+    Before the first change of a Recover: proves, with the account of the run, that the Entra Connect server answers (an authenticated read-only call to its ADSync module). It is asked only
+    when the tool runs the cycles by remoting itself (EntraConnect.Mode = Remoting): a script of the administrator is how the server is reached in Script mode, and Manual mode asks the operator.
+    Apply: a server that does not answer stops the run before any change. Preview: the same answer, as a warning, and the first next step says to fix it.
     #>
     $entra = $context.Config.EntraConnect
     if (Test-PcmSameText $entra.Mode 'Manual') { return }
     $context.CurrentOperation = 'Check-EntraConnect'
-    $server = [string](Get-PcmValue $entra 'Server' '')
-    if (-not $server) {
-        Write-PcmItem -Context $context -Status Info -Icon Sync -Text 'Entra Connect: EntraConnect.Server is empty and the script of EntraConnect.ScriptPath reaches the server its own way, so the tool cannot check it before the first change.'
+    if (-not (Test-PcmSameText $entra.Mode 'Remoting')) {
+        Write-PcmLog -Context $context -Message ('EntraConnect.Mode = {0}: the script of EntraConnect.ScriptPath is how the Entra Connect server is reached, so the server is not checked before the run.' -f $entra.Mode) -Level Detail
         return
     }
-    $call = @{ Server = $server }
-    $unreadable = $null
-    if (Test-PcmSameText $entra.Mode 'Script') {
-        $file = [string](Get-PcmValue $entra 'CredentialPath' '')
-        if (-not $file -and [string](Get-PcmValue $entra 'ScriptPath' '')) {
-            $beside = Join-Path (Split-Path -Parent ([string]$entra.ScriptPath)) 'EntraConnect.cred.xml'
-            if ([IO.File]::Exists($beside)) { $file = $beside }
-        }
-        if ($file) {
-            try { $call.Credential = Import-Clixml -LiteralPath $file -ErrorAction Stop }
-            catch { $unreadable = [pscustomobject]@{ Ok = $false; Kind = 'Failed'; Reason = ('the credential file {0} cannot be read by this account (it can only be read by the Windows account and the computer that wrote it): write it again with Get-Credential | Export-Clixml' -f $file); Technical = $_.Exception.Message } }
-        }
-    }
-    $answer = if ($unreadable) { $unreadable } else { Test-PcmSyncServer @call }
+    $answer = Test-PcmSyncServer -Server ([string]$entra.Server)
     if ($answer.Ok) {
         Write-PcmItem -Context $context -Status Ok -Icon Sync -Text ('Entra Connect: {0}; the delta cycles run from this tool ({1})' -f $answer.Reason, $entra.Mode)
         return
@@ -3289,6 +3276,7 @@ function Test-PcmEntraConnectAvailable {
     Write-PcmLog -Context $context -Message ('Entra Connect check, technical message: {0}' -f $answer.Technical) -Level Detail
     $message = 'Entra Connect cannot be used from this tool: {0}. Fix that, or set EntraConnect.Mode = Manual in the configuration file and run the Entra Connect steps yourself when the tool asks.' -f $answer.Reason
     if (Test-PcmSameText $context.Mode 'Apply') { $context.NoChangeMade = $true; $context.CurrentIdentity = ''; throw ('{0} Nothing was changed.' -f $message) }
+    $context.EntraProbeFailure = [string]$answer.Reason
     Write-PcmLog -Context $context -Message $message -Level Warning
 }
 
@@ -3462,7 +3450,9 @@ function Invoke-PcmRecover {
     if ($planUsers.Count -or $planShared.Count) { Test-PcmEntraConnectAvailable }
     if ($context.Mode -ne 'Apply') {
         foreach ($title in @('Users: back on-premises', 'Shared mailboxes', 'Licence group')) { Skip-PcmStep -Title $title -Reason 'Preview: not run.' -Icon Write }
-        $context.NextSteps = @('To make the changes, run the same command in Apply mode (the confirmation is asked once):', (Get-PcmCommandLine -ActionName 'Recover' -ModeName 'Apply' -BatchId ([string]$convert.id) -KeepFilters))
+        $probeFailure = [string](Get-PcmValue $context 'EntraProbeFailure' '')
+        $context.NextSteps = @($(if ($probeFailure) { 'Fix the Entra Connect access first ({0}), or set EntraConnect.Mode = Manual in the configuration file. Then run the same command in Apply mode (the confirmation is asked once):' -f $probeFailure } else { 'To make the changes, run the same command in Apply mode (the confirmation is asked once):' }),
+            (Get-PcmCommandLine -ActionName 'Recover' -ModeName 'Apply' -BatchId ([string]$convert.id) -KeepFilters))
         return
     }
     if (-not $plan.Count) { throw 'Nothing to roll back (see above).' }

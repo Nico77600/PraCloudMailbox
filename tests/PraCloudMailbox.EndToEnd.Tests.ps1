@@ -3845,15 +3845,11 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
     #endregion
 
     #region Environment and tenant of a snapshot and of a batch
-    It 'refuses a snapshot of another Environment in Check, Convert and Recover, whatever the letter case of the name' -Tag 'Ownership' {
-        Start-E2E -Action Convert
-        Invoke-PcmConvert
-        $convertBatch = $context.BatchId
-        Close-E2E
+    It 'refuses a snapshot of another Environment in Check and Convert without a batch, whatever the letter case of the name' -Tag 'Ownership' {
         $cn = Open-PcmStore -Path $global:PraE2E.Db -Root $global:PraE2E.Root
         try { $null = Invoke-PcmSql $cn "UPDATE snapshot SET environment = 'OTHER'" } finally { Close-PcmStore $cn }
-        foreach ($case in @(@{ Action = 'Check'; Call = { Invoke-PcmCheck } }, @{ Action = 'Convert'; Call = { Invoke-PcmConvert } }, @{ Action = 'Recover'; Call = { Invoke-PcmRecover } })) {
-            Start-E2E -Action $case.Action -Mode Preview -Batch $(if ($case.Action -eq 'Recover') { $convertBatch } else { '' })
+        foreach ($case in @(@{ Action = 'Check'; Call = { Invoke-PcmCheck } }, @{ Action = 'Convert'; Call = { Invoke-PcmConvert } })) {
+            Start-E2E -Action $case.Action -Mode Preview
             { & $case.Call } | Should -Throw "*Snapshot * was made for Environment 'OTHER' and the configuration says 'TEST'. Nothing was changed.*Collect again*"
             $context.NoChangeMade | Should -BeTrue
         }
@@ -3916,6 +3912,51 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal
         try { @(Invoke-PcmSql $journal 'PRAGMA table_info(batch)' -As Rows | ForEach-Object { $_.name }) | Should -Contain 'tenant_id' } finally { Close-PcmStore $journal }
     }
+
+    It 'continues a batch whose Environment is not the one of its snapshot, with the configuration of the batch' -Tag 'Ownership' {
+        Start-E2E -Action Convert
+        Invoke-PcmConvert
+        $convertBatch = $context.BatchId
+        Close-E2E
+        $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal
+        try { $null = Invoke-PcmSql $journal "UPDATE batch SET environment = 'DR', tenant_id = NULL" } finally { Close-PcmStore $journal }
+        [IO.File]::WriteAllText($global:PraE2E.Config, [IO.File]::ReadAllText($global:PraE2E.Config).Replace("Environment = 'TEST'", "Environment = 'dr'"), [Text.UTF8Encoding]::new($true))
+        Start-E2E -Action Check -Mode Preview
+        { Invoke-PcmCheck } | Should -Throw "*Snapshot * was made for Environment 'TEST' and the configuration says 'dr'. Nothing was changed.*"
+        Start-E2E -Action Check -Mode Preview -Batch $convertBatch
+        { Invoke-PcmCheckBatch } | Should -Not -Throw
+        Start-E2E -Action Convert -Mode Preview -Batch $convertBatch
+        $failure = try { Invoke-PcmConvert; '' } catch { $_.Exception.Message }
+        $failure | Should -Not -Match 'was made for Environment'
+        Start-E2E -Action Recover -Mode Preview -Batch $convertBatch
+        { Invoke-PcmRecover } | Should -Not -Throw
+        Start-E2E -Action Recover -Mode Apply -Batch $convertBatch
+        { Invoke-PcmRecover } | Should -Not -Throw
+        (Get-E2ERow 'alice@contoso.com').FinalStatus | Should -Be Success
+        Close-E2E
+        $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal -ReadOnly
+        try { [string](Invoke-PcmSql $journal "SELECT environment FROM batch WHERE action = 'Recover'" -As Scalar) | Should -BeExactly 'dr' } finally { Close-PcmStore $journal }
+    }
+
+    It 'rolls back, in Apply, a batch of a journal that holds no tenant column, and keeps the tenant in the new Recover batch' -Tag 'Ownership' {
+        Start-E2E -Action Convert
+        Invoke-PcmConvert
+        $convertBatch = $context.BatchId
+        Close-E2E
+        $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal
+        try { $null = Invoke-PcmSql $journal 'ALTER TABLE batch DROP COLUMN tenant_id' } finally { Close-PcmStore $journal }
+        Start-E2E -Action Recover -Mode Apply -Batch $convertBatch
+        { Invoke-PcmRecover } | Should -Not -Throw
+        (Get-E2ERow 'alice@contoso.com').FinalStatus | Should -Be Success
+        $recoverBatch = $context.BatchId
+        Close-E2E
+        $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal -ReadOnly
+        try {
+            @(Invoke-PcmSql $journal 'PRAGMA table_info(batch)' -As Rows | ForEach-Object { $_.name }) | Should -Contain 'tenant_id'
+            [string](Invoke-PcmSql $journal 'SELECT tenant_id FROM batch WHERE id = @b' @{ b = $recoverBatch } -As Scalar) | Should -BeExactly '33333333-3333-3333-3333-333333333333'
+            [string](Invoke-PcmSql $journal 'SELECT tenant_id FROM batch WHERE id = @b' @{ b = $convertBatch } -As Scalar) | Should -BeNullOrEmpty
+        } finally { Close-PcmStore $journal }
+    }
     #endregion
 
     #region Entra Connect check before the first change of a Recover
@@ -3934,11 +3975,13 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         Close-E2E
         $journal = Open-PcmStore -Path $context.Config.Store.JournalPath -Root $global:PraE2E.Root -Kind Journal -ReadOnly
         try { @(Invoke-PcmSql $journal "SELECT id FROM batch WHERE action = 'Recover'" -As Rows).Count | Should -Be 0 } finally { Close-PcmStore $journal }
-        Should -Invoke Test-PcmSyncServer -Times 1 -Exactly -ParameterFilter { $Server -eq 'aadc' -and -not $Credential }
+        Should -Invoke Test-PcmSyncServer -Times 1 -Exactly -ParameterFilter { $Server -eq 'aadc' }
         Start-E2E -Action Recover -Mode Preview -Batch $convertBatch
         { Invoke-PcmRecover } | Should -Not -Throw
         $context.Warnings | Should -BeGreaterThan 0
         [IO.File]::ReadAllText($context.LogFile) | Should -Match 'Entra Connect cannot be used from this tool'
+        @($context.NextSteps)[0] | Should -Match '^Fix the Entra Connect access first \(the account of the run has no right on aadc\), or set EntraConnect\.Mode = Manual'
+        @($context.NextSteps)[1] | Should -Match '-Action Recover -Mode Apply -Batch '
         $global:PraFake.Calls.Count | Should -Be $before
     }
 
@@ -3961,29 +4004,24 @@ Describe 'Convert and Recover end to end (fake tenant)' -Skip:($PSVersionTable.P
         (Get-E2ERow 'alice@contoso.com').FinalStatus | Should -Be Success
     }
 
-    It 'checks Entra Connect in Script mode with the saved credential, and not when the script has no server' -Tag 'EntraProbe' {
+    It 'does not check Entra Connect in Script mode, where the script of the administrator is how the server is reached, and says so in the log' -Tag 'EntraProbe' {
         Start-E2E -Action Convert
         Invoke-PcmConvert
         $convertBatch = $context.BatchId
         Close-E2E
-        $credentialFile = Join-Path $global:PraE2E.Dir 'entra.cred.xml'
-        $secret = [System.Security.SecureString]::new(); foreach ($character in 'not a secret'.ToCharArray()) { $secret.AppendChar($character) }
-        [pscredential]::new('CONTOSO\svc', $secret) | Export-Clixml -LiteralPath $credentialFile
         $scriptFile = Join-Path $global:PraE2E.Dir 'entra.ps1'
         [IO.File]::WriteAllText($scriptFile, "param(`$Operation)`n")
-        $text = [IO.File]::ReadAllText($global:PraE2E.Config).Replace("EntraConnect = @{ Mode = 'Manual'; Server = 'aadc' }", "EntraConnect = @{ Mode = 'Script'; Server = 'aadc'; ScriptPath = '$scriptFile'; CredentialPath = '$credentialFile' }")
+        $text = [IO.File]::ReadAllText($global:PraE2E.Config).Replace("EntraConnect = @{ Mode = 'Manual'; Server = 'aadc' }", "EntraConnect = @{ Mode = 'Script'; Server = 'aadc'; ScriptPath = '$scriptFile' }")
         [IO.File]::WriteAllText($global:PraE2E.Config, $text, [Text.UTF8Encoding]::new($true))
-        Mock Test-PcmSyncServer { [pscustomobject]@{ Ok = $true; Kind = 'Ok'; Server = 'aadc'; Reason = 'aadc accepts this account and Entra Connect answers'; Technical = '' } }
+        Mock Test-PcmSyncServer { throw 'The probe must not run in Script mode.' }
         Mock Confirm-PcmApply {}
-        Start-E2E -Action Recover -Mode Preview -Batch $convertBatch
-        Invoke-PcmRecover
-        Should -Invoke Test-PcmSyncServer -Times 1 -Exactly -ParameterFilter { $Server -eq 'aadc' -and $Credential.UserName -eq 'CONTOSO\svc' }
-        Close-E2E
-        [IO.File]::WriteAllText($global:PraE2E.Config, [IO.File]::ReadAllText($global:PraE2E.Config).Replace("Server = 'aadc'; ScriptPath", "Server = ''; ScriptPath"), [Text.UTF8Encoding]::new($true))
-        Start-E2E -Action Recover -Mode Apply -Batch $convertBatch
-        Invoke-PcmRecover
-        Should -Invoke Test-PcmSyncServer -Times 1 -Exactly
-        [IO.File]::ReadAllText($context.LogFile) | Should -Match 'EntraConnect.Server is empty'
+        foreach ($mode in 'Preview', 'Apply') {
+            Start-E2E -Action Recover -Mode $mode -Batch $convertBatch
+            { Invoke-PcmRecover } | Should -Not -Throw
+            [IO.File]::ReadAllText($context.LogFile) | Should -Match 'EntraConnect\.Mode = Script: the script of EntraConnect\.ScriptPath is how the Entra Connect server is reached, so the server is not checked before the run\.'
+            Close-E2E
+        }
+        Should -Invoke Test-PcmSyncServer -Times 0 -Exactly
     }
     #endregion
 }

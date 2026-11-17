@@ -3232,20 +3232,29 @@ function Get-PcmSyncFailure {
 function Test-PcmSyncServer {
     <#
     .SYNOPSIS
-        Proves that Entra Connect can be used FOR THIS ACCOUNT: an authenticated, read-only call to the ADSync module of the server (PowerShell remoting, bounded time). Starts nothing, changes nothing.
-    .PARAMETER Credential
-        The account that the operations of the run use when it is not the current one (EntraConnect.Mode = Script with a saved credential).
+        Proves that Entra Connect can be used FOR THIS ACCOUNT: an authenticated, read-only call to the ADSync module of the server (PowerShell remoting). The call is a remote job that is waited for
+        at most TimeoutSeconds, then stopped. Starts nothing, changes nothing.
     .OUTPUTS
         Ok, Kind (Ok, Denied, Unreachable, NoModule or Failed), Server, Reason (plain words) and Technical (the raw message).
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Server, [ValidateRange(5, 600)][int]$TimeoutSeconds = 30, [pscredential]$Credential)
+    param([Parameter(Mandatory)][string]$Server, [ValidateRange(5, 600)][int]$TimeoutSeconds = 30)
     $option = New-PSSessionOption -OpenTimeout ($TimeoutSeconds * 1000) -OperationTimeout ($TimeoutSeconds * 1000)
-    $call = @{ ComputerName = $Server; ScriptBlock = $script:PcmSyncProbe; SessionOption = $option; ErrorAction = 'Stop' }
-    if ($Credential) { $call.Credential = $Credential }
-    try { $answer = Invoke-Command @call } catch { return (Get-PcmSyncFailure $_ $Server) }
-    if ($null -eq $answer) { return New-PcmSyncResult -Ok $false -Kind 'Failed' -Server $Server -Reason ('{0} answered nothing to the Entra Connect check' -f $Server) -Technical 'empty answer' }
-    New-PcmSyncResult -Ok $true -Kind 'Ok' -Server $Server -Reason ('{0} accepts this account and Entra Connect answers' -f $Server)
+    try { $job = Invoke-Command -ComputerName $Server -ScriptBlock $script:PcmSyncProbe -SessionOption $option -AsJob -ErrorAction Stop }
+    catch { return (Get-PcmSyncFailure $_ $Server) }
+    try {
+        $null = Wait-Job -Job $job -Timeout $TimeoutSeconds
+        if ([string]$job.State -in @('NotStarted', 'Running', 'Suspended', 'Stopping', 'Disconnected')) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            return New-PcmSyncResult -Ok $false -Kind 'Unreachable' -Server $Server -Technical ('no answer within {0} seconds' -f $TimeoutSeconds) `
+                -Reason ('{0} does not answer to PowerShell remoting (WinRM, port 5985) within {1} seconds: check the server name in EntraConnect.Server, the network and the firewall' -f $Server, $TimeoutSeconds)
+        }
+        $answer = Receive-Job -Job $job -ErrorAction Stop
+        if ($null -eq $answer) { return New-PcmSyncResult -Ok $false -Kind 'Failed' -Server $Server -Reason ('{0} answered nothing to the Entra Connect check' -f $Server) -Technical 'empty answer' }
+        New-PcmSyncResult -Ok $true -Kind 'Ok' -Server $Server -Reason ('{0} accepts this account and Entra Connect answers' -f $Server)
+    }
+    catch { Get-PcmSyncFailure $_ $Server }
+    finally { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
 }
 
 function Invoke-PcmEntraConnectObject {
